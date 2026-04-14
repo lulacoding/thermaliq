@@ -1,0 +1,33 @@
+name = "silent"
+description = "Quiet operation — prioritizes low noise"
+version = 1
+
+[[curves]]
+type = "linear"
+id = "cpu_linear"
+source = "cpu_package"
+min_temp = 50.0
+max_temp = 85.0
+min_pwm = 0
+max_pwm = 70
+
+[[controls]]
+fan = "cpu_fan_0"
+curve = "cpu_linear"
+mode = "pwm"
+step_up_pct = 5
+step_down_pct = 2
+min_pwm = 0
+
+[[alerts]]
+sensor = "cpu_package"
+threshold = 92.0
+severity = "warn"
+action = "notify"
+
+[[alerts]]
+sensor = "cpu_package"
+threshold = 96.0
+severity = "crit"
+action = "apply_profile"
+profile = "performance"

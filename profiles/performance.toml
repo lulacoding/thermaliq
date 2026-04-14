@@ -1,0 +1,32 @@
+name = "performance"
+description = "Maximum cooling — high noise"
+version = 1
+
+[[curves]]
+type = "linear"
+id = "cpu_linear"
+source = "cpu_package"
+min_temp = 35.0
+max_temp = 70.0
+min_pwm = 40
+max_pwm = 100
+
+[[controls]]
+fan = "cpu_fan_0"
+curve = "cpu_linear"
+mode = "pwm"
+step_up_pct = 15
+step_down_pct = 5
+min_pwm = 40
+
+[[alerts]]
+sensor = "cpu_package"
+threshold = 85.0
+severity = "warn"
+action = "notify"
+
+[[alerts]]
+sensor = "cpu_package"
+threshold = 90.0
+severity = "crit"
+action = "log"

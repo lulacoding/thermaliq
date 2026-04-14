@@ -1,0 +1,19 @@
+[package]
+name = "thermaliq-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tq"
+path = "src/main.rs"
+
+[dependencies]
+thermaliq-common = { path = "../thermaliq-common" }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { version = "4", features = ["derive", "env"] }
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+dirs = "5"

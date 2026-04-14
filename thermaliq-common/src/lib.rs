@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod alert;
+pub mod config;
 pub mod curve;
 pub mod history;
 

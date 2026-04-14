@@ -13,19 +13,53 @@
 //! `routes.rs`. The Bearer scheme already defeats CSRF for non-browser clients;
 //! the CORS restriction covers the Tauri webview case.
 
+use std::sync::{Arc, Mutex};
+
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
     middleware::Next,
     response::Response,
 };
-use std::sync::Arc;
+use serde::{Deserialize, Serialize};
+use tokio::sync::{watch, RwLock};
+
+use thermaliq_common::config::Profile;
+use thermaliq_common::history::HistoryDb;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentMode {
+    #[default]
+    Passive,
+    Approval,
+    Autonomous,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Intervention {
+    pub id: String,
+    pub description: String,
+    pub proposed_at: u64,
+    pub proposed_action: String,
+}
 
 /// Shared state injected into every axum handler.
 #[derive(Clone)]
 pub struct AppState {
     pub api_token: Arc<String>,
     pub hal: Arc<dyn thermaliq_hal::HardwareLayer>,
+    pub history: Arc<Mutex<HistoryDb>>,
+    pub active_profile: Arc<RwLock<Option<Profile>>>,
+    pub agent_mode: Arc<RwLock<AgentMode>>,
+    pub pending_interventions: Arc<Mutex<Vec<Intervention>>>,
+    pub shutdown_tx: Arc<watch::Sender<bool>>,
+}
+
+impl axum::extract::FromRef<AppState> for Arc<String> {
+    fn from_ref(state: &AppState) -> Self {
+        state.api_token.clone()
+    }
 }
 
 /// Tower middleware that enforces Bearer token authentication.
