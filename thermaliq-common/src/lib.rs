@@ -1,3 +1,8 @@
+pub mod agent;
+pub mod alert;
+pub mod curve;
+pub mod history;
+
 use serde::{Deserialize, Serialize};
 
 /// Celsius temperature reading from a single sensor.

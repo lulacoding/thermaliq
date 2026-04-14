@@ -1,3 +1,8 @@
 /target
 Cargo.lock
 *.token
+
+# OMC runtime state (session-specific, not for version control)
+.omc/state/
+.omc/sessions/
+.omc/project-memory.json
