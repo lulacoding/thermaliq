@@ -1,0 +1,16 @@
+{
+  "id": "thermaliq-deep-001",
+  "goal": "Comprehensive research on ThermalIQ v0.2: feature gaps, new features, competitive analysis, agent architecture gaps, platform concerns, public release requirements, landing page strategy",
+  "status": "in_progress",
+  "mode": "auto",
+  "stages": [
+    {"id": 1, "name": "FanControl & competitor feature gaps", "tier": "HIGH", "status": "running"},
+    {"id": 2, "name": "Agent architecture gaps & edge cases", "tier": "HIGH", "status": "running"},
+    {"id": 3, "name": "Platform-specific concerns", "tier": "HIGH", "status": "running"},
+    {"id": 4, "name": "New features & product ideas", "tier": "HIGH", "status": "running"},
+    {"id": 5, "name": "Public release & distribution", "tier": "MEDIUM", "status": "running"},
+    {"id": 6, "name": "Landing page & install UX", "tier": "MEDIUM", "status": "running"},
+    {"id": 7, "name": "Security, privacy & community", "tier": "MEDIUM", "status": "running"}
+  ],
+  "createdAt": "2026-04-14T10:16:00Z"
+}

@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"~/.cargo/bin/rustup toolchain list && ~/.cargo/bin/rustc --version 2>&1\",\"description\":\"Check rustup toolchains via full path\"}",
+  "error": "Exit code 1\nstable-aarch64-apple-darwin (active, default)\nerror: Missing manifest in toolchain 'stable-aarch64-apple-darwin'",
+  "timestamp": "2026-04-14T11:14:21.970Z",
+  "retry_count": 3
+}
