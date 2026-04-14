@@ -1,0 +1,22 @@
+[package]
+name = "thermaliq-hal"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[features]
+# Enable mock hardware implementations for CI and development without physical hardware.
+# All platform sensor/fan calls return deterministic fake data when this feature is active.
+# Usage: cargo test --features mock-hardware
+# CI: cargo test --all-features (implies mock-hardware via --features mock-hardware)
+default = []
+mock-hardware = []
+
+[dependencies]
+thermaliq-common = { path = "../thermaliq-common" }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

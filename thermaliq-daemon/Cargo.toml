@@ -1,0 +1,28 @@
+[package]
+name = "thermaliq-daemon"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[features]
+# Propagates mock-hardware to the HAL crate.
+# Use `cargo run --features mock-hardware` for development without real hardware.
+default = []
+mock-hardware = ["thermaliq-hal/mock-hardware"]
+
+[dependencies]
+thermaliq-hal = { path = "../thermaliq-hal" }
+thermaliq-common = { path = "../thermaliq-common" }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+axum = { version = "0.7", features = ["macros"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors"] }
+rand = "0.8"
+hex = "0.4"
+dirs = "5"
