@@ -4,6 +4,7 @@ members = [
     "thermaliq-hal",
     "thermaliq-daemon",
     "thermaliq-cli",
+    "thermaliq-helper",
 ]
 exclude = ["thermaliq-ui"]
 resolver = "2"
