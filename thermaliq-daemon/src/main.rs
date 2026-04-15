@@ -1,5 +1,6 @@
 mod agent_db;
 mod agent_task;
+mod ai_provider;
 mod api;
 mod app_monitor;
 mod poller;
@@ -100,6 +101,29 @@ pub async fn run_daemon_inner() -> Result<()> {
     let sensor_tx = Arc::new(sensor_tx);
     let agent_event_tx = Arc::new(agent_event_tx);
 
+    // AI Provider — initialize from config if enabled
+    let ai_provider_opt = if config.ai.enabled && !config.ai.api_key.is_empty() {
+        match ai_provider::create_provider(
+            ai_provider::AIProviderKind::Anthropic, // TODO: use config.ai.provider
+            config.ai.api_key.clone(),
+        ) {
+            Ok(provider) => {
+                tracing::info!(
+                    provider = %config.ai.provider.as_str(),
+                    "AI provider initialized"
+                );
+                Some(provider)
+            }
+            Err(e) => {
+                tracing::warn!("failed to initialize AI provider: {}", e);
+                None
+            }
+        }
+    } else {
+        tracing::debug!("AI provider disabled or no API key configured");
+        None
+    };
+
     // AppState
     let state = AppState {
         api_token,
@@ -112,6 +136,7 @@ pub async fn run_daemon_inner() -> Result<()> {
         sensor_tx,
         agent_event_tx,
         schedule: Arc::new(RwLock::new(config.schedule.clone())),
+        ai_provider: Arc::new(Mutex::new(ai_provider_opt)),
     };
 
     // Agent DB

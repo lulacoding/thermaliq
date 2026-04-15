@@ -1,0 +1,180 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1776253390599,
+  "projectRoot": "/Users/samalesci-bateman/dev/Thermaliq/thermaliq-ui",
+  "techStack": {
+    "languages": [
+      {
+        "name": "JavaScript/TypeScript",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "package.json"
+        ]
+      },
+      {
+        "name": "TypeScript",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "tsconfig.json"
+        ]
+      }
+    ],
+    "frameworks": [
+      {
+        "name": "react",
+        "version": "18.3.1",
+        "category": "frontend"
+      },
+      {
+        "name": "react-dom",
+        "version": "18.3.1",
+        "category": "frontend"
+      },
+      {
+        "name": "vite",
+        "version": "5.4.8",
+        "category": "build"
+      }
+    ],
+    "packageManager": "npm",
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": "npm run build",
+    "testCommand": null,
+    "lintCommand": null,
+    "devCommand": "npm run dev",
+    "scripts": {
+      "dev": "vite",
+      "build": "tsc && vite build",
+      "preview": "vite preview",
+      "tauri": "tauri"
+    }
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": "type-based"
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "src"
+    ],
+    "gitBranches": null
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "src": {
+      "path": "src",
+      "purpose": "Source code",
+      "fileCount": 3,
+      "lastAccessed": 1776253390587,
+      "keyFiles": [
+        "App.tsx",
+        "index.css",
+        "main.tsx"
+      ]
+    },
+    "src-tauri": {
+      "path": "src-tauri",
+      "purpose": null,
+      "fileCount": 4,
+      "lastAccessed": 1776253390587,
+      "keyFiles": [
+        "Cargo.toml",
+        "build.rs",
+        "com.thermaliq.helper.plist",
+        "tauri.conf.json"
+      ]
+    },
+    "src/components": {
+      "path": "src/components",
+      "purpose": "UI components",
+      "fileCount": 4,
+      "lastAccessed": 1776253390591,
+      "keyFiles": [
+        "AgentPanel.tsx",
+        "AlertCenter.tsx",
+        "Dashboard.tsx"
+      ]
+    },
+    "src-tauri/src": {
+      "path": "src-tauri/src",
+      "purpose": "Source code",
+      "fileCount": 2,
+      "lastAccessed": 1776253390591,
+      "keyFiles": [
+        "lib.rs",
+        "main.rs"
+      ]
+    }
+  },
+  "hotPaths": [
+    {
+      "path": "src-tauri/tauri.conf.json",
+      "accessCount": 13,
+      "lastAccessed": 1776254265564,
+      "type": "file"
+    },
+    {
+      "path": "src/App.tsx",
+      "accessCount": 11,
+      "lastAccessed": 1776255979316,
+      "type": "file"
+    },
+    {
+      "path": "src/components/SettingsPanel.tsx",
+      "accessCount": 10,
+      "lastAccessed": 1776255754055,
+      "type": "file"
+    },
+    {
+      "path": "src/components/Dashboard.tsx",
+      "accessCount": 7,
+      "lastAccessed": 1776255662063,
+      "type": "file"
+    },
+    {
+      "path": "src/components/CurveEditor.tsx",
+      "accessCount": 7,
+      "lastAccessed": 1776255786847,
+      "type": "file"
+    },
+    {
+      "path": "src/components/HardwareDetect.tsx",
+      "accessCount": 7,
+      "lastAccessed": 1776255829186,
+      "type": "file"
+    },
+    {
+      "path": "src-tauri/src/lib.rs",
+      "accessCount": 5,
+      "lastAccessed": 1776253927221,
+      "type": "file"
+    },
+    {
+      "path": "src/components/CalibrationWizard.tsx",
+      "accessCount": 5,
+      "lastAccessed": 1776255797320,
+      "type": "file"
+    },
+    {
+      "path": "src/components/ProfileManager.tsx",
+      "accessCount": 3,
+      "lastAccessed": 1776255841170,
+      "type": "file"
+    },
+    {
+      "path": "package.json",
+      "accessCount": 1,
+      "lastAccessed": 1776253395890,
+      "type": "file"
+    }
+  ],
+  "userDirectives": []
+}

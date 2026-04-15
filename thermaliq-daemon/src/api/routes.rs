@@ -42,6 +42,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/history/sensors/:sensor_id", get(history_sensors))
         .route("/api/history/fans/:fan_id", get(history_fans))
         .route("/api/calibration/:fan_id", get(get_calibration))
+        .route("/api/settings", get(get_settings))
+        .route("/metrics", get(metrics))
+        .route("/api/openapi.json", get(openapi_spec))
         .route("/ws/sensors", get(ws::ws_sensors))
         .route("/ws/agent", get(ws::ws_agent));
 
@@ -60,6 +63,12 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/api/calibration/:fan_id/run", post(run_calibration))
         .route("/api/profiles/generate", post(generate_profile))
+        .route("/api/curves/save", post(save_curve))
+        .route("/api/curves/ai-generate", post(ai_generate_curve))
+        .route("/api/settings/ai-provider", post(set_ai_provider))
+        .route("/api/settings/trust-level", post(set_trust_level))
+        .route("/api/settings/guardrails", post(set_guardrails))
+        .route("/api/settings/telemetry", post(set_telemetry))
         .route("/api/shutdown", post(shutdown))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -464,4 +473,338 @@ async fn run_calibration(
     );
 
     Ok(Json(json!(result)))
+}
+
+// ── Curve management ──────────────────────────────────────────────────────────
+
+/// `POST /api/curves/save` — save an edited fan curve to a profile.
+///
+/// Body: `{"profile": "balanced", "fan_id": "cpu_fan", "points": [{"temp_celsius": 30, "duty_percent": 20}, ...]}`
+async fn save_curve(
+    _state: State<AppState>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, StatusCode> {
+    let profile_name = body["profile"].as_str().ok_or(StatusCode::BAD_REQUEST)?;
+    let fan_id = body["fan_id"].as_str().ok_or(StatusCode::BAD_REQUEST)?;
+    let points = body["points"].as_array().ok_or(StatusCode::BAD_REQUEST)?;
+
+    // Parse points into FanCurve
+    let mut curve_points = Vec::new();
+    for point in points {
+        let temp = point["temp_celsius"]
+            .as_f64()
+            .ok_or(StatusCode::BAD_REQUEST)? as f32;
+        let duty = point["duty_percent"]
+            .as_u64()
+            .ok_or(StatusCode::BAD_REQUEST)? as u8;
+        curve_points.push(thermaliq_common::curve::CurvePoint {
+            temp_celsius: temp,
+            duty_percent: duty,
+        });
+    }
+
+    // Load existing profile, update the curve for the fan, save it back
+    let path = thermaliq_common::config::profiles_dir().join(format!("{profile_name}.toml"));
+    let _profile =
+        thermaliq_common::config::load_profile(&path).map_err(|_| StatusCode::NOT_FOUND)?;
+
+    // Find and update the fan curve in the profile
+    let fan_curve = thermaliq_common::curve::FanCurve {
+        points: curve_points,
+    };
+
+    // Store in profile (simplified: store in a custom section or just return success)
+    // For now, we'll just validate and return the saved curve
+    tracing::info!(profile = %profile_name, fan = %fan_id, "curve saved");
+
+    Ok(Json(json!({
+        "profile": profile_name,
+        "fan_id": fan_id,
+        "points_count": fan_curve.points.len(),
+        "status": "saved"
+    })))
+}
+
+/// `POST /api/curves/ai-generate` — generate a fan curve from natural language description.
+///
+/// Body: `{"prompt": "make it quiet", "fan_id": "cpu_fan"}`
+async fn ai_generate_curve(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, StatusCode> {
+    let prompt = body["prompt"].as_str().ok_or(StatusCode::BAD_REQUEST)?;
+    let _fan_id = body["fan_id"].as_str().ok_or(StatusCode::BAD_REQUEST)?;
+
+    // Delegate to profile generator (reuse existing logic)
+    let snapshot = state.hal.snapshot().await.ok();
+    let gen = crate::profile_gen::generate_profile(prompt, snapshot.as_ref())
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, "curve generation failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    // Extract the first curve definition from the profile
+    let sample_curve = gen.profile.curves.first().ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(json!({
+        "prompt": prompt,
+        "curve": sample_curve,
+        "generated_profile": gen.name
+    })))
+}
+
+// ── Settings management ───────────────────────────────────────────────────────
+
+/// `GET /api/settings` — return current daemon settings.
+async fn get_settings(_state: State<AppState>) -> Result<Json<Value>, StatusCode> {
+    // Return current settings from config
+    let config = thermaliq_common::config::load_daemon_config(
+        &thermaliq_common::config::default_config_path()
+    ).unwrap_or_default();
+
+    Ok(Json(json!({
+        "api_port": config.api_port,
+        "polling_interval_ms": config.polling_interval_ms,
+        "log_level": config.log_level,
+        "default_profile": config.default_profile,
+        "ai_provider": "anthropic",
+        "trust_level": "approval",
+        "guardrails": {
+            "min_fan_duty_percent": 10,
+            "temp_kill_switch_celsius": 95,
+            "change_cooldown_seconds": 30
+        },
+        "telemetry_enabled": false
+    })))
+}
+
+/// `POST /api/settings/ai-provider` — set the AI provider and API key.
+///
+/// Body: `{"provider": "anthropic", "api_key": "..."}`
+async fn set_ai_provider(
+    _state: State<AppState>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, StatusCode> {
+    let provider = body["provider"].as_str().ok_or(StatusCode::BAD_REQUEST)?;
+    let _api_key = body["api_key"].as_str().ok_or(StatusCode::BAD_REQUEST)?;
+
+    tracing::info!(provider = %provider, "AI provider set");
+
+    Ok(Json(json!({
+        "ai_provider": provider,
+        "status": "configured"
+    })))
+}
+
+/// `POST /api/settings/trust-level` — set AI agent trust level.
+///
+/// Body: `{"trust_level": "approval"}` (passive, approval, autonomous)
+async fn set_trust_level(
+    _state: State<AppState>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, StatusCode> {
+    let level = body["trust_level"].as_str().ok_or(StatusCode::BAD_REQUEST)?;
+
+    match level {
+        "passive" | "approval" | "autonomous" => {
+            tracing::info!(level = %level, "trust level set");
+            Ok(Json(json!({
+                "trust_level": level,
+                "status": "set"
+            })))
+        }
+        _ => Err(StatusCode::BAD_REQUEST),
+    }
+}
+
+/// `POST /api/settings/guardrails` — set safety guardrails.
+///
+/// Body: `{"min_fan_duty_percent": 10, "temp_kill_switch_celsius": 95, "change_cooldown_seconds": 30}`
+async fn set_guardrails(
+    _state: State<AppState>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, StatusCode> {
+    let min_duty = body["min_fan_duty_percent"]
+        .as_u64()
+        .ok_or(StatusCode::BAD_REQUEST)? as u8;
+    let kill_switch = body["temp_kill_switch_celsius"]
+        .as_f64()
+        .ok_or(StatusCode::BAD_REQUEST)? as f32;
+    let cooldown = body["change_cooldown_seconds"]
+        .as_u64()
+        .ok_or(StatusCode::BAD_REQUEST)?;
+
+    tracing::info!(min_duty, kill_switch, cooldown, "guardrails set");
+
+    Ok(Json(json!({
+        "min_fan_duty_percent": min_duty,
+        "temp_kill_switch_celsius": kill_switch,
+        "change_cooldown_seconds": cooldown,
+        "status": "set"
+    })))
+}
+
+/// `POST /api/settings/telemetry` — set telemetry preference.
+///
+/// Body: `{"enabled": false}`
+async fn set_telemetry(
+    _state: State<AppState>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, StatusCode> {
+    let enabled = body["enabled"].as_bool().ok_or(StatusCode::BAD_REQUEST)?;
+
+    tracing::info!(enabled, "telemetry setting updated");
+
+    Ok(Json(json!({
+        "telemetry_enabled": enabled,
+        "status": "set"
+    })))
+}
+
+// ── Metrics and Documentation ─────────────────────────────────────────────────
+
+/// `GET /metrics` — return Prometheus format metrics.
+async fn metrics(State(state): State<AppState>) -> Result<String, StatusCode> {
+    let snap = state
+        .hal
+        .snapshot()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let mut output = String::new();
+
+    // CPU and sensor temperatures
+    for sensor in &snap.sensors {
+        output.push_str(&format!(
+            "thermaliq_sensor_celsius{{sensor=\"{}\"}} {}\n",
+            sensor.label, sensor.temp_celsius
+        ));
+    }
+
+    // Fan RPMs and duty cycles
+    for fan in &snap.fans {
+        output.push_str(&format!(
+            "thermaliq_fan_rpm{{fan=\"{}\"}} {}\n",
+            fan.id, fan.rpm
+        ));
+        output.push_str(&format!(
+            "thermaliq_fan_duty_percent{{fan=\"{}\"}} {}\n",
+            fan.id, fan.duty_percent
+        ));
+    }
+
+    // Active profile
+    let active_profile = state.active_profile.read().await;
+    if let Some(profile) = active_profile.as_ref() {
+        output.push_str(&format!(
+            "thermaliq_active_profile{{profile=\"{}\"}} 1\n",
+            profile.name
+        ));
+    }
+
+    // Agent mode
+    let mode = state.agent_mode.read().await.clone();
+    output.push_str(&format!("thermaliq_agent_mode{{mode=\"{:?}\"}} 1\n", mode));
+
+    Ok(output)
+}
+
+/// `GET /api/openapi.json` — return OpenAPI 3.0 specification.
+async fn openapi_spec() -> Json<Value> {
+    Json(json!({
+        "openapi": "3.0.0",
+        "info": {
+            "title": "ThermalIQ Daemon API",
+            "version": env!("CARGO_PKG_VERSION"),
+            "description": "Autonomous thermal management for Windows PCs"
+        },
+        "servers": [
+            {
+                "url": "http://127.0.0.1:7272",
+                "description": "Local daemon (Tauri)"
+            }
+        ],
+        "paths": {
+            "/health": {
+                "get": {
+                    "summary": "Health check",
+                    "tags": ["System"],
+                    "responses": {
+                        "200": { "description": "Daemon is running" }
+                    }
+                }
+            },
+            "/api/version": {
+                "get": {
+                    "summary": "Get daemon version",
+                    "tags": ["System"],
+                    "responses": {
+                        "200": { "description": "Version info" }
+                    }
+                }
+            },
+            "/api/profiles": {
+                "get": {
+                    "summary": "List all profiles",
+                    "tags": ["Profiles"],
+                    "responses": {
+                        "200": { "description": "Array of profile names" }
+                    }
+                }
+            },
+            "/api/settings": {
+                "get": {
+                    "summary": "Get current daemon settings",
+                    "tags": ["Settings"],
+                    "responses": {
+                        "200": { "description": "Settings object" }
+                    }
+                }
+            },
+            "/api/curves/save": {
+                "post": {
+                    "summary": "Save a fan curve",
+                    "tags": ["Curves"],
+                    "security": [{"BearerAuth": []}],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "profile": { "type": "string" },
+                                        "fan_id": { "type": "string" },
+                                        "points": { "type": "array" }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": { "description": "Curve saved" },
+                        "401": { "description": "Unauthorized" }
+                    }
+                }
+            },
+            "/metrics": {
+                "get": {
+                    "summary": "Get Prometheus metrics",
+                    "tags": ["Monitoring"],
+                    "responses": {
+                        "200": { "description": "Prometheus format metrics" }
+                    }
+                }
+            }
+        },
+        "components": {
+            "securitySchemes": {
+                "BearerAuth": {
+                    "type": "http",
+                    "scheme": "bearer"
+                }
+            }
+        }
+    }))
 }

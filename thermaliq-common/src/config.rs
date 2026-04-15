@@ -32,6 +32,71 @@ pub struct ScheduleEntry {
     pub note: String,
 }
 
+// ── AI Settings ───────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AiProviderKind {
+    Anthropic,
+    OpenAI,
+    Gemini,
+    Ollama,
+    OpenRouter,
+}
+
+impl AiProviderKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::OpenAI => "openai",
+            Self::Gemini => "gemini",
+            Self::Ollama => "ollama",
+            Self::OpenRouter => "openrouter",
+        }
+    }
+}
+
+impl Default for AiProviderKind {
+    fn default() -> Self {
+        Self::Anthropic
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AiSettings {
+    /// AI provider: anthropic, openai, gemini, ollama, openrouter.
+    pub provider: AiProviderKind,
+    /// API key for the provider (stored securely in daemon, never logged).
+    #[serde(default)]
+    pub api_key: String,
+    /// Base URL for Ollama (ignored for other providers).
+    #[serde(default = "default_ollama_url")]
+    pub ollama_url: String,
+    /// Enable AI features (agent, curve generation, etc).
+    #[serde(default = "default_ai_enabled")]
+    pub enabled: bool,
+}
+
+fn default_ollama_url() -> String {
+    "http://localhost:11434".to_string()
+}
+
+fn default_ai_enabled() -> bool {
+    false
+}
+
+impl Default for AiSettings {
+    fn default() -> Self {
+        Self {
+            provider: AiProviderKind::default(),
+            api_key: String::new(),
+            ollama_url: default_ollama_url(),
+            enabled: default_ai_enabled(),
+        }
+    }
+}
+
 // ── DaemonConfig ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +110,9 @@ pub struct DaemonConfig {
     /// Optional time-based profile schedule evaluated every 60 s.
     #[serde(default)]
     pub schedule: Vec<ScheduleEntry>,
+    /// AI provider configuration.
+    #[serde(default)]
+    pub ai: AiSettings,
 }
 
 impl Default for DaemonConfig {
@@ -56,6 +124,7 @@ impl Default for DaemonConfig {
             log_level: "info".to_string(),
             default_profile: "balanced".to_string(),
             schedule: Vec::new(),
+            ai: AiSettings::default(),
         }
     }
 }

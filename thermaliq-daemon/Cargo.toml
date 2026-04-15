@@ -33,6 +33,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 sysinfo = { version = "0.31", default-features = false, features = ["system"] }
 reqwest = { version = "0.12", features = ["json"] }
 chrono = { workspace = true }
+async-trait = "0.1"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-service = "0.6"

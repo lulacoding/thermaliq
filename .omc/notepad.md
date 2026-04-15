@@ -3,7 +3,7 @@
 
 ## Priority Context
 <!-- ALWAYS loaded. Keep under 500 chars. Critical discoveries only. -->
-THERMALIQ STATUS 2026-04-15: Phase 0 COMPLETE (daemon/HAL/CLI/UI). CURRENT: Phase 1 Windows HAL. Next task: thermaliq-hal/src/windows.rs — HWiNFO64 shared memory (Global\HWiNFO_SENS_SM2) + NVML GPU fans. Roadmap: docs/ROADMAP.md. Decision log in project memory.
+THERMALIQ Lane 2 (Multi-Provider AI) IN PROGRESS: AIProvider trait + 5 implementations (Anthropic, OpenAI, Gemini, Ollama, OpenRouter) complete. Config updated with AiSettings. AppState wired. Build clean. Next: Wire agent_task to use provider, update settings endpoint to save AI config dynamically.
 
 ## Working Memory
 <!-- Session notes. Auto-pruned after 7 days. -->
