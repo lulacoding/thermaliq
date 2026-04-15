@@ -226,7 +226,7 @@ fn cstr_to_string(bytes: &[u8]) -> String {
 
 fn wmi_snapshot() -> (Vec<SensorReading>, Vec<FanReading>) {
     use serde::Deserialize;
-    use wmi::{COMLibrary, WMIConnection};
+    use wmi::WMIConnection;
 
     #[derive(Deserialize)]
     #[serde(rename = "MSAcpi_ThermalZoneTemperature")]
@@ -237,15 +237,7 @@ fn wmi_snapshot() -> (Vec<SensorReading>, Vec<FanReading>) {
         instance_name: String,
     }
 
-    let com = match COMLibrary::new() {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(error = %e, "WMI COM init failed");
-            return (Vec::new(), Vec::new());
-        }
-    };
-
-    let conn = match WMIConnection::with_namespace_path("ROOT\\WMI", com.into()) {
+    let conn = match WMIConnection::with_namespace_path("ROOT\\WMI") {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(
