@@ -38,6 +38,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/profiles/active", get(get_active_profile))
         .route("/api/agent/status", get(agent_status))
         .route("/api/agent/interventions", get(list_interventions))
+        .route("/api/schedule", get(list_schedule))
         .route("/api/history/sensors/:sensor_id", get(history_sensors))
         .route("/api/history/fans/:fan_id", get(history_fans))
         .route("/api/calibration/:fan_id", get(get_calibration))
@@ -130,6 +131,11 @@ async fn list_interventions(State(state): State<AppState>) -> Json<Value> {
         .map(|v| v.clone())
         .unwrap_or_default();
     Json(json!({ "interventions": interventions }))
+}
+
+async fn list_schedule(State(state): State<AppState>) -> Json<Value> {
+    let entries = state.schedule.read().await.clone();
+    Json(json!({ "schedule": entries }))
 }
 
 #[derive(Deserialize)]
@@ -391,7 +397,10 @@ async fn run_calibration(
             .map(|f| f.rpm)
             .unwrap_or(0);
 
-        steps.push(CalibrationStep { duty_percent: duty, rpm });
+        steps.push(CalibrationStep {
+            duty_percent: duty,
+            rpm,
+        });
     }
 
     // Restore fan to auto / 0% after sweep.

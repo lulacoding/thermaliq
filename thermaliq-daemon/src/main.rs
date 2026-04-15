@@ -1,9 +1,10 @@
 mod agent_db;
 mod agent_task;
-mod app_monitor;
 mod api;
+mod app_monitor;
 mod poller;
 mod profile_gen;
+mod schedule_monitor;
 mod token;
 
 #[cfg(target_os = "windows")]
@@ -110,6 +111,7 @@ pub async fn run_daemon_inner() -> Result<()> {
         shutdown_tx: Arc::new(shutdown_tx),
         sensor_tx,
         agent_event_tx,
+        schedule: Arc::new(RwLock::new(config.schedule.clone())),
     };
 
     // Agent DB
@@ -132,6 +134,8 @@ pub async fn run_daemon_inner() -> Result<()> {
     let _agent = agent_task::start_agent_loop(state.clone(), agent_db.clone());
     let _app_monitor =
         app_monitor::start_app_monitor(state.clone(), config.default_profile.clone());
+    let _schedule_monitor =
+        schedule_monitor::start_schedule_monitor(state.clone(), config.default_profile.clone());
 
     // HTTP server
     let addr = format!("127.0.0.1:{}", config.api_port);

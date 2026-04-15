@@ -78,8 +78,19 @@ enum Command {
         #[arg(long, default_value = "1000")]
         interval_ms: u64,
     },
+    /// Schedule management
+    Schedule {
+        #[command(subcommand)]
+        action: ScheduleAction,
+    },
     /// Stop the daemon
     Stop,
+}
+
+#[derive(Subcommand)]
+enum ScheduleAction {
+    /// Show the configured time-based profile schedule
+    List,
 }
 
 #[derive(Subcommand)]
@@ -407,9 +418,7 @@ fn main() -> Result<()> {
 
         Command::Calibrate { fan_id } => {
             let token = require_token(&cli.token)?;
-            eprintln!(
-                "Calibrating fan '{fan_id}' — ramping 0→100% in 5% steps (≈42 s)…"
-            );
+            eprintln!("Calibrating fan '{fan_id}' — ramping 0→100% in 5% steps (≈42 s)…");
             // Calibration blocks for ~42 s; use a 120 s timeout.
             let long_client = reqwest::blocking::Client::builder()
                 .timeout(std::time::Duration::from_secs(120))
@@ -502,6 +511,43 @@ fn main() -> Result<()> {
                 thread::sleep(Duration::from_millis(*interval_ms));
             }
         }
+
+        Command::Schedule { action } => match action {
+            ScheduleAction::List => {
+                let data = get(&client, &format!("{base}/api/schedule"))?;
+                let empty = vec![];
+                let entries = data["schedule"].as_array().unwrap_or(&empty);
+                if entries.is_empty() {
+                    println!("No schedule entries configured.");
+                    println!("Add [[schedule]] entries to your daemon config.toml.");
+                } else {
+                    for entry in entries {
+                        let days = entry["days"]
+                            .as_array()
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|v| v.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            })
+                            .unwrap_or_default();
+                        let days_str = if days.is_empty() {
+                            "every day".to_string()
+                        } else {
+                            days
+                        };
+                        let time = entry["time"].as_str().unwrap_or("?");
+                        let profile = entry["profile"].as_str().unwrap_or("?");
+                        let note = entry["note"].as_str().unwrap_or("");
+                        if note.is_empty() {
+                            println!("  [{days_str}] {time} → {profile}");
+                        } else {
+                            println!("  [{days_str}] {time} → {profile}  ({note})");
+                        }
+                    }
+                }
+            }
+        },
 
         Command::Stop => {
             let token = require_token(&cli.token)?;
