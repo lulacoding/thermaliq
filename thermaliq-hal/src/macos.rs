@@ -388,9 +388,7 @@ fn send_helper_command(fan_idx: u8, duty: u8) -> Result<()> {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
 
-    let mut writer = stream
-        .try_clone()
-        .context("cloning helper socket stream")?;
+    let mut writer = stream.try_clone().context("cloning helper socket stream")?;
     let request = format!(r#"{{"cmd":"set_fan","fan_idx":{fan_idx},"duty":{duty}}}"#);
     writeln!(writer, "{request}").context("writing helper request")?;
 

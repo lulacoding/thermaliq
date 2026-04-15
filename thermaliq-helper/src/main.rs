@@ -438,9 +438,8 @@ mod macos {
                 }
                 Err(e) => Response::err(format!("invalid command: {e}")),
             };
-            let encoded = serde_json::to_string(&response).unwrap_or_else(|_| {
-                r#"{"ok":false,"error":"serialization failed"}"#.to_string()
-            });
+            let encoded = serde_json::to_string(&response)
+                .unwrap_or_else(|_| r#"{"ok":false,"error":"serialization failed"}"#.to_string());
             if writeln!(writer, "{encoded}").is_err() {
                 break;
             }
