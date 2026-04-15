@@ -1,5 +1,6 @@
 use anyhow::Result;
 use rusqlite::{params, Connection};
+use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,6 +109,27 @@ impl HistoryDb {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(records)
+    }
+
+    /// Average temperature for `sensor_id` over the last `seconds` of history.
+    /// Returns `None` when no rows exist in that window.
+    pub fn query_sensor_avg_last_seconds(
+        &self,
+        sensor_id: &str,
+        seconds: u64,
+    ) -> Result<Option<f32>> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let cutoff = now - seconds as i64;
+        let mut stmt = self.conn.prepare(
+            "SELECT AVG(temp_celsius) FROM sensor_readings \
+             WHERE sensor_id = ?1 AND recorded_at >= ?2",
+        )?;
+        let avg: Option<f64> =
+            stmt.query_row(params![sensor_id, cutoff], |row| row.get(0))?;
+        Ok(avg.map(|v| v as f32))
     }
 
     pub fn prune_older_than(&self, cutoff_unix: i64) -> Result<usize> {
