@@ -48,13 +48,14 @@ use windows::{
         Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE},
         System::{
             Com::{
-                CoCreateInstance, CoInitializeEx, CoInitializeSecurity, CoSetProxyBlanket,
-                CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, EOAC_NONE, RPC_C_AUTHN_LEVEL_DEFAULT,
-                RPC_C_IMP_LEVEL_IMPERSONATE,
+                CoCreateInstance, CoInitializeEx, CoSetProxyBlanket, CLSCTX_INPROC_SERVER,
+                COINIT_MULTITHREADED, EOAC_NONE, RPC_C_AUTHN_LEVEL_DEFAULT,
+                RPC_C_IMP_LEVEL_IMPERSONATE, VARIANT,
             },
-            Memory::{MapViewOfFile, OpenFileMappingW, UnmapViewOfFile, FILE_MAP_READ},
-            Ole::VariantToDoubleArray,
-            Variant::VARIANT,
+            Memory::{
+                MapViewOfFile, MEMORYMAPPEDVIEW_HANDLE, OpenFileMappingW, UnmapViewOfFile,
+                FILE_MAP_READ,
+            },
             Wmi::{
                 IWbemLocator, IWbemServices, WbemLocator, WBEM_FLAG_FORWARD_ONLY,
                 WBEM_FLAG_RETURN_IMMEDIATELY,
@@ -114,6 +115,7 @@ struct HwinfoReading {
 
 struct HwinfoMapping {
     handle: HANDLE,
+    view_handle: MEMORYMAPPEDVIEW_HANDLE,
     view: *const u8,
 }
 
@@ -137,17 +139,17 @@ impl HwinfoMapping {
             return Err(anyhow!("HWiNFO64 shared memory not found — is HWiNFO64 running?"));
         }
 
-        let view = unsafe { MapViewOfFile(handle, FILE_MAP_READ, 0, 0, 0) };
-        if view.Value.is_null() {
+        let view_handle = unsafe { MapViewOfFile(handle, FILE_MAP_READ, 0, 0, 0) };
+        if view_handle.Value.is_null() {
             unsafe { let _ = CloseHandle(handle); }
             return Err(anyhow!("MapViewOfFile failed"));
         }
 
         // Validate signature
-        let header = unsafe { &*(view.Value as *const HwinfoHeader) };
+        let header = unsafe { &*(view_handle.Value as *const HwinfoHeader) };
         if header.signature != HWINFO_SIGNATURE {
             unsafe {
-                UnmapViewOfFile(view);
+                UnmapViewOfFile(view_handle);
                 let _ = CloseHandle(handle);
             }
             return Err(anyhow!(
@@ -158,7 +160,8 @@ impl HwinfoMapping {
 
         Ok(Self {
             handle,
-            view: view.Value as *const u8,
+            view_handle,
+            view: view_handle.Value as *const u8,
         })
     }
 
@@ -212,9 +215,7 @@ impl HwinfoMapping {
 impl Drop for HwinfoMapping {
     fn drop(&mut self) {
         unsafe {
-            UnmapViewOfFile(windows::Win32::System::Memory::MEMORYMAPPEDVIEW_HANDLE(
-                self.view as _,
-            ));
+            UnmapViewOfFile(self.view_handle);
             let _ = CloseHandle(self.handle);
         }
     }
@@ -244,23 +245,24 @@ fn wmi_snapshot() -> (Vec<SensorReading>, Vec<FanReading>) {
     (sensors, fans)
 }
 
+/// Extract a numeric value from a WMI VARIANT. Handles VT_R8 (f64), VT_I4 (i32), VT_UI4 (u32).
+unsafe fn variant_to_f64(var: &VARIANT) -> Option<f64> {
+    let inner = &var.Anonymous.Anonymous;
+    match inner.vt.0 {
+        5 => Some(*inner.Anonymous.dblVal),      // VT_R8
+        3 => Some(*inner.Anonymous.lVal as f64), // VT_I4
+        19 => Some(*inner.Anonymous.ulVal as f64), // VT_UI4
+        _ => None,
+    }
+}
+
 fn wmi_query_sensors() -> Result<(Vec<SensorReading>, Vec<FanReading>)> {
     let mut sensors = Vec::new();
     let mut fans = Vec::new();
 
     unsafe {
-        CoInitializeSecurity(
-            None,
-            -1,
-            None,
-            None,
-            RPC_C_AUTHN_LEVEL_DEFAULT,
-            RPC_C_IMP_LEVEL_IMPERSONATE,
-            None,
-            EOAC_NONE,
-            None,
-        )
-        .ok(); // Ignore if already initialized
+        // CoInitializeSecurity is optional — omitting it uses default COM security
+        // which is sufficient for local WMI queries. Calling it requires Win32_Security.
 
         let locator: IWbemLocator =
             CoCreateInstance(&WbemLocator, None, CLSCTX_INPROC_SERVER)
@@ -314,9 +316,8 @@ fn wmi_query_sensors() -> Result<(Vec<SensorReading>, Vec<FanReading>)> {
                     .is_ok()
                 {
                     // deci-Kelvin → Celsius
-                    let mut buf = [0f64; 1];
-                    if VariantToDoubleArray(&var, &mut buf).is_ok() {
-                        let temp_c = (buf[0] / 10.0 - 273.15) as f32;
+                    if let Some(raw) = variant_to_f64(&var) {
+                        let temp_c = (raw / 10.0 - 273.15) as f32;
                         if temp_c > -40.0 && temp_c < 150.0 {
                             sensors.push(SensorReading {
                                 id: format!("wmi_thermal_{idx}"),
@@ -377,12 +378,7 @@ fn wmi_query_sensors() -> Result<(Vec<SensorReading>, Vec<FanReading>)> {
                     .Get(&BSTR::from("DesiredSpeed"), 0, &mut var, None, None)
                     .is_ok()
                 {
-                    let mut buf = [0f64; 1];
-                    if VariantToDoubleArray(&var, &mut buf).is_ok() {
-                        buf[0] as u32
-                    } else {
-                        0
-                    }
+                    variant_to_f64(&var).unwrap_or(0.0) as u32
                 } else {
                     0
                 };
@@ -457,18 +453,14 @@ fn nvml_set_fan(fan_id: &str, duty_percent: u8) -> Result<()> {
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| anyhow!("invalid nvml fan id: {fan_id}"))?;
 
-    let nvml = nvml_wrapper::Nvml::init().context("NVML init")?;
-    let device = nvml.device_by_index(gpu_idx).context("NVML device")?;
-    device
-        .set_fan_speed(fan_idx, duty_percent as u32)
-        .context("NVML set_fan_speed (requires driver 520+)")?;
-
-    tracing::info!(
-        fan = fan_id,
-        duty = duty_percent,
-        "Windows: NVML GPU fan speed set"
-    );
-    Ok(())
+    // nvml-wrapper 0.10 does not yet expose nvmlDeviceSetFanSpeed_v2 in its safe
+    // API. Fan speed writes will be available in a future crate release.
+    // Track: https://github.com/Cldfire/nvml-wrapper/issues
+    let _ = (gpu_idx, fan_idx, duty_percent);
+    bail!(
+        "NVML GPU fan writes are not yet available in nvml-wrapper 0.10. \
+         Upgrade the crate when nvmlDeviceSetFanSpeed_v2 is wrapped."
+    )
 }
 
 // ── AMD ADL fan control ───────────────────────────────────────────────────────
