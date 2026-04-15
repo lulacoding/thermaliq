@@ -351,7 +351,10 @@ async fn run_calibration(
             .map(|f| f.rpm)
             .unwrap_or(0);
 
-        steps.push(CalibrationStep { duty_percent: duty, rpm });
+        steps.push(CalibrationStep {
+            duty_percent: duty,
+            rpm,
+        });
     }
 
     // Restore fan to auto / 0% after sweep.

@@ -86,11 +86,8 @@ pub fn start_poll_loop(state: AppState, interval_ms: u64) -> tokio::task::JoinHa
                         let db = state.history.lock().ok();
                         evaluate_custom_sensors(&profile.sensors, &snap.sensors, db.as_deref())
                     };
-                    let all_sensors: Vec<&SensorReading> = snap
-                        .sensors
-                        .iter()
-                        .chain(virtual_sensors.iter())
-                        .collect();
+                    let all_sensors: Vec<&SensorReading> =
+                        snap.sensors.iter().chain(virtual_sensors.iter()).collect();
 
                     for control in &profile.controls {
                         let Some(curve) =
@@ -117,16 +114,22 @@ pub fn start_poll_loop(state: AppState, interval_ms: u64) -> tokio::task::JoinHa
                         // deadband logic to prevent fan chatter at low duty values.
                         let effective_duty = match (control.stop_percent, control.start_percent) {
                             (Some(stop), Some(start)) => {
-                                let currently_running = fan_running
-                                    .get(&control.fan)
-                                    .copied()
-                                    .unwrap_or(false);
+                                let currently_running =
+                                    fan_running.get(&control.fan).copied().unwrap_or(false);
                                 if currently_running {
                                     // Fan is spinning — keep it on unless below stop_percent.
-                                    if raw_duty <= stop { 0 } else { raw_duty }
+                                    if raw_duty <= stop {
+                                        0
+                                    } else {
+                                        raw_duty
+                                    }
                                 } else {
                                     // Fan is stopped — only start if above start_percent.
-                                    if raw_duty > start { raw_duty } else { 0 }
+                                    if raw_duty > start {
+                                        raw_duty
+                                    } else {
+                                        0
+                                    }
                                 }
                             }
                             _ => raw_duty,
@@ -192,7 +195,11 @@ fn evaluate_custom_sensors(
                 })
             }
 
-            CustomSensor::Mix { id, function, sources } => {
+            CustomSensor::Mix {
+                id,
+                function,
+                sources,
+            } => {
                 let temps: Vec<f32> = sources
                     .iter()
                     .filter_map(|src| all.iter().find(|s| &s.id == src))
@@ -234,10 +241,10 @@ fn evaluate_custom_sensors(
                     std::fs::read_to_string(path).ok().and_then(|s| {
                         let s = s.trim();
                         // Accept plain float ("45.5") or hwmon millidegrees ("45500").
-                        let temp = s
-                            .parse::<f32>()
-                            .ok()
-                            .map(|v| if v > 1000.0 { v / 1000.0 } else { v })?;
+                        let temp =
+                            s.parse::<f32>()
+                                .ok()
+                                .map(|v| if v > 1000.0 { v / 1000.0 } else { v })?;
                         if temp > -40.0 && temp < 200.0 {
                             Some(SensorReading {
                                 id: id.clone(),
@@ -252,13 +259,11 @@ fn evaluate_custom_sensors(
             }
 
             CustomSensor::Offset { id, source, offset } => {
-                all.iter()
-                    .find(|s| &s.id == source)
-                    .map(|s| SensorReading {
-                        id: id.clone(),
-                        label: format!("{source} + {offset:+.1}°C"),
-                        temp_celsius: s.temp_celsius + offset,
-                    })
+                all.iter().find(|s| &s.id == source).map(|s| SensorReading {
+                    id: id.clone(),
+                    label: format!("{source} + {offset:+.1}°C"),
+                    temp_celsius: s.temp_celsius + offset,
+                })
             }
         };
 

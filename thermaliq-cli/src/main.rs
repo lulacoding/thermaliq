@@ -382,9 +382,7 @@ fn main() -> Result<()> {
 
         Command::Calibrate { fan_id } => {
             let token = require_token(&cli.token)?;
-            eprintln!(
-                "Calibrating fan '{fan_id}' — ramping 0→100% in 5% steps (≈42 s)…"
-            );
+            eprintln!("Calibrating fan '{fan_id}' — ramping 0→100% in 5% steps (≈42 s)…");
             // Calibration blocks for ~42 s; use a 120 s timeout.
             let long_client = reqwest::blocking::Client::builder()
                 .timeout(std::time::Duration::from_secs(120))
