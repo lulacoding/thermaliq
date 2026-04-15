@@ -15,12 +15,6 @@ function tempBadgeClass(c: number): string {
   return "badge badge-green";
 }
 
-function dutyBarColor(pct: number): string {
-  if (pct >= 85) return "var(--red)";
-  if (pct >= 60) return "var(--yellow)";
-  return "var(--accent)";
-}
-
 // Generate mock time-series data (1 hour)
 function generateChartData(sensors: Sensor[]) {
   const data = [];
@@ -64,21 +58,21 @@ function getLogColor(type: LogEntry["type"]): string {
   }
 }
 
-function FanSpinner({ fan }: { fan: Fan }) {
+function FanSpinner({ fan, index }: { fan: Fan; index: number }) {
   const durations = [1.5, 1.6, 1.8, 2.0, 2.2];
-  const duration = durations[fan.id % durations.length];
+  const duration = durations[index % durations.length];
 
   return (
     <div style={styles.fanCell}>
       <style>{`
-        @keyframes spin-fan-${fan.id} {
+        @keyframes spin-fan-${index} {
           from { transform: rotate(0deg); }
           to { transform: rotate(360deg); }
         }
       `}</style>
       <div
         style={{
-          animation: `spin-fan-${fan.id} ${duration}s linear infinite`,
+          animation: `spin-fan-${index} ${duration}s linear infinite`,
           display: "flex",
           alignItems: "center",
           justifyContent: "center",
@@ -269,8 +263,8 @@ export default function Dashboard() {
           {/* Fan Status Grid — overlay below logs */}
           {fans.length > 0 && (
             <div style={styles.fanStatusGrid}>
-              {fans.map((f) => (
-                <FanSpinner key={f.id} fan={f} />
+              {fans.map((f, idx) => (
+                <FanSpinner key={f.id} fan={f} index={idx} />
               ))}
             </div>
           )}
