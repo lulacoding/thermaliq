@@ -110,6 +110,7 @@ export default function ProfileManager() {
                   ...(isActive ? styles.profileCardActive : {}),
                 }}
               >
+                <div style={styles.profileCardAccentBar} />
                 <div style={styles.profileTop}>
                   <div style={styles.profileIconWrap}>
                     <Layers
@@ -199,6 +200,16 @@ const styles: Record<string, React.CSSProperties> = {
     textAlign: "left",
     cursor: "pointer",
     transition: "border-color 0.15s, background 0.15s",
+    position: "relative",
+    overflow: "hidden",
+  },
+  profileCardAccentBar: {
+    position: "absolute",
+    bottom: 0,
+    left: 0,
+    right: 0,
+    height: 4,
+    background: "var(--accent)",
   },
   profileCardActive: {
     borderColor: "var(--accent)",

@@ -24,51 +24,20 @@
     ],
     "security": {
       "csp": null
-    },
-    "trayIcon": {
-      "id": "thermaliq-tray",
-      "iconPath": "icons/32x32.png",
-      "tooltip": "ThermalIQ"
     }
   },
   "bundle": {
     "active": true,
     "targets": "all",
-    "icon": [
-      "icons/32x32.png",
-      "icons/128x128.png",
-      "icons/128x128@2x.png",
-      "icons/icon.icns",
-      "icons/icon.ico"
-    ],
-    "resources": [
-      "resources/thermaliq-daemon.exe"
-    ],
     "windows": {
       "nsis": {
-        "installMode": "perMachine",
-        "installerIcon": "icons/icon.ico",
-        "compression": "lzma",
-        "startMenuFolder": "ThermalIQ",
-        "createDesktopShortcut": true,
-        "createStartMenuShortcut": true,
-        "include": "nsis/installer-hooks.nsi"
-      },
-      "wix": {
-        "language": "en-US"
-      },
-      "requestedExecutionLevel": "asInvoker"
+        "installerIcon": "icons/icon.ico"
+      }
     }
   },
   "plugins": {
     "shell": {
       "open": true
-    },
-    "fs": {
-      "scope": {
-        "allow": ["$HOME/.config/thermaliq/**", "$APPDATA/thermaliq/**"],
-        "deny": []
-      }
     }
   }
 }

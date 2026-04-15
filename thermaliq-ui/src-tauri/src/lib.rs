@@ -46,8 +46,7 @@ fn setup_tray(app: &mut tauri::App, state: Arc<Mutex<TrayState>>) -> tauri::Resu
 
     let _tray = TrayIconBuilder::with_id(TRAY_ID)
         .icon(app.default_window_icon().cloned().unwrap_or_else(|| {
-            tauri::image::Image::from_bytes(include_bytes!("../icons/32x32.png"))
-                .expect("tray icon missing")
+            tauri::image::Image::new(&[0, 0, 0, 255], 1, 1)
         }))
         .tooltip("ThermalIQ")
         .menu(&menu)
