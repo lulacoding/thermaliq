@@ -3,7 +3,7 @@
 
 ## Priority Context
 <!-- ALWAYS loaded. Keep under 500 chars. Critical discoveries only. -->
-THERMALIQ Lane 2 (Multi-Provider AI) IN PROGRESS: AIProvider trait + 5 implementations (Anthropic, OpenAI, Gemini, Ollama, OpenRouter) complete. Config updated with AiSettings. AppState wired. Build clean. Next: Wire agent_task to use provider, update settings endpoint to save AI config dynamically.
+THERMALIQ Lane 2 (Multi-Provider AI) IN PROGRESS: Phase 1+2 complete (AIProvider trait, 5 implementations, agent_task integration). Phase 3 remaining: POST /api/settings/ai-provider endpoint to dynamically save/reload config. ~1h remaining on Lane 2.
 
 ## Working Memory
 <!-- Session notes. Auto-pruned after 7 days. -->

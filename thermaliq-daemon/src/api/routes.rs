@@ -14,6 +14,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use super::auth::{require_bearer_auth, AgentMode, AppState};
 use super::ws;
+use crate::ai_provider::{create_provider, AIProviderKind};
 
 /// Build the axum Router with all endpoints configured.
 ///
@@ -582,19 +583,70 @@ async fn get_settings(_state: State<AppState>) -> Result<Json<Value>, StatusCode
 /// `POST /api/settings/ai-provider` — set the AI provider and API key.
 ///
 /// Body: `{"provider": "anthropic", "api_key": "..."}`
+/// `POST /api/settings/ai-provider` — set and initialize AI provider.
+///
+/// Body: `{"provider": "anthropic", "api_key": "sk-..."}`
+/// Updates AppState.ai_provider with the new provider instance.
+/// If provider creation fails, returns BAD_REQUEST with error details.
 async fn set_ai_provider(
-    _state: State<AppState>,
+    state: State<AppState>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, StatusCode> {
-    let provider = body["provider"].as_str().ok_or(StatusCode::BAD_REQUEST)?;
-    let _api_key = body["api_key"].as_str().ok_or(StatusCode::BAD_REQUEST)?;
+    let provider_str = body["provider"].as_str().ok_or(StatusCode::BAD_REQUEST)?;
+    let api_key = body["api_key"].as_str().ok_or(StatusCode::BAD_REQUEST)?;
 
-    tracing::info!(provider = %provider, "AI provider set");
+    if api_key.is_empty() {
+        tracing::warn!("AI provider set with empty API key");
+        return Err(StatusCode::BAD_REQUEST);
+    }
 
-    Ok(Json(json!({
-        "ai_provider": provider,
-        "status": "configured"
-    })))
+    // Parse provider kind
+    let provider_kind = match provider_str {
+        "anthropic" => AIProviderKind::Anthropic,
+        "openai" => AIProviderKind::OpenAI,
+        "gemini" => AIProviderKind::Gemini,
+        "ollama" => AIProviderKind::Ollama,
+        "openrouter" => AIProviderKind::OpenRouter,
+        _ => {
+            tracing::warn!(provider = %provider_str, "unknown AI provider");
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    };
+
+    // Create provider instance
+    match create_provider(provider_kind, api_key.to_string()) {
+        Ok(provider) => {
+            // Clone provider_str for spawned task (must be 'static)
+            let provider_name = provider_str.to_string();
+            let provider_name_for_log = provider_name.clone();
+
+            // Update the provider in AppState via spawned task
+            let state_clone = state.clone();
+            tokio::spawn(async move {
+                let mut ai_provider = state_clone.ai_provider.lock().await;
+                *ai_provider = Some(provider);
+                tracing::info!(
+                    provider = %provider_name_for_log,
+                    "AI provider dynamically updated"
+                );
+            });
+
+            tracing::info!(provider = %provider_str, "AI provider initialized and set");
+            Ok(Json(json!({
+                "provider": provider_str,
+                "status": "configured",
+                "message": "AI provider updated successfully"
+            })))
+        }
+        Err(e) => {
+            tracing::warn!(
+                provider = %provider_str,
+                error = %e,
+                "failed to initialize AI provider"
+            );
+            Err(StatusCode::BAD_REQUEST)
+        }
+    }
 }
 
 /// `POST /api/settings/trust-level` — set AI agent trust level.
