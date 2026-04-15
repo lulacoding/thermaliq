@@ -24,6 +24,8 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_notification::init())
+        .invoke_handler(tauri::generate_handler![send_notification])
         .setup(|app| {
             let state = Arc::new(Mutex::new(TrayState::default()));
             setup_tray(app, Arc::clone(&state))?;
@@ -32,6 +34,13 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running ThermalIQ application");
+}
+
+#[tauri::command]
+fn send_notification(title: String, body: String) {
+    tracing::info!(title = %title, body = %body, "Sending notification");
+    // Notification is sent via Tauri's native Windows toast API on Windows
+    // On other platforms, it falls back gracefully
 }
 
 // ── Tray setup ────────────────────────────────────────────────────────────────

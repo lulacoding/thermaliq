@@ -193,6 +193,11 @@ pub fn start_agent_loop(
                         "reason": reason,
                         "cpu_temp": cpu_temp,
                         "gpu_temp": gpu_temp,
+                        "notification": {
+                            "title": "🚨 Critical Thermal Alert",
+                            "message": format!("{} — all fans at 100%", reason),
+                            "severity": "error"
+                        }
                     })
                     .to_string(),
                 );
@@ -306,6 +311,11 @@ pub fn start_agent_loop(
                                 "id": &id,
                                 "action": &action,
                                 "description": &intervention.description,
+                                "notification": {
+                                    "title": "⚡ AI Agent Applied",
+                                    "message": format!("{} — fan curve adjusted", intervention.description),
+                                    "severity": "info"
+                                }
                             })
                             .to_string(),
                         );
@@ -317,6 +327,11 @@ pub fn start_agent_loop(
                                 "id": &id,
                                 "action": &action,
                                 "description": &intervention.description,
+                                "notification": {
+                                    "title": "🤖 AI Agent Review",
+                                    "message": format!("{} — awaiting your approval", intervention.description),
+                                    "severity": "warning"
+                                }
                             })
                             .to_string(),
                         );
@@ -342,6 +357,11 @@ async fn apply_intervention(state: &AppState, intervention: &Intervention) {
                         "type": "profile_changed",
                         "profile": profile_name,
                         "source": "agent",
+                        "notification": {
+                            "title": "🎯 Profile Switched",
+                            "message": format!("Switched to {} profile", profile_name),
+                            "severity": "info"
+                        }
                     })
                     .to_string(),
                 );

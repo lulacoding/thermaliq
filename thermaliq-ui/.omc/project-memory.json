@@ -116,33 +116,33 @@
   },
   "hotPaths": [
     {
+      "path": "src/App.tsx",
+      "accessCount": 14,
+      "lastAccessed": 1776259992880,
+      "type": "file"
+    },
+    {
       "path": "src-tauri/tauri.conf.json",
       "accessCount": 13,
       "lastAccessed": 1776254265564,
       "type": "file"
     },
     {
-      "path": "src/App.tsx",
-      "accessCount": 11,
-      "lastAccessed": 1776255979316,
+      "path": "src/components/Dashboard.tsx",
+      "accessCount": 13,
+      "lastAccessed": 1776259465277,
+      "type": "file"
+    },
+    {
+      "path": "src/components/SettingsPanel.tsx",
+      "accessCount": 12,
+      "lastAccessed": 1776260590012,
       "type": "file"
     },
     {
       "path": "src/components/CurveEditor.tsx",
       "accessCount": 11,
       "lastAccessed": 1776258620394,
-      "type": "file"
-    },
-    {
-      "path": "src/components/SettingsPanel.tsx",
-      "accessCount": 10,
-      "lastAccessed": 1776255754055,
-      "type": "file"
-    },
-    {
-      "path": "src/components/Dashboard.tsx",
-      "accessCount": 7,
-      "lastAccessed": 1776255662063,
       "type": "file"
     },
     {
@@ -159,8 +159,8 @@
     },
     {
       "path": "src-tauri/src/lib.rs",
-      "accessCount": 5,
-      "lastAccessed": 1776253927221,
+      "accessCount": 6,
+      "lastAccessed": 1776259938272,
       "type": "file"
     },
     {
@@ -173,6 +173,24 @@
       "path": "src/components/ProfileManager.tsx",
       "accessCount": 3,
       "lastAccessed": 1776255841170,
+      "type": "file"
+    },
+    {
+      "path": "src-tauri/Cargo.toml",
+      "accessCount": 3,
+      "lastAccessed": 1776260215977,
+      "type": "file"
+    },
+    {
+      "path": "src/hooks/useNotifications.ts",
+      "accessCount": 3,
+      "lastAccessed": 1776261712886,
+      "type": "file"
+    },
+    {
+      "path": "src/hooks/useDaemon.ts",
+      "accessCount": 2,
+      "lastAccessed": 1776259967485,
       "type": "file"
     },
     {

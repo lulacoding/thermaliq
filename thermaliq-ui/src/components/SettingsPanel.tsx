@@ -132,6 +132,13 @@ export default function SettingsPanel() {
       setError(null);
       setSuccess(null);
 
+      // Validate API key requirement
+      if (!settings.api_key && settings.provider !== "ollama") {
+        setError("API key is required for non-local providers");
+        setSaving(false);
+        return;
+      }
+
       const token = apiToken || localStorage.getItem("api_token");
       const headers: HeadersInit = {
         "Content-Type": "application/json",

@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "identifier": "default",
+  "description": "Enables core and notification permissions",
+  "windows": ["main"],
+  "permissions": [
+    "core:webview:allow-internal-toggle-devtools",
+    "notification:default"
+  ]
+}

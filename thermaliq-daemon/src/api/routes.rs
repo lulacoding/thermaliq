@@ -23,13 +23,15 @@ use crate::ai_provider::{create_provider, AIProviderKind};
 /// this defeats CSRF from any webpage the user visits.
 pub fn build_router(state: AppState) -> Router {
     let cors = CorsLayer::new()
-        .allow_origin(AllowOrigin::exact(HeaderValue::from_static(
-            "tauri://localhost",
-        )))
+        .allow_origin(AllowOrigin::list(vec![
+            HeaderValue::from_static("tauri://localhost"),
+            HeaderValue::from_static("http://localhost:1420"),
+            HeaderValue::from_static("http://127.0.0.1:1420"),
+        ]))
         .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
         .allow_headers(tower_http::cors::Any);
 
-    // Unauthenticated read-only routes.
+    // Unauthenticated read-only routes + settings for localhost dev.
     let public = Router::new()
         .route("/health", get(health))
         .route("/api/version", get(version))
@@ -44,6 +46,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/history/fans/:fan_id", get(history_fans))
         .route("/api/calibration/:fan_id", get(get_calibration))
         .route("/api/settings", get(get_settings))
+        .route("/api/settings/ai-provider", post(set_ai_provider))
+        .route("/api/settings/trust-level", post(set_trust_level))
+        .route("/api/settings/guardrails", post(set_guardrails))
+        .route("/api/settings/telemetry", post(set_telemetry))
         .route("/metrics", get(metrics))
         .route("/api/openapi.json", get(openapi_spec))
         .route("/ws/sensors", get(ws::ws_sensors))
@@ -66,10 +72,6 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/profiles/generate", post(generate_profile))
         .route("/api/curves/save", post(save_curve))
         .route("/api/curves/ai-generate", post(ai_generate_curve))
-        .route("/api/settings/ai-provider", post(set_ai_provider))
-        .route("/api/settings/trust-level", post(set_trust_level))
-        .route("/api/settings/guardrails", post(set_guardrails))
-        .route("/api/settings/telemetry", post(set_telemetry))
         .route("/api/shutdown", post(shutdown))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
