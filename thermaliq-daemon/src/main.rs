@@ -136,7 +136,7 @@ pub async fn run_daemon_inner() -> Result<()> {
         sensor_tx,
         agent_event_tx,
         schedule: Arc::new(RwLock::new(config.schedule.clone())),
-        ai_provider: Arc::new(Mutex::new(ai_provider_opt)),
+        ai_provider: Arc::new(tokio::sync::Mutex::new(ai_provider_opt)),
     };
 
     // Agent DB

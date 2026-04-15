@@ -234,22 +234,32 @@ pub fn start_agent_loop(
                         continue;
                     }
 
-                    let (reason, action) = if cpu_temp > MAX_CPU_TEMP {
-                        (
-                            format!("CPU {:.1}°C exceeds safety threshold", cpu_temp),
-                            "switch_profile:performance".to_string(),
-                        )
-                    } else if workload == WorkloadKind::Stress {
-                        (
-                            format!("Stress workload detected, CPU {:.1}°C", cpu_temp),
-                            "switch_profile:performance".to_string(),
-                        )
-                    } else {
-                        (
-                            format!("Gaming workload, CPU {:.1}°C", cpu_temp),
-                            "switch_profile:balanced".to_string(),
-                        )
-                    };
+                    let (reason, action) = enhance_intervention_with_ai(
+                        &state,
+                        cpu_temp,
+                        gpu_temp,
+                        &workload,
+                    )
+                    .await
+                    .unwrap_or_else(|| {
+                        // Fallback to hardcoded logic if AI is unavailable
+                        if cpu_temp > MAX_CPU_TEMP {
+                            (
+                                format!("CPU {:.1}°C exceeds safety threshold", cpu_temp),
+                                "switch_profile:performance".to_string(),
+                            )
+                        } else if workload == WorkloadKind::Stress {
+                            (
+                                format!("Stress workload detected, CPU {:.1}°C", cpu_temp),
+                                "switch_profile:performance".to_string(),
+                            )
+                        } else {
+                            (
+                                format!("Gaming workload, CPU {:.1}°C", cpu_temp),
+                                "switch_profile:balanced".to_string(),
+                            )
+                        }
+                    });
 
                     let id = make_id();
                     let before_snapshot = serde_json::to_string(&serde_json::json!({
@@ -341,6 +351,75 @@ async fn apply_intervention(state: &AppState, intervention: &Intervention) {
             }
         }
     }
+}
+
+/// Attempt to enhance intervention reason and action with AI-generated reasoning.
+/// If AI provider is unavailable or fails, returns None and caller uses fallback logic.
+async fn enhance_intervention_with_ai(
+    state: &AppState,
+    cpu_temp: f32,
+    gpu_temp: f32,
+    workload: &WorkloadKind,
+) -> Option<(String, String)> {
+    // Check if AI provider is configured
+    let ai_provider_guard = state.ai_provider.lock().await;
+    let provider = ai_provider_guard.as_ref()?;
+
+    // Build a thermal context prompt
+    let prompt = format!(
+        "Analyze thermal conditions and recommend a fan profile adjustment:\n\
+        - CPU Temperature: {:.1}°C\n\
+        - GPU Temperature: {:.1}°C\n\
+        - Detected Workload: {}\n\
+        - Thresholds: Normal operation <80°C, elevated 80-85°C, high >85°C\n\n\
+        Respond with ONLY two lines:\n\
+        LINE 1: Brief reason for adjustment\n\
+        LINE 2: Profile recommendation (silent, balanced, or performance)\n\
+        Example:\n\
+        GPU thermal load detected; switching to balanced cooling\n\
+        balanced",
+        cpu_temp, gpu_temp, workload.as_str()
+    );
+
+    // Call AI provider
+    match provider.send_prompt(&prompt).await {
+        Ok(response) => {
+            let lines: Vec<&str> = response.lines().collect();
+            if lines.len() >= 2 {
+                let reason = lines[0].trim().to_string();
+                let profile_rec = lines[1].trim().to_string();
+
+                // Validate profile recommendation
+                if matches!(
+                    profile_rec.as_str(),
+                    "silent" | "balanced" | "performance" | "quiet" | "cool" | "gaming"
+                ) {
+                    let action = format!("switch_profile:{}", profile_rec);
+                    tracing::debug!(
+                        "[agent:ai] AI recommended: {} (action: {})",
+                        reason,
+                        action
+                    );
+                    return Some((reason, action));
+                } else {
+                    tracing::warn!(
+                        "[agent:ai] Invalid profile recommendation: '{}', using fallback",
+                        profile_rec
+                    );
+                }
+            } else {
+                tracing::warn!(
+                    "[agent:ai] Unexpected response format: {}",
+                    response
+                );
+            }
+        }
+        Err(e) => {
+            tracing::debug!("[agent:ai] Provider call failed: {}, using fallback", e);
+        }
+    }
+
+    None
 }
 
 fn make_id() -> String {

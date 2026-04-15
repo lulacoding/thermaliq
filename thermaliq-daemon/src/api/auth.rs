@@ -61,7 +61,7 @@ pub struct AppState {
     /// Time-based profile schedule, updated at runtime.
     pub schedule: Arc<RwLock<Vec<ScheduleEntry>>>,
     /// Optional AI provider for autonomous decisions and curve generation.
-    pub ai_provider: Arc<Mutex<Option<Box<dyn crate::ai_provider::AIProvider>>>>,
+    pub ai_provider: Arc<tokio::sync::Mutex<Option<Box<dyn crate::ai_provider::AIProvider>>>>,
 }
 
 impl axum::extract::FromRef<AppState> for Arc<String> {
