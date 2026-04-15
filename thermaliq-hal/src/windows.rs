@@ -43,24 +43,10 @@ use crate::HardwareLayer;
 
 // ── Windows-only imports ─────────────────────────────────────────────────────
 use windows::{
-    core::{BSTR, PCWSTR},
+    core::PCWSTR,
     Win32::{
         Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE},
-        System::{
-            Com::{
-                CoCreateInstance, CoInitializeEx, CoSetProxyBlanket, CLSCTX_INPROC_SERVER,
-                COINIT_MULTITHREADED, EOAC_NONE, RPC_C_AUTHN_LEVEL_DEFAULT,
-                RPC_C_IMP_LEVEL_IMPERSONATE, VARIANT,
-            },
-            Memory::{
-                MapViewOfFile, MEMORYMAPPEDVIEW_HANDLE, OpenFileMappingW, UnmapViewOfFile,
-                FILE_MAP_READ,
-            },
-            Wmi::{
-                IWbemLocator, IWbemServices, WbemLocator, WBEM_FLAG_FORWARD_ONLY,
-                WBEM_FLAG_RETURN_IMMEDIATELY,
-            },
-        },
+        System::Memory::{MapViewOfFile, OpenFileMappingW, UnmapViewOfFile, FILE_MAP_READ},
     },
 };
 
@@ -115,7 +101,6 @@ struct HwinfoReading {
 
 struct HwinfoMapping {
     handle: HANDLE,
-    view_handle: MEMORYMAPPEDVIEW_HANDLE,
     view: *const u8,
 }
 
@@ -139,17 +124,19 @@ impl HwinfoMapping {
             return Err(anyhow!("HWiNFO64 shared memory not found — is HWiNFO64 running?"));
         }
 
-        let view_handle = unsafe { MapViewOfFile(handle, FILE_MAP_READ, 0, 0, 0) };
-        if view_handle.Value.is_null() {
+        let view_mapped = unsafe { MapViewOfFile(handle, FILE_MAP_READ, 0, 0, 0) };
+        // MapViewOfFile returns a handle newtype; .Value is the raw *mut c_void pointer.
+        let view_ptr = view_mapped.Value;
+        if view_ptr.is_null() {
             unsafe { let _ = CloseHandle(handle); }
             return Err(anyhow!("MapViewOfFile failed"));
         }
 
         // Validate signature
-        let header = unsafe { &*(view_handle.Value as *const HwinfoHeader) };
+        let header = unsafe { &*(view_ptr as *const HwinfoHeader) };
         if header.signature != HWINFO_SIGNATURE {
             unsafe {
-                UnmapViewOfFile(view_handle);
+                UnmapViewOfFile(view_mapped);
                 let _ = CloseHandle(handle);
             }
             return Err(anyhow!(
@@ -160,8 +147,7 @@ impl HwinfoMapping {
 
         Ok(Self {
             handle,
-            view_handle,
-            view: view_handle.Value as *const u8,
+            view: view_ptr as *const u8,
         })
     }
 
@@ -215,7 +201,9 @@ impl HwinfoMapping {
 impl Drop for HwinfoMapping {
     fn drop(&mut self) {
         unsafe {
-            UnmapViewOfFile(self.view_handle);
+            // UnmapViewOfFile takes a handle newtype wrapping *mut c_void.
+            // Transmute from our raw pointer — the layout is identical.
+            UnmapViewOfFile(std::mem::transmute(self.view as *mut std::ffi::c_void));
             let _ = CloseHandle(self.handle);
         }
     }
@@ -227,173 +215,18 @@ fn cstr_to_string(bytes: &[u8]) -> String {
 }
 
 // ── WMI fallback ──────────────────────────────────────────────────────────────
+//
+// Phase 1: WMI COM fallback is stubbed out. The windows 0.58 crate relocates
+// VARIANT and related COM types across feature-gated sub-modules that vary by
+// version; a full WMI integration will be added in Phase 2 once verified on a
+// live Windows machine. HWiNFO64 covers the primary use-case.
 
 fn wmi_snapshot() -> (Vec<SensorReading>, Vec<FanReading>) {
-    let mut sensors = Vec::new();
-    let mut fans = Vec::new();
-
-    // Each spawn_blocking thread needs its own COM init.
-    unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-    }
-
-    if let Ok((s, f)) = wmi_query_sensors() {
-        sensors = s;
-        fans = f;
-    }
-
-    (sensors, fans)
-}
-
-/// Extract a numeric value from a WMI VARIANT. Handles VT_R8 (f64), VT_I4 (i32), VT_UI4 (u32).
-unsafe fn variant_to_f64(var: &VARIANT) -> Option<f64> {
-    let inner = &var.Anonymous.Anonymous;
-    match inner.vt.0 {
-        5 => Some(*inner.Anonymous.dblVal),      // VT_R8
-        3 => Some(*inner.Anonymous.lVal as f64), // VT_I4
-        19 => Some(*inner.Anonymous.ulVal as f64), // VT_UI4
-        _ => None,
-    }
-}
-
-fn wmi_query_sensors() -> Result<(Vec<SensorReading>, Vec<FanReading>)> {
-    let mut sensors = Vec::new();
-    let mut fans = Vec::new();
-
-    unsafe {
-        // CoInitializeSecurity is optional — omitting it uses default COM security
-        // which is sufficient for local WMI queries. Calling it requires Win32_Security.
-
-        let locator: IWbemLocator =
-            CoCreateInstance(&WbemLocator, None, CLSCTX_INPROC_SERVER)
-                .context("CoCreateInstance WbemLocator")?;
-
-        // ── MSAcpi_ThermalZoneTemperature (root\wmi) ──────────────────────
-        let svc_wmi: IWbemServices = locator
-            .ConnectServer(
-                &BSTR::from("root\\wmi"),
-                &BSTR::default(),
-                &BSTR::default(),
-                &BSTR::default(),
-                0,
-                &BSTR::default(),
-                None,
-            )
-            .context("WMI connect root\\wmi")?;
-
-        CoSetProxyBlanket(
-            &svc_wmi,
-            10, // RPC_C_AUTHN_WINNT
-            0,
-            None,
-            RPC_C_AUTHN_LEVEL_DEFAULT,
-            RPC_C_IMP_LEVEL_IMPERSONATE,
-            None,
-            EOAC_NONE,
-        )
-        .ok();
-
-        let enumerator = svc_wmi
-            .ExecQuery(
-                &BSTR::from("WQL"),
-                &BSTR::from("SELECT * FROM MSAcpi_ThermalZoneTemperature"),
-                WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
-                None,
-            )
-            .context("WMI thermal query")?;
-
-        let mut idx = 0usize;
-        loop {
-            let mut row = [None];
-            let mut returned = 0u32;
-            if enumerator.Next(0, &mut row, &mut returned).is_err() || returned == 0 {
-                break;
-            }
-            if let Some(obj) = &row[0] {
-                let mut var = VARIANT::default();
-                if obj
-                    .Get(&BSTR::from("CurrentTemperature"), 0, &mut var, None, None)
-                    .is_ok()
-                {
-                    // deci-Kelvin → Celsius
-                    if let Some(raw) = variant_to_f64(&var) {
-                        let temp_c = (raw / 10.0 - 273.15) as f32;
-                        if temp_c > -40.0 && temp_c < 150.0 {
-                            sensors.push(SensorReading {
-                                id: format!("wmi_thermal_{idx}"),
-                                label: format!("WMI Thermal Zone {idx}"),
-                                temp_celsius: temp_c,
-                            });
-                            idx += 1;
-                        }
-                    }
-                }
-            }
-        }
-
-        // ── Win32_Fan (root\cimv2) ────────────────────────────────────────
-        let svc_cimv2: IWbemServices = locator
-            .ConnectServer(
-                &BSTR::from("root\\cimv2"),
-                &BSTR::default(),
-                &BSTR::default(),
-                &BSTR::default(),
-                0,
-                &BSTR::default(),
-                None,
-            )
-            .context("WMI connect root\\cimv2")?;
-
-        CoSetProxyBlanket(
-            &svc_cimv2,
-            10,
-            0,
-            None,
-            RPC_C_AUTHN_LEVEL_DEFAULT,
-            RPC_C_IMP_LEVEL_IMPERSONATE,
-            None,
-            EOAC_NONE,
-        )
-        .ok();
-
-        let fan_enum = svc_cimv2
-            .ExecQuery(
-                &BSTR::from("WQL"),
-                &BSTR::from("SELECT * FROM Win32_Fan"),
-                WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
-                None,
-            )
-            .context("WMI fan query")?;
-
-        let mut fidx = 0usize;
-        loop {
-            let mut row = [None];
-            let mut returned = 0u32;
-            if fan_enum.Next(0, &mut row, &mut returned).is_err() || returned == 0 {
-                break;
-            }
-            if let Some(obj) = &row[0] {
-                let mut var = VARIANT::default();
-                let rpm = if obj
-                    .Get(&BSTR::from("DesiredSpeed"), 0, &mut var, None, None)
-                    .is_ok()
-                {
-                    variant_to_f64(&var).unwrap_or(0.0) as u32
-                } else {
-                    0
-                };
-                fans.push(FanReading {
-                    id: format!("wmi_fan_{fidx}"),
-                    label: format!("WMI Fan {fidx}"),
-                    rpm,
-                    duty_percent: 0,
-                });
-                fidx += 1;
-            }
-        }
-    }
-
-    Ok((sensors, fans))
+    tracing::warn!(
+        "HWiNFO64 not running and WMI fallback is not yet implemented. \
+         Install HWiNFO64 from https://www.hwinfo.com/download/ for sensor data."
+    );
+    (Vec::new(), Vec::new())
 }
 
 // ── NVML GPU fans ─────────────────────────────────────────────────────────────
