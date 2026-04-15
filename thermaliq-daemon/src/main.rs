@@ -1,5 +1,6 @@
 mod agent_db;
 mod agent_task;
+mod app_monitor;
 mod api;
 mod poller;
 mod token;
@@ -128,6 +129,8 @@ pub async fn run_daemon_inner() -> Result<()> {
     // Background tasks
     let _poller = poller::start_poll_loop(state.clone(), config.polling_interval_ms);
     let _agent = agent_task::start_agent_loop(state.clone(), agent_db.clone());
+    let _app_monitor =
+        app_monitor::start_app_monitor(state.clone(), config.default_profile.clone());
 
     // HTTP server
     let addr = format!("127.0.0.1:{}", config.api_port);
