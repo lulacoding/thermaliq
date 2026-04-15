@@ -27,7 +27,7 @@ rand = "0.8"
 hex = "0.4"
 dirs = "5"
 toml = { workspace = true }
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
 futures-util = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
 
