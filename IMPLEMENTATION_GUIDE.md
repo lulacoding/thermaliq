@@ -1,7 +1,7 @@
 # ThermalIQ Implementation Guide
 
-**Last Updated:** 2026-04-15  
-**Current Focus:** Merging Phase 2.1–3.3 feature branches into main  
+**Last Updated:** 2026-04-15 10:35 GMT  
+**Current Focus:** Phase 3.1–3.3 PR #10 (awaiting merge); Phase 3.4 blocked  
 **Roadmap Reference:** `docs/ROADMAP.md`
 
 ---
@@ -12,75 +12,62 @@
 |-------|---------|--------|--------|----|----|
 | **Phase 0** | Foundation | ✅ COMPLETE | main | — | All core types, daemon, HAL, CLI, UI |
 | **Phase 1** | Windows HAL | ✅ COMPLETE | main (f792c34) | — | HWiNFO64 shared memory, WMI fallback, NSIS, service |
-| **Phase 2.1** | macOS Fan Writes | ✅ COMPLETE | `feat/macos-fan-writes-phase-2-1` (8626308) | #8 OPEN | SMJobBless helper, Unix socket protocol |
+| **Phase 2.1** | macOS Fan Writes | ✅ MERGED | main (ea2285f) | #8 MERGED | SMJobBless helper, Unix socket protocol |
 | **Phase 2.2** | Linux RDNA3 GPU | ✅ COMPLETE | `feat/phase-2.2-linux-rdna3-fan-control` (5e492fd) | — | RDNA3 OverDrive fan curves, kernel 6.7+ |
 | **Phase 2.3** | Laptop EC Support | ✅ COMPLETE | merged to main | — | ThinkPad, ASUS, NBFC integration |
 | **Phase 2.4** | Custom Sensors | ✅ COMPLETE | merged to main | — | TimeAverage, Mix, File, Offset evaluation |
 | **Phase 2.5** | Fan Calibration | ✅ COMPLETE | merged to main | — | 0→100% ramp, RPM table storage, CLI/UI |
 | **Phase 2.6** | Hysteresis & DC Mode | ✅ COMPLETE | merged to main | — | Start%/stop%, DC fan mode (pwm1_enable=2) |
-| **Phase 3.1** | Per-App Curves | ✅ COMPLETE | `feat/phase-3-ai-depth` (cf3e727) | — | sysinfo process matching, smooth ramp |
-| **Phase 3.2** | NL Profile Gen | ✅ COMPLETE | `feat/phase-3-ai-depth` (cf3e727) | — | Claude API, TOML validation, CLI `tq profile create` |
-| **Phase 3.3** | Schedule Profiles | ✅ COMPLETE | working dir (not committed) | — | Time+day matching, midnight wrap, `tq schedule list` |
+| **Phase 3.1** | Per-App Curves | ✅ COMPLETE | `feat/phase-3-ai-depth` (af46036) | #10 OPEN | sysinfo process matching, smooth ramp |
+| **Phase 3.2** | NL Profile Gen | ✅ COMPLETE | `feat/phase-3-ai-depth` (af46036) | #10 OPEN | Claude API, TOML validation, CLI `tq profile create` |
+| **Phase 3.3** | Schedule Profiles | ✅ COMPLETE | `feat/phase-3-ai-depth` (af46036) | #10 OPEN | Time+day matching, midnight wrap, `tq schedule list` |
 | **Phase 3.4** | Battery State | 🔵 BLOCKED | — | — | Needs Phase 3.3 merged first |
 
 ---
 
 ## 🎯 Immediate Next Steps
 
-### 1. **Commit Phase 3.3 Changes** (5 min)
-```bash
-git add thermaliq-daemon/src/schedule_monitor.rs \
-        thermaliq-daemon/src/main.rs \
-        thermaliq-daemon/src/api/routes.rs \
-        thermaliq-daemon/src/api/auth.rs \
-        thermaliq-daemon/Cargo.toml \
-        thermaliq-common/src/config.rs \
-        thermaliq-cli/src/main.rs \
-        Cargo.toml
+### 1. **Merge Phase 2.1 (macOS Fan Writes)** ✅ DONE
+- PR #8 merged to main (commit ea2285f)
+- All CI checks passed, no conflicts
 
-git commit -m "feat(daemon): Phase 3.3 schedule-based profiles
+### 2. **Rebase Phase 3.1–3.3 onto main** ✅ DONE
+- `feat/phase-3-ai-depth` rebased onto ea2285f (main)
+- All 8 commits applied cleanly
+- New base: commit af46036
 
-- Time-based profile schedule with day filters
-- Midnight-wrapping time ranges (e.g. 22:00-08:00)
-- 60s evaluation interval, revert to base on no match
-- GET /api/schedule public endpoint
-- CLI: tq schedule list
-- Priority: app rules > schedule > base profile"
-```
+### 3. **PR Phase 3.1–3.3 to main** ✅ DONE
+- PR #10 created: "feat(daemon): Phase 3.1–3.3 — Per-app curves, NL profile generation, and schedule-based profiles"
+- Status: OPEN, awaiting CI checks and review
+- Once merged, unblocks Phase 3.4
 
-### 2. **Merge Phase 2.1 (macOS Fan Writes)** to main
-- PR #8 is OPEN: `feat/macos-fan-writes-phase-2-1`
-- Action: `gh pr merge 8 --squash` OR rebase onto main if conflicts
-- This unblocks macOS users from controlling fan speed
-
-### 3. **Rebase Phase 3.1–3.3 onto main**
-- After merging 2.1, rebase `feat/phase-3-ai-depth` (currently at 3.2)
-- Then add Phase 3.3 commit
-- Create single PR: Phase 3.1–3.3 stack
-
-### 4. **Implement Phase 3.4 (Battery State)**
+### 4. **Implement Phase 3.4 (Battery State)** 🔵 BLOCKED
+- Waiting for Phase 3.3 (PR #10) to merge
 - Detection logic already scoped (GetSystemPowerStatus, IOPSCopyPowerSourcesInfo, /sys/class/power_supply)
-- Add `[battery]` section to config: `on_battery = "silent" | plugged_in = "balanced"`
-- TOML parsing + AppState field
-- OS event subscription (not poll for speed)
-- Daemon integration point: `start_battery_monitor()`
+- Implementation plan:
+  - Add `[battery]` section to config: `on_battery = "silent" | plugged_in = "balanced"`
+  - TOML parsing + AppState field
+  - OS event subscription (not poll for speed)
+  - Daemon integration point: `start_battery_monitor()`
+  - Create `thermaliq-daemon/src/battery_monitor.rs` module
+  - Wire into main.rs startup
 
 ---
 
 ## 📂 Feature Branch Map
 
 ```
-origin/main                           (Phase 1: Windows)
-├─ feat/macos-fan-writes-phase-2-1    (Phase 2.1: macOS SMJobBless)  [PR #8 OPEN]
-├─ feat/phase-2.2-linux-rdna3-fan-control  (Phase 2.2: RDNA3)
-├─ feat/phase-3-ai-depth              (Phase 3.1–3.2: Per-app + NL)
-│  └─ [LOCAL ONLY] Phase 3.3 in working dir
+origin/main (Phase 0–1 + Phase 2.1 merged)
+├─ feat/macos-fan-writes-phase-2-1    [MERGED to main]
+├─ feat/phase-2.2-linux-rdna3-fan-control  (Phase 2.2: RDNA3 GPU fans)  [ready to merge]
+├─ feat/phase-3-ai-depth              (Phase 3.1–3.3: Per-app, NL, Schedule)  [PR #10 OPEN]
 ```
 
-**Merge Order (To Unblock):**
-1. 2.1 (macOS) → main
-2. Rebase 3.1–3.3 onto main (after 2.1)
-3. 3.1–3.3 → main as single PR
+**Current Merge Status:**
+1. ✅ 2.1 (macOS) → main (commit ea2285f)
+2. ✅ 3.1–3.3 rebased onto main (commit af46036)
+3. ⏳ 3.1–3.3 → main as PR #10 (awaiting CI + merge)
+4. 🔵 Phase 3.4 blocked until PR #10 merges
 
 ---
 
