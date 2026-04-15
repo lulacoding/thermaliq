@@ -170,6 +170,18 @@
       "type": "file"
     },
     {
+      "path": "src/hooks/useNotifications.ts",
+      "accessCount": 4,
+      "lastAccessed": 1776262137799,
+      "type": "file"
+    },
+    {
+      "path": "src/hooks/useDaemon.ts",
+      "accessCount": 4,
+      "lastAccessed": 1776262148593,
+      "type": "file"
+    },
+    {
       "path": "src/components/ProfileManager.tsx",
       "accessCount": 3,
       "lastAccessed": 1776255841170,
@@ -179,18 +191,6 @@
       "path": "src-tauri/Cargo.toml",
       "accessCount": 3,
       "lastAccessed": 1776260215977,
-      "type": "file"
-    },
-    {
-      "path": "src/hooks/useNotifications.ts",
-      "accessCount": 3,
-      "lastAccessed": 1776261712886,
-      "type": "file"
-    },
-    {
-      "path": "src/hooks/useDaemon.ts",
-      "accessCount": 2,
-      "lastAccessed": 1776259967485,
       "type": "file"
     },
     {
@@ -204,6 +204,12 @@
       "accessCount": 1,
       "lastAccessed": 1776258363346,
       "type": "directory"
+    },
+    {
+      "path": "src-tauri/src/main.rs",
+      "accessCount": 1,
+      "lastAccessed": 1776262119705,
+      "type": "file"
     }
   ],
   "userDirectives": []

@@ -40,6 +40,7 @@ export function useDaemon(): DaemonState {
 
   const connect = useCallback(() => {
     if (unmountedRef.current) return;
+    if (wsRef.current?.readyState === WebSocket.OPEN) return; // Already connected
 
     const ws = new WebSocket(WS_URL);
     wsRef.current = ws;
@@ -69,7 +70,8 @@ export function useDaemon(): DaemonState {
     };
 
     ws.onerror = () => {
-      ws.close();
+      // Don't close immediately; let onclose handler manage reconnection
+      // This prevents error spam during development
     };
   }, []);
 
