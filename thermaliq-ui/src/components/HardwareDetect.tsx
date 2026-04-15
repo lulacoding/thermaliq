@@ -8,25 +8,115 @@ interface DetectedHardware {
   storage: { path: string; size: string };
 }
 
+const API_BASE = "http://127.0.0.1:7272";
+
 export default function HardwareDetect() {
   const [stage, setStage] = useState<"detecting" | "results" | "confirm">("detecting");
   const [hardware, setHardware] = useState<DetectedHardware>({
-    fans: ["CPU Fan", "System Fan 1", "System Fan 2"],
-    sensors: [
-      { name: "CPU Package", type: "cpu" },
-      { name: "GPU Core", type: "gpu" },
-      { name: "System", type: "system" },
-    ],
-    gpus: ["NVIDIA GeForce RTX 4080"],
+    fans: [],
+    sensors: [],
+    gpus: [],
     storage: { path: "~/.config/thermaliq/", size: "< 1 MB" },
   });
 
   useEffect(() => {
-    // Simulate hardware detection
-    const timer = setTimeout(() => {
-      setStage("results");
-    }, 2000);
-    return () => clearTimeout(timer);
+    const detectHardware = async () => {
+      try {
+        // Fetch sensors
+        const sensorsRes = await fetch(`${API_BASE}/sensors`);
+        if (!sensorsRes.ok) throw new Error(`Sensors fetch failed: ${sensorsRes.statusText}`);
+        const sensorsData = (await sensorsRes.json()) as {
+          sensors: Array<{ id: string; label: string; temp_celsius: number }>;
+        };
+
+        // Fetch fans
+        const fansRes = await fetch(`${API_BASE}/fans`);
+        if (!fansRes.ok) throw new Error(`Fans fetch failed: ${fansRes.statusText}`);
+        const fansData = (await fansRes.json()) as {
+          fans: Array<{ id: string; label: string; rpm: number; duty_percent: number }>;
+        };
+
+        // Parse sensors and classify by type
+        const sensorsByType = new Map<string, typeof sensorsData.sensors>();
+        const gpuLabels = new Set<string>();
+
+        sensorsData.sensors.forEach((sensor) => {
+          const label = sensor.label.toLowerCase();
+          let type: "cpu" | "gpu" | "system" = "system";
+
+          if (label.includes("cpu") || label.includes("core") || label.includes("package")) {
+            type = "cpu";
+          } else if (
+            label.includes("gpu") ||
+            label.includes("junction") ||
+            label.includes("memory") ||
+            label.includes("vram")
+          ) {
+            type = "gpu";
+            gpuLabels.add(sensor.label);
+          }
+
+          if (!sensorsByType.has(type)) {
+            sensorsByType.set(type, []);
+          }
+          sensorsByType.get(type)!.push(sensor);
+        });
+
+        // Build sensor list for display
+        const displaySensors = sensorsData.sensors.map((s) => {
+          let type: "cpu" | "gpu" | "system" = "system";
+          const label = s.label.toLowerCase();
+
+          if (label.includes("cpu") || label.includes("core") || label.includes("package")) {
+            type = "cpu";
+          } else if (
+            label.includes("gpu") ||
+            label.includes("junction") ||
+            label.includes("memory") ||
+            label.includes("vram")
+          ) {
+            type = "gpu";
+          }
+
+          return { name: s.label, type };
+        });
+
+        // For GPUs, try to extract model names from sensor labels or use placeholders
+        const gpus = Array.from(gpuLabels).length > 0
+          ? Array.from(gpuLabels).map((label) => {
+              // Try to extract GPU model from label (e.g., "NVIDIA RTX 4080" from label)
+              if (label.includes("NVIDIA")) return "NVIDIA GPU";
+              if (label.includes("AMD")) return "AMD GPU";
+              if (label.includes("Intel")) return "Intel Arc GPU";
+              return "GPU Device";
+            })
+          : [];
+
+        setHardware({
+          fans: fansData.fans.map((f) => f.label),
+          sensors: displaySensors,
+          gpus,
+          storage: { path: "~/.config/thermaliq/", size: "< 1 MB" },
+        });
+
+        setStage("results");
+      } catch (error) {
+        console.error("Hardware detection failed:", error);
+        // Fallback to mock data on error
+        setHardware({
+          fans: ["CPU Fan", "System Fan"],
+          sensors: [
+            { name: "CPU Package", type: "cpu" },
+            { name: "GPU Junction", type: "gpu" },
+          ],
+          gpus: ["GPU Device"],
+          storage: { path: "~/.config/thermaliq/", size: "< 1 MB" },
+        });
+        setStage("results");
+      }
+    };
+
+    detectHardware();
   }, []);
 
   const handleConfirm = () => {
