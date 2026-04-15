@@ -55,14 +55,18 @@ export default function CalibrationWizard() {
       for (const fan of availableFans) {
         try {
           // Run calibration (takes ~42 seconds, set 60s timeout)
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 60000);
+
           const calRes = await fetch(`${API_BASE}/api/calibration/${fan.id}/run`, {
             method: "POST",
             headers: {
               "Content-Type": "application/json",
               Authorization: `Bearer ${token}`,
             },
-            timeout: 60000,
+            signal: controller.signal,
           });
+          clearTimeout(timeoutId);
 
           if (!calRes.ok) {
             throw new Error(`Calibration failed for ${fan.label}`);

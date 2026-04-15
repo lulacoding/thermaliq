@@ -152,15 +152,21 @@
       "type": "file"
     },
     {
+      "path": "src/components/CalibrationWizard.tsx",
+      "accessCount": 7,
+      "lastAccessed": 1776259237127,
+      "type": "file"
+    },
+    {
       "path": "src-tauri/src/lib.rs",
       "accessCount": 5,
       "lastAccessed": 1776253927221,
       "type": "file"
     },
     {
-      "path": "src/components/CalibrationWizard.tsx",
+      "path": "src/components/AgentPanel.tsx",
       "accessCount": 5,
-      "lastAccessed": 1776255797320,
+      "lastAccessed": 1776259265199,
       "type": "file"
     },
     {

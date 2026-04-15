@@ -1,6 +1,5 @@
 import { useState, useEffect } from "react";
-import { Zap, AlertCircle } from "lucide-react";
-import { useToken } from "../hooks/useToken";
+import { Zap } from "lucide-react";
 
 interface Intervention {
   id: string;
@@ -17,19 +16,16 @@ interface AgentStatusData {
 const API_BASE = "http://127.0.0.1:7272";
 
 export default function AgentPanel() {
-  const { token } = useToken();
   const [agentStatus, setAgentStatus] = useState<"idle" | "active" | "error">("active");
   const [agentMode, setAgentMode] = useState<"Passive" | "Approval" | "Autonomous">("Approval");
   const [decisionCount, setDecisionCount] = useState(0);
   const [lastAction, setLastAction] = useState("Waiting for first intervention...");
-  const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   // Fetch agent status and recent interventions on mount
   useEffect(() => {
     const fetchAgentData = async () => {
       try {
-        setLoading(true);
         setError(null);
 
         // Fetch agent status (mode and pending count)
@@ -64,8 +60,6 @@ export default function AgentPanel() {
         console.error("Failed to fetch agent data:", err);
         setError(err instanceof Error ? err.message : "Failed to load agent data");
         setAgentStatus("error");
-      } finally {
-        setLoading(false);
       }
     };
 
