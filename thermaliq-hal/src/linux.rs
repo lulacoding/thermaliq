@@ -581,14 +581,14 @@ impl HardwareLayer for LinuxHardwareLayer {
         // ── ThinkPad ACPI fan control (/proc/acpi/ibm/fan) ──────────────────
         if chip_name.starts_with("thinkpad") {
             if let Some(result) = thinkpad_set_fan(duty) {
-                return result.map_err(Into::into);
+                return result;
             }
         }
 
         // ── ASUS nb-wmi fan boost mode ────────────────────────────────────────
         if chip_name.starts_with("asus") {
             if let Some(result) = asus_set_fan_boost(duty) {
-                return result.map_err(Into::into);
+                return result;
             }
             // Fall through to generic hwmon PWM if boost mode not available.
         }
@@ -601,12 +601,11 @@ impl HardwareLayer for LinuxHardwareLayer {
                 let fan_slot = cmd
                     .fan_id
                     .chars()
-                    .rev()
-                    .next()
+                    .next_back()
                     .and_then(|c| c.to_digit(10))
                     .map(|d| d as usize)
                     .unwrap_or(0);
-                return nbfc_set_fan(&nbfc, fan_slot, duty).map_err(Into::into);
+                return nbfc_set_fan(&nbfc, fan_slot, duty);
             }
         }
 
