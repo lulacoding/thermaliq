@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use super::auth::{require_bearer_auth, AgentMode, AppState};
+use super::ws;
 
 /// Build the axum Router with all endpoints configured.
 ///
@@ -38,7 +39,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/agent/status", get(agent_status))
         .route("/api/agent/interventions", get(list_interventions))
         .route("/api/history/sensors/:sensor_id", get(history_sensors))
-        .route("/api/history/fans/:fan_id", get(history_fans));
+        .route("/api/history/fans/:fan_id", get(history_fans))
+        .route("/ws/sensors", get(ws::ws_sensors))
+        .route("/ws/agent", get(ws::ws_agent));
 
     // Mutation routes — require Bearer token.
     let protected = Router::new()
@@ -46,6 +49,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/profiles/active", post(set_active_profile))
         .route("/api/agent/mode", post(set_agent_mode))
         .route("/api/agent/interventions/:id/approve", post(approve_intervention))
+        .route("/api/agent/interventions/:id/reject", post(reject_intervention))
         .route("/api/shutdown", post(shutdown))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -142,12 +146,17 @@ async fn history_sensors(
 }
 
 async fn history_fans(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(fan_id): Path<String>,
-    Query(_params): Query<LimitQuery>,
-) -> Json<Value> {
-    // history.rs does not yet expose a query_fan_last_n method — return empty
-    Json(json!({ "fan_id": fan_id, "records": [] }))
+    Query(params): Query<LimitQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    let records = state
+        .history
+        .lock()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .query_fan_last_n(&fan_id, params.limit)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(json!({ "fan_id": fan_id, "records": records })))
 }
 
 // ── Protected handlers ────────────────────────────────────────────────────────
@@ -187,6 +196,9 @@ async fn set_active_profile(
         .map_err(|_| StatusCode::NOT_FOUND)?;
 
     *state.active_profile.write().await = Some(profile);
+    let _ = state.agent_event_tx.send(
+        json!({ "type": "profile_changed", "profile": name }).to_string()
+    );
     Ok(Json(json!({ "active_profile": name })))
 }
 
@@ -202,6 +214,9 @@ async fn set_agent_mode(
         _ => return Err(StatusCode::BAD_REQUEST),
     };
     *state.agent_mode.write().await = mode;
+    let _ = state.agent_event_tx.send(
+        json!({ "type": "mode_changed", "mode": mode_str }).to_string()
+    );
     Ok(Json(json!({ "agent_mode": mode_str })))
 }
 
@@ -228,7 +243,27 @@ async fn approve_intervention(
         }
     }
 
+    let _ = state.agent_event_tx.send(
+        json!({ "type": "intervention_applied", "id": id, "status": "approved" }).to_string()
+    );
     Ok(Json(json!({ "intervention_id": id, "status": "applied" })))
+}
+
+async fn reject_intervention(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    let mut pending = state
+        .pending_interventions
+        .lock()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let pos = pending.iter().position(|i| i.id == id)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    pending.remove(pos);
+    let _ = state.agent_event_tx.send(
+        json!({ "type": "intervention_rejected", "id": id }).to_string()
+    );
+    Ok(Json(json!({ "intervention_id": id, "status": "rejected" })))
 }
 
 async fn shutdown(State(state): State<AppState>) -> Json<Value> {

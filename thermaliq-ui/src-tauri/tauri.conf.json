@@ -1,0 +1,70 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "ThermalIQ",
+  "version": "0.1.0",
+  "identifier": "com.thermaliq.app",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [
+      {
+        "title": "ThermalIQ",
+        "width": 1200,
+        "height": 800,
+        "resizable": true,
+        "fullscreen": false,
+        "decorations": true,
+        "transparent": false
+      }
+    ],
+    "security": {
+      "csp": null
+    },
+    "trayIcon": {
+      "id": "thermaliq-tray",
+      "iconPath": "icons/32x32.png",
+      "tooltip": "ThermalIQ"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "perMachine",
+        "installerIcon": "icons/icon.ico",
+        "compression": "lzma",
+        "startMenuFolder": "ThermalIQ",
+        "createDesktopShortcut": true,
+        "createStartMenuShortcut": true
+      },
+      "wix": {
+        "language": "en-US"
+      },
+      "requestedExecutionLevel": "asInvoker"
+    }
+  },
+  "plugins": {
+    "shell": {
+      "open": true
+    },
+    "fs": {
+      "scope": {
+        "allow": ["$HOME/.config/thermaliq/**", "$APPDATA/thermaliq/**"],
+        "deny": []
+      }
+    }
+  }
+}

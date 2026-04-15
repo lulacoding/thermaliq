@@ -1,6 +1,8 @@
 {
   "enabledPlugins": {
-    "telegram@claude-plugins-official": true,
-    "oh-my-claudecode@omc": true
+    "telegram@claude-plugins-official": false,
+    "oh-my-claudecode@omc": true,
+    "playwright@claude-plugins-official": false,
+    "typescript-lsp@claude-plugins-official": false
   }
 }

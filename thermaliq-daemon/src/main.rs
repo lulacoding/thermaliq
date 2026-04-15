@@ -1,12 +1,17 @@
+mod agent_db;
 mod agent_task;
 mod api;
 mod poller;
 mod token;
 
+#[cfg(target_os = "windows")]
+mod service;
+
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use tokio::sync::{watch, RwLock};
+use tokio::sync::{broadcast, watch, RwLock};
 use tracing_subscriber::EnvFilter;
 
 use api::auth::{AgentMode, AppState};
@@ -15,8 +20,29 @@ use thermaliq_common::{
     history::HistoryDb,
 };
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    #[cfg(target_os = "windows")]
+    let args: Vec<String> = std::env::args().collect();
+
+    #[cfg(target_os = "windows")]
+    {
+        if args.contains(&"--service".to_string()) {
+            return service::start_as_service();
+        }
+        if args.contains(&"install-service".to_string()) {
+            return service::install_service();
+        }
+        if args.contains(&"uninstall-service".to_string()) {
+            return service::uninstall_service();
+        }
+    }
+
+    // Interactive mode — build a Tokio runtime and run.
+    tokio::runtime::Runtime::new()?.block_on(run_daemon_inner())
+}
+
+/// Core daemon logic, shared between interactive mode and Windows service mode.
+pub async fn run_daemon_inner() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
@@ -63,6 +89,12 @@ async fn main() -> Result<()> {
     // Shutdown channel
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
+    // WebSocket broadcast channels
+    let (sensor_tx, _) = broadcast::channel::<String>(64);
+    let (agent_event_tx, _) = broadcast::channel::<String>(64);
+    let sensor_tx = Arc::new(sensor_tx);
+    let agent_event_tx = Arc::new(agent_event_tx);
+
     // AppState
     let state = AppState {
         api_token,
@@ -72,11 +104,29 @@ async fn main() -> Result<()> {
         agent_mode: Arc::new(RwLock::new(AgentMode::Passive)),
         pending_interventions: Arc::new(Mutex::new(Vec::new())),
         shutdown_tx: Arc::new(shutdown_tx),
+        sensor_tx,
+        agent_event_tx,
     };
+
+    // Agent DB
+    let agent_db_path = dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("thermaliq")
+        .join("agent.db");
+    if let Some(p) = agent_db_path.parent() {
+        std::fs::create_dir_all(p)?;
+    }
+    let agent_db_path_str = agent_db_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("agent db path not valid UTF-8"))?;
+    let agent_db = Arc::new(tokio::sync::Mutex::new(
+        agent_db::AgentDb::new(agent_db_path_str)
+            .map_err(|e| anyhow::anyhow!("agent DB: {e}"))?,
+    ));
 
     // Background tasks
     let _poller = poller::start_poll_loop(state.clone(), config.polling_interval_ms);
-    let _agent = agent_task::start_agent_loop(state.clone());
+    let _agent = agent_task::start_agent_loop(state.clone(), agent_db.clone());
 
     // HTTP server
     let addr = format!("127.0.0.1:{}", config.api_port);

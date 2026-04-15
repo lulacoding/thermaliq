@@ -1,0 +1,82 @@
+name = "gaming"
+description = "Optimised for sustained gaming — aggressive cooling, low thermal throttling risk"
+version = 1
+
+# CPU fan tracks CPU temp aggressively — ramps fast, slow to drop
+[[curves]]
+type = "linear"
+id = "cpu_aggressive"
+source = "cpu_package"
+min_temp = 35.0
+max_temp = 75.0
+min_pwm = 35
+max_pwm = 100
+
+# GPU fan curve (if separate GPU header present)
+[[curves]]
+type = "linear"
+id = "gpu_curve"
+source = "gpu_edge"
+min_temp = 40.0
+max_temp = 80.0
+min_pwm = 30
+max_pwm = 100
+
+# Chassis fans: keep airflow high during gaming
+[[curves]]
+type = "trigger"
+id = "chassis_gaming"
+source = "cpu_package"
+idle_temp = 45.0
+idle_pwm = 40
+load_temp = 65.0
+load_pwm = 80
+response_ms = 1000
+
+[[controls]]
+fan = "cpu_fan_0"
+curve = "cpu_aggressive"
+mode = "pwm"
+step_up_pct = 15
+step_down_pct = 3
+min_pwm = 35
+
+[[controls]]
+fan = "gpu_fan_0"
+curve = "gpu_curve"
+mode = "pwm"
+step_up_pct = 15
+step_down_pct = 3
+min_pwm = 30
+
+[[controls]]
+fan = "chassis_fan_0"
+curve = "chassis_gaming"
+mode = "pwm"
+step_up_pct = 10
+step_down_pct = 5
+min_pwm = 30
+
+[[alerts]]
+sensor = "cpu_package"
+threshold = 85.0
+severity = "warn"
+action = "notify"
+
+[[alerts]]
+sensor = "cpu_package"
+threshold = 92.0
+severity = "crit"
+action = "log"
+
+[[alerts]]
+sensor = "gpu_edge"
+threshold = 80.0
+severity = "warn"
+action = "notify"
+
+[[alerts]]
+sensor = "gpu_edge"
+threshold = 88.0
+severity = "crit"
+action = "log"

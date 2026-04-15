@@ -5,20 +5,37 @@ on:
     tags:
       - 'v*.*.*'
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   build:
-    name: Build (${{ matrix.os }})
+    name: Build (${{ matrix.artifact }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-13, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            artifact: thermaliq-linux-x86_64
+          - os: macos-13
+            target: x86_64-apple-darwin
+            artifact: thermaliq-macos-intel
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: thermaliq-macos-arm64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: thermaliq-windows-x86_64
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -30,19 +47,230 @@ jobs:
             target/
           key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build release
-        # TODO(v1.0.0): Replace mock-hardware with real hardware build.
-        # Requires platform-specific toolchain setup and driver dependencies.
-        run: cargo build --release --features mock-hardware
+      # ── Linux ─────────────────────────────────────────────────────────────
 
-      # TODO(v1.0.0): Add the following steps:
-      # - macOS: Import APPLE_CERTIFICATE secret, run tauri-apps/tauri-action,
-      #   notarize with xcrun notarytool (not Tauri's built-in — see issue #14579),
-      #   staple with xcrun stapler. Secrets needed: APPLE_CERTIFICATE,
-      #   APPLE_CERTIFICATE_PASSWORD, APPLE_ID, APPLE_ID_PASSWORD, APPLE_TEAM_ID,
-      #   APPLE_SIGNING_IDENTITY, TAURI_SIGNING_PRIVATE_KEY.
-      # - Windows: Sign with SignPath.io or ssl.com eSigner (EV cert preferred
-      #   for SmartScreen reputation). Cannot use USB HSM in Actions.
-      # - All: Upload artifacts and create GitHub Release via softprops/action-gh-release.
-      # - Post-release: Submit to winget (up to 4 weeks review for new publishers),
-      #   update Homebrew tap, update AUR thermaliq-bin PKGBUILD.
+      - name: Build release binaries (Linux)
+        if: matrix.os == 'ubuntu-22.04'
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package (Linux)
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/tq dist/
+          cp target/${{ matrix.target }}/release/thermaliq-daemon dist/
+          tar czf ${{ matrix.artifact }}.tar.gz -C dist tq thermaliq-daemon
+
+      # ── macOS ─────────────────────────────────────────────────────────────
+
+      - name: Build release binaries (macOS)
+        if: startsWith(matrix.os, 'macos')
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Import Apple signing certificate (macOS)
+        if: startsWith(matrix.os, 'macos') && env.HAVE_APPLE_CERT == 'true'
+        env:
+          HAVE_APPLE_CERT: ${{ secrets.APPLE_CERTIFICATE != '' && 'true' || 'false' }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/thermaliq.keychain-db"
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          echo "$APPLE_CERTIFICATE" | base64 --decode > /tmp/cert.p12
+          security import /tmp/cert.p12 \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 \
+            -k "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+
+      - name: Build Tauri app (macOS)
+        if: startsWith(matrix.os, 'macos')
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: thermaliq-ui
+          args: --target ${{ matrix.target }}
+
+      - name: Notarize DMG with xcrun notarytool (macOS)
+        # Use xcrun notarytool directly — Tauri's built-in notarize hangs (tauri#14579/#8630)
+        if: startsWith(matrix.os, 'macos') && env.APPLE_ID != ''
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          DMG=$(find thermaliq-ui/src-tauri/target/release/bundle/dmg -name "*.dmg" 2>/dev/null | head -1)
+          if [ -n "$DMG" ]; then
+            xcrun notarytool submit "$DMG" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_ID_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID" \
+              --wait --timeout 1800
+            xcrun stapler staple "$DMG"
+            echo "Notarized: $DMG"
+          fi
+
+      - name: Package CLI (macOS)
+        if: startsWith(matrix.os, 'macos')
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/tq dist/
+          cp target/${{ matrix.target }}/release/thermaliq-daemon dist/
+          tar czf ${{ matrix.artifact }}.tar.gz -C dist tq thermaliq-daemon
+
+      # ── Windows ───────────────────────────────────────────────────────────
+
+      - name: Build release binaries (Windows)
+        if: matrix.os == 'windows-latest'
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build Tauri app (Windows)
+        if: matrix.os == 'windows-latest'
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: thermaliq-ui
+          args: --target ${{ matrix.target }}
+
+      - name: Sign with ssl.com eSigner (Windows)
+        # Requires secrets: ESIGNER_USERNAME, ESIGNER_PASSWORD,
+        # ESIGNER_TOTP_SECRET, ESIGNER_CREDENTIAL_ID
+        # Sign up at https://www.ssl.com/esigner/ (EV cert preferred for SmartScreen reputation)
+        if: matrix.os == 'windows-latest'
+        env:
+          ESIGNER_USERNAME: ${{ secrets.ESIGNER_USERNAME }}
+          ESIGNER_PASSWORD: ${{ secrets.ESIGNER_PASSWORD }}
+          ESIGNER_TOTP_SECRET: ${{ secrets.ESIGNER_TOTP_SECRET }}
+          ESIGNER_CREDENTIAL_ID: ${{ secrets.ESIGNER_CREDENTIAL_ID }}
+        run: |
+          if (-not $env:ESIGNER_USERNAME) {
+            Write-Warning "ESIGNER_USERNAME secret not set — skipping code signing"
+            exit 0
+          }
+
+          # Download CodeSignTool
+          $ZIP = "$env:RUNNER_TEMP\CodeSignTool.zip"
+          $DIR = "$env:RUNNER_TEMP\CodeSignTool"
+          Invoke-WebRequest -Uri "https://www.ssl.com/download/codesigntool-for-windows/" `
+            -OutFile $ZIP -UseBasicParsing
+          Expand-Archive -Path $ZIP -DestinationPath $DIR -Force
+          $TOOL = (Get-ChildItem -Path $DIR -Filter "CodeSignTool.bat" -Recurse).FullName
+
+          # Collect files to sign
+          $FILES = @(
+            "target\${{ matrix.target }}\release\thermaliq-daemon.exe",
+            "target\${{ matrix.target }}\release\tq.exe"
+          )
+          $NSIS = Get-ChildItem `
+            -Path "thermaliq-ui\src-tauri\target\release\bundle\nsis" `
+            -Filter "*_x64-setup.exe" -Recurse -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if ($NSIS) { $FILES += $NSIS.FullName }
+
+          foreach ($FILE in $FILES) {
+            if (Test-Path $FILE) {
+              Write-Host "Signing: $FILE"
+              & cmd /c "`"$TOOL`" sign" `
+                "-username=$env:ESIGNER_USERNAME" `
+                "-password=$env:ESIGNER_PASSWORD" `
+                "-credential_id=$env:ESIGNER_CREDENTIAL_ID" `
+                "-totp_secret=$env:ESIGNER_TOTP_SECRET" `
+                "-input_file_path=`"$FILE`"" `
+                "-override=true"
+              if ($LASTEXITCODE -ne 0) {
+                Write-Error "Signing failed for $FILE"
+                exit 1
+              }
+            }
+          }
+        shell: pwsh
+
+      - name: Package (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target\${{ matrix.target }}\release\tq.exe" dist\
+          Copy-Item "target\${{ matrix.target }}\release\thermaliq-daemon.exe" dist\
+          $NSIS = Get-ChildItem `
+            -Path "thermaliq-ui\src-tauri\target\release\bundle\nsis" `
+            -Filter "*_x64-setup.exe" -Recurse -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if ($NSIS) { Copy-Item $NSIS.FullName dist\ }
+          Compress-Archive -Path dist\* -DestinationPath "${{ matrix.artifact }}.zip"
+        shell: pwsh
+
+      # ── Upload ─────────────────────────────────────────────────────────────
+
+      - name: Upload artifact (Unix)
+        if: matrix.os != 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.tar.gz
+
+      - name: Upload artifact (Windows)
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.zip
+
+  # ── GitHub Release ─────────────────────────────────────────────────────────
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Create draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: artifacts/**/*
+          body: |
+            ## Installation
+
+            **Windows**
+            ```powershell
+            winget install thermaliq.ThermalIQ
+            ```
+            Or download the NSIS installer below.
+
+            **macOS**
+            ```bash
+            brew tap thermaliq/tap && brew install thermaliq
+            ```
+            Or download the DMG below.
+
+            **Linux**
+            ```bash
+            curl -fsSL https://thermaliq.dev/install.sh | sh
+            ```
+
+            See [CHANGELOG.md](CHANGELOG.md) for full release notes.

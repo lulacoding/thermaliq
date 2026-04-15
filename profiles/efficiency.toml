@@ -1,0 +1,57 @@
+name = "efficiency"
+description = "Maximum silence — fans as slow as safe, ideal for light workloads and battery life"
+version = 1
+
+# CPU fan: very conservative ramp, stops below 35°C
+[[curves]]
+type = "auto"
+id = "cpu_efficiency"
+source = "cpu_package"
+idle_temp = 50.0
+load_temp = 85.0
+min_pwm = 0
+max_pwm = 70
+step = 1
+deadband = 5.0
+
+# Chassis: flat low speed — almost inaudible
+[[curves]]
+type = "flat"
+id = "chassis_quiet"
+pwm = 20
+
+# AI curve: agent keeps things quiet unless thermals demand otherwise
+[[curves]]
+type = "ai"
+id = "ai_quiet"
+goal = "efficiency"
+
+[[controls]]
+fan = "cpu_fan_0"
+curve = "cpu_efficiency"
+mode = "pwm"
+step_up_pct = 3
+step_down_pct = 1
+min_pwm = 0
+
+[[controls]]
+fan = "chassis_fan_0"
+curve = "chassis_quiet"
+mode = "pwm"
+step_up_pct = 2
+step_down_pct = 1
+min_pwm = 0
+
+[[alerts]]
+sensor = "cpu_package"
+threshold = 88.0
+severity = "warn"
+action = "apply_profile"
+profile = "balanced"
+
+[[alerts]]
+sensor = "cpu_package"
+threshold = 92.0
+severity = "crit"
+action = "apply_profile"
+profile = "performance"

@@ -63,3 +63,25 @@ State: `.omc/state/`, `.omc/state/sessions/{sessionId}/`, `.omc/notepad.md`, `.o
 Say "setup omc" or run `/oh-my-claudecode:omc-setup`.
 
 <!-- OMC:END -->
+
+## Session Start Protocol — MANDATORY
+
+Run before any file or code work:
+1. `project_memory_read(section="all")`
+2. `notepad_read()`
+3. `state_list_active()`
+
+Before reading source files:
+4. `smart_search(query="<symbol>")`
+5. `smart_outline(path=".")`
+
+After significant changes:
+6. `project_memory_write(merge=true, memory={...})`
+7. `notepad_write_working(content="...")`
+
+## Key Project Facts (cached — always verify against project_memory)
+
+- Repo: `lulacoding/thermaliq` | Port: 7272 | Token: `~/.config/thermaliq/api.token`
+- Build: `cargo build --features mock-hardware` | Test: `cargo test --features mock-hardware`
+- Architecture spec: `ThermalIQ_Architecture_Report_v0.2.docx` in repo root
+- Project memory: `.omc/project-memory.json` | Notepad: `.omc/notepad.md`

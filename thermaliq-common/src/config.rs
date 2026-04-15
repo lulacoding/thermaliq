@@ -180,12 +180,32 @@ pub enum ProfileCurve {
         #[serde(default = "default_goal")]
         goal: String,
     },
+    Predictive {
+        id: String,
+        source: String,
+        min_pwm: u8,
+        max_pwm: u8,
+        /// How many seconds of history to consider
+        #[serde(default = "default_lookahead")]
+        lookahead_secs: u64,
+    },
+    Learning {
+        id: String,
+        source: String,
+        base_min_pwm: u8,
+        base_max_pwm: u8,
+        /// Learning rate 0.0-1.0 (how fast to adapt)
+        #[serde(default = "default_learning_rate")]
+        learning_rate: f32,
+    },
 }
 
 fn default_response_ms() -> u64 { 2000 }
 fn default_step() -> u8 { 2 }
 fn default_deadband() -> f32 { 3.0 }
 fn default_goal() -> String { "balanced".to_string() }
+fn default_lookahead() -> u64 { 300 }
+fn default_learning_rate() -> f32 { 0.1 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphPoint {

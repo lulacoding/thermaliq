@@ -1,14 +1,100 @@
-//! 24/7 AI agent background monitoring task.
+//! 24/7 AI agent background monitoring task — workload detection, safety enforcement, interventions.
 
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::Mutex;
 use tokio::time::interval;
 
+use crate::agent_db::{AgentDb, InterventionRecord};
 use crate::api::auth::{AgentMode, AppState, Intervention};
 
-pub fn start_agent_loop(state: AppState) -> tokio::task::JoinHandle<()> {
+// Safety limits — hardcoded, never overrideable
+const MAX_CPU_TEMP: f32 = 90.0;
+const EMERGENCY_TEMP: f32 = 95.0;
+const MAX_INTERVENTIONS_PER_HOUR: i64 = 6;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum WorkloadKind {
+    Idle,
+    Gaming,
+    Compiling,
+    Encoding,
+    Stress,
+    Unknown,
+}
+
+impl WorkloadKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            WorkloadKind::Idle => "idle",
+            WorkloadKind::Gaming => "gaming",
+            WorkloadKind::Compiling => "compiling",
+            WorkloadKind::Encoding => "encoding",
+            WorkloadKind::Stress => "stress",
+            WorkloadKind::Unknown => "unknown",
+        }
+    }
+}
+
+/// Detect workload from recent thermal samples.
+/// Uses temperature as a proxy for CPU/GPU load (no direct load% available from HAL).
+fn detect_workload(
+    cpu_temp: f32,
+    gpu_temp: f32,
+    cpu_temps_5min: &[f32],
+) -> WorkloadKind {
+    if cpu_temps_5min.is_empty() {
+        return WorkloadKind::Unknown;
+    }
+
+    let avg_cpu: f32 = cpu_temps_5min.iter().sum::<f32>() / cpu_temps_5min.len() as f32;
+    let max_cpu: f32 = cpu_temps_5min.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+
+    // Emergency / Stress: sustained very high CPU
+    if max_cpu >= 78.0 && avg_cpu >= 72.0 {
+        return WorkloadKind::Stress;
+    }
+
+    // Gaming: high GPU + elevated CPU
+    if gpu_temp > 65.0 && cpu_temp > 55.0 {
+        return WorkloadKind::Gaming;
+    }
+
+    // Encoding: mixed sustained CPU + GPU warmth
+    if cpu_temp > 58.0 && gpu_temp > 50.0 && gpu_temp < 65.0 {
+        return WorkloadKind::Encoding;
+    }
+
+    // Compiling: sustained CPU, GPU stays cool
+    if avg_cpu > 62.0 && gpu_temp < 50.0 {
+        return WorkloadKind::Compiling;
+    }
+
+    // Idle: everything cool
+    if avg_cpu < 45.0 && gpu_temp < 45.0 {
+        return WorkloadKind::Idle;
+    }
+
+    WorkloadKind::Unknown
+}
+
+/// Check safety limits. Returns Some(reason) if an emergency action is needed.
+fn check_safety(cpu_temp: f32, gpu_temp: f32) -> Option<&'static str> {
+    if cpu_temp >= EMERGENCY_TEMP {
+        return Some("EMERGENCY: CPU >= 95°C — all fans to 100%");
+    }
+    if gpu_temp >= 90.0 {
+        return Some("EMERGENCY: GPU >= 90°C — all fans to 100%");
+    }
+    None
+}
+
+pub fn start_agent_loop(state: AppState, agent_db: Arc<Mutex<AgentDb>>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = interval(Duration::from_secs(5));
-        let mut high_temp_since: Option<Instant> = None;
+        let mut cpu_temps_5min: Vec<f32> = Vec::new();
+        let mut last_workload = WorkloadKind::Unknown;
+        let mut prune_counter: u32 = 0;
 
         loop {
             ticker.tick().await;
@@ -18,59 +104,179 @@ pub fn start_agent_loop(state: AppState) -> tokio::task::JoinHandle<()> {
                 Err(_) => continue,
             };
 
+            let now = unix_now();
+
+            // Extract key temperatures
+            let cpu_temp = snap.sensors.iter()
+                .filter(|s| s.id.contains("cpu") || s.id.contains("package") || s.id.contains("tctl"))
+                .map(|s| s.temp_celsius)
+                .fold(f32::NEG_INFINITY, f32::max);
+
+            let gpu_temp = snap.sensors.iter()
+                .filter(|s| s.id.contains("gpu") || s.id.contains("edge"))
+                .map(|s| s.temp_celsius)
+                .fold(0.0_f32, f32::max);
+
+            let cpu_temp = if cpu_temp == f32::NEG_INFINITY { 0.0 } else { cpu_temp };
+
+            // Maintain 5-minute sliding window (60 samples at 5s interval)
+            cpu_temps_5min.push(cpu_temp);
+            if cpu_temps_5min.len() > 60 {
+                cpu_temps_5min.remove(0);
+            }
+
+            // Prune agent DB every hour (720 ticks × 5s = 3600s)
+            prune_counter += 1;
+            if prune_counter >= 720 {
+                prune_counter = 0;
+                let cutoff = now - 7 * 86400;
+                if let Ok(db) = agent_db.lock().await.prune_samples_older_than(cutoff) {
+                    tracing::debug!("[agent] pruned {} old thermal samples", db);
+                }
+            }
+
+            // Record thermal sample to agent DB
+            let workload = detect_workload(cpu_temp, gpu_temp, &cpu_temps_5min);
+            {
+                let db = agent_db.lock().await;
+                let _ = db.insert_sample("cpu_package", cpu_temp, Some(workload.as_str()));
+                if gpu_temp > 0.0 {
+                    let _ = db.insert_sample("gpu", gpu_temp, Some(workload.as_str()));
+                }
+            }
+
+            if workload != last_workload {
+                tracing::info!("[agent] workload changed: {:?} → {:?}", last_workload, workload);
+                let _ = state.agent_event_tx.send(serde_json::json!({
+                    "type": "workload_changed",
+                    "workload": workload.as_str(),
+                    "cpu_temp": cpu_temp,
+                }).to_string());
+                last_workload = workload.clone();
+            }
+
+            // Safety check — emergency override regardless of mode
+            if let Some(reason) = check_safety(cpu_temp, gpu_temp) {
+                tracing::error!("[agent:SAFETY] {}", reason);
+                for fan in &snap.fans {
+                    let _ = state.hal.set_fan_duty(thermaliq_common::SetFanDuty {
+                        fan_id: fan.id.clone(),
+                        duty_percent: 100,
+                    }).await;
+                }
+                let _ = state.agent_event_tx.send(serde_json::json!({
+                    "type": "safety_emergency",
+                    "reason": reason,
+                    "cpu_temp": cpu_temp,
+                    "gpu_temp": gpu_temp,
+                }).to_string());
+                continue;
+            }
+
             let mode = state.agent_mode.read().await.clone();
 
             match mode {
                 AgentMode::Passive => {
-                    for sensor in &snap.sensors {
-                        tracing::debug!(
-                            sensor_id = %sensor.id,
-                            temp = sensor.temp_celsius,
-                            "[agent] passive observation"
-                        );
-                    }
-                    high_temp_since = None;
+                    tracing::debug!(
+                        cpu = cpu_temp,
+                        gpu = gpu_temp,
+                        workload = workload.as_str(),
+                        "[agent:passive]"
+                    );
                 }
 
                 AgentMode::Approval | AgentMode::Autonomous => {
-                    // Find highest CPU temperature
-                    let cpu_temp = snap.sensors.iter()
-                        .filter(|s| s.id.contains("cpu") || s.id.contains("package"))
-                        .map(|s| s.temp_celsius)
-                        .fold(f32::NEG_INFINITY, f32::max);
+                    // Check rate limit
+                    let recent_count = {
+                        let db = agent_db.lock().await;
+                        db.recent_interventions_count(3600).unwrap_or(0)
+                    };
+                    if recent_count >= MAX_INTERVENTIONS_PER_HOUR {
+                        tracing::warn!("[agent] rate limit hit ({}/hr), skipping intervention", recent_count);
+                        continue;
+                    }
 
-                    if cpu_temp > 85.0 {
-                        let since = high_temp_since.get_or_insert_with(Instant::now);
-                        if since.elapsed().as_secs() >= 30 {
-                            high_temp_since = None;
-                            let intervention = Intervention {
-                                id: make_id(),
-                                description: format!(
-                                    "CPU {:.1}°C sustained for 30s — recommend performance profile",
-                                    cpu_temp
-                                ),
-                                proposed_at: unix_now(),
-                                proposed_action: "switch_profile:performance".to_string(),
-                            };
+                    // Determine if intervention is warranted
+                    let intervention_needed = cpu_temp > MAX_CPU_TEMP
+                        || (workload == WorkloadKind::Stress && cpu_temp > 75.0)
+                        || (workload == WorkloadKind::Gaming && cpu_temp > 80.0);
 
-                            if mode == AgentMode::Autonomous {
-                                tracing::warn!(
-                                    "[agent:autonomous] applying: {}",
-                                    intervention.description
-                                );
-                                apply_intervention(&state, &intervention).await;
-                            } else {
-                                tracing::info!(
-                                    "[agent:approval] queued intervention: {}",
-                                    intervention.description
-                                );
-                                if let Ok(mut pending) = state.pending_interventions.lock() {
-                                    pending.push(intervention);
-                                }
-                            }
-                        }
+                    if !intervention_needed {
+                        continue;
+                    }
+
+                    let (reason, action) = if cpu_temp > MAX_CPU_TEMP {
+                        (
+                            format!("CPU {:.1}°C exceeds safety threshold", cpu_temp),
+                            "switch_profile:performance".to_string(),
+                        )
+                    } else if workload == WorkloadKind::Stress {
+                        (
+                            format!("Stress workload detected, CPU {:.1}°C", cpu_temp),
+                            "switch_profile:performance".to_string(),
+                        )
                     } else {
-                        high_temp_since = None;
+                        (
+                            format!("Gaming workload, CPU {:.1}°C", cpu_temp),
+                            "switch_profile:balanced".to_string(),
+                        )
+                    };
+
+                    let id = make_id();
+                    let before_snapshot = serde_json::to_string(&serde_json::json!({
+                        "sensors": snap.sensors,
+                        "fans": snap.fans,
+                    })).ok();
+
+                    let rec = InterventionRecord {
+                        id: id.clone(),
+                        trigger_reason: reason.clone(),
+                        proposed_action: action.clone(),
+                        proposed_at: now,
+                        approved_at: None,
+                        applied_at: None,
+                        result: None,
+                        before_snapshot,
+                        after_snapshot: None,
+                        rolled_back_at: None,
+                    };
+
+                    {
+                        let db = agent_db.lock().await;
+                        let _ = db.log_intervention(&rec);
+                    }
+
+                    let intervention = Intervention {
+                        id: id.clone(),
+                        description: reason,
+                        proposed_at: now as u64,
+                        proposed_action: action.clone(),
+                    };
+
+                    if mode == AgentMode::Autonomous {
+                        tracing::warn!("[agent:autonomous] applying: {}", intervention.description);
+                        apply_intervention(&state, &intervention).await;
+                        {
+                            let db = agent_db.lock().await;
+                            let _ = db.update_intervention_result(&id, "applied", unix_now(), None);
+                        }
+                        let _ = state.agent_event_tx.send(serde_json::json!({
+                            "type": "intervention_applied",
+                            "id": &id,
+                            "action": &action,
+                            "description": &intervention.description,
+                        }).to_string());
+                    } else {
+                        tracing::info!("[agent:approval] queued: {}", intervention.description);
+                        let _ = state.agent_event_tx.send(serde_json::json!({
+                            "type": "intervention_proposed",
+                            "id": &id,
+                            "action": &action,
+                            "description": &intervention.description,
+                        }).to_string());
+                        if let Ok(mut pending) = state.pending_interventions.lock() {
+                            pending.push(intervention);
+                        }
                     }
                 }
             }
@@ -86,6 +292,11 @@ async fn apply_intervention(state: &AppState, intervention: &Intervention) {
             Ok(profile) => {
                 *state.active_profile.write().await = Some(profile);
                 tracing::info!("[agent] switched to profile: {profile_name}");
+                let _ = state.agent_event_tx.send(serde_json::json!({
+                    "type": "profile_changed",
+                    "profile": profile_name,
+                    "source": "agent",
+                }).to_string());
             }
             Err(e) => {
                 tracing::warn!("[agent] could not load profile {profile_name}: {e}");
@@ -101,9 +312,9 @@ fn make_id() -> String {
     format!("{:x}{:08x}", ts.as_secs(), ts.subsec_nanos())
 }
 
-fn unix_now() -> u64 {
+fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs()
+        .as_secs() as i64
 }

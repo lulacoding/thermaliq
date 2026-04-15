@@ -90,6 +90,35 @@ impl HistoryDb {
         .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(records)
     }
+
+    pub fn query_fan_last_n(&self, fan_id: &str, n: usize) -> Result<Vec<FanRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, fan_id, rpm, duty_percent, recorded_at FROM fan_readings WHERE fan_id = ?1 ORDER BY recorded_at DESC LIMIT ?2"
+        )?;
+        let records = stmt.query_map(params![fan_id, n as i64], |row| {
+            Ok(FanRecord {
+                id: row.get(0)?,
+                fan_id: row.get(1)?,
+                rpm: row.get(2)?,
+                duty_percent: row.get(3)?,
+                recorded_at: row.get(4)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
+    pub fn prune_older_than(&self, cutoff_unix: i64) -> Result<usize> {
+        let n1 = self.conn.execute(
+            "DELETE FROM sensor_readings WHERE recorded_at < ?1",
+            params![cutoff_unix],
+        )?;
+        let n2 = self.conn.execute(
+            "DELETE FROM fan_readings WHERE recorded_at < ?1",
+            params![cutoff_unix],
+        )?;
+        Ok(n1 + n2)
+    }
 }
 
 #[cfg(test)]
@@ -117,5 +146,14 @@ mod tests {
         let db = HistoryDb::in_memory().unwrap();
         let records = db.query_sensor_last_n("nonexistent", 10).unwrap();
         assert!(records.is_empty());
+    }
+
+    #[test]
+    fn query_fan_last_n_works() {
+        let db = HistoryDb::in_memory().unwrap();
+        db.insert_fan("cpu_fan", 1200, 50).unwrap();
+        db.insert_fan("cpu_fan", 1300, 60).unwrap();
+        let records = db.query_fan_last_n("cpu_fan", 10).unwrap();
+        assert_eq!(records.len(), 2);
     }
 }

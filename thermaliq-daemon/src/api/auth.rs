@@ -22,7 +22,7 @@ use axum::{
     response::Response,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::{watch, RwLock};
+use tokio::sync::{broadcast, watch, RwLock};
 
 use thermaliq_common::config::Profile;
 use thermaliq_common::history::HistoryDb;
@@ -54,6 +54,10 @@ pub struct AppState {
     pub agent_mode: Arc<RwLock<AgentMode>>,
     pub pending_interventions: Arc<Mutex<Vec<Intervention>>>,
     pub shutdown_tx: Arc<watch::Sender<bool>>,
+    /// Broadcasts JSON sensor+fan snapshots to /ws/sensors clients (1 Hz).
+    pub sensor_tx: Arc<broadcast::Sender<String>>,
+    /// Broadcasts JSON agent events to /ws/agent clients.
+    pub agent_event_tx: Arc<broadcast::Sender<String>>,
 }
 
 impl axum::extract::FromRef<AppState> for Arc<String> {
