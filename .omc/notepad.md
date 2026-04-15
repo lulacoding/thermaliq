@@ -3,21 +3,12 @@
 
 ## Priority Context
 <!-- ALWAYS loaded. Keep under 500 chars. Critical discoveries only. -->
-THERMALIQ Week 1 UI Backend Integration in progress. ✅ SettingsPanel complete (commit 820f3b0). Next: CurveEditor backend wiring (POST /api/curves/ai-generate, POST /api/curves/save), then ProfileManager, HardwareDetect, Dashboard. Target v1.0 May 6 (20 days).
+THERMALIQ Week 1 UI Backend Integration COMPLETE ✅. All components wired: SettingsPanel (820f3b0), CurveEditor (70834fb), HardwareDetect (e94ccfb), ProfileManager (pre-wired), Dashboard (WebSocket live). Next: CalibrationWizard, AgentPanel API wiring. Windows HAL Phase 1 complete (NVML GPU fan writes). Target v1.0 May 6 (19 days).
 
 ## Working Memory
 <!-- Session notes. Auto-pruned after 7 days. -->
-### 2026-04-14 12:11
-### 2026-04-15 00:40
-2026-04-15: Full product roadmap mapped and saved. Phase 0 complete. Phase 1 (Windows) is active focus. Windows HAL decision: HWiNFO64 shared memory (Global\HWiNFO_SENS_SM2) as primary, WMI fallback. Avoid WinRing0 (Defender quarantine) and PawnIO (anti-cheat). NVML for NVIDIA GPU fan control. Full roadmap in docs/ROADMAP.md. All technical decisions locked and saved to project memory. Next session: start thermaliq-hal/src/windows.rs implementation.
-
-
-## 2026-04-14 12:11
-## ThermalIQ v0.2 session wrap-up (2026-04-14)
-Commits pushed: 05ea9a2 (data layer), 5ca81c2 (community), 041b6df (CI), 60e3f30 (arch doc), 43c3cc9 (v0.2 — config/poll/agent/CLI)
-32 tests passing. Repo: lulacoding/thermaliq main.
-Next: real HAL implementations, fan calibration, remaining curve types, Tauri+React UI.
-
+### 2026-04-15 11:20pm
+Week 1 UI backend wiring sprint completed. CurveEditor → daemon /api/curves/ai-generate and /api/curves/save. HardwareDetect → daemon /sensors and /fans endpoints. ProfileManager already wired to /api/profiles endpoints. Dashboard fully wired via useDaemon WebSocket hook to /ws/sensors. All components compile without new TypeScript errors.
 
 ## MANUAL
 <!-- User content. Never auto-pruned. -->
