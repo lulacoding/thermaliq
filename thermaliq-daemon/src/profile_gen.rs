@@ -144,7 +144,11 @@ pub async fn generate_profile(
         return Err(anyhow!("generated profile has no `[[controls]]`"));
     }
 
-    Ok(GeneratedProfile { name: profile.name.clone(), toml: toml_text, profile })
+    Ok(GeneratedProfile {
+        name: profile.name.clone(),
+        toml: toml_text,
+        profile,
+    })
 }
 
 /// Persist a generated profile to the profiles directory.
@@ -183,8 +187,7 @@ fn build_hw_context(snapshot: Option<&HardwareSnapshot>) -> String {
             )
         }
         None => {
-            "Hardware: unknown — use generic IDs like 'cpu_tctl', 'cpu_fan', 'gpu_fan'."
-                .to_string()
+            "Hardware: unknown — use generic IDs like 'cpu_tctl', 'cpu_fan', 'gpu_fan'.".to_string()
         }
     }
 }

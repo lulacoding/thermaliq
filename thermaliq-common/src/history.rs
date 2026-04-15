@@ -160,8 +160,7 @@ impl HistoryDb {
             "SELECT AVG(temp_celsius) FROM sensor_readings \
              WHERE sensor_id = ?1 AND recorded_at >= ?2",
         )?;
-        let avg: Option<f64> =
-            stmt.query_row(params![sensor_id, cutoff], |row| row.get(0))?;
+        let avg: Option<f64> = stmt.query_row(params![sensor_id, cutoff], |row| row.get(0))?;
         Ok(avg.map(|v| v as f32))
     }
 

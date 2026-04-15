@@ -223,13 +223,16 @@ fn find_drm_card_for_hwmon(hwmon_chip: &Path) -> Option<PathBuf> {
 /// Present on kernel 6.7+ with RDNA3 (Navi3x) hardware.
 fn rdna3_fan_curve_path(card_path: &Path) -> Option<PathBuf> {
     let p = card_path.join("device/gpu_od/fan_ctrl/fan_curve");
-    if p.exists() { Some(p) } else { None }
+    if p.exists() {
+        Some(p)
+    } else {
+        None
+    }
 }
 
 /// Check whether amdgpu has OverDrive enabled (ppfeaturemask bit 22).
 fn amdgpu_overdrive_enabled() -> bool {
-    let s = fs::read_to_string(AMDGPU_PPFEATUREMASK)
-        .unwrap_or_default();
+    let s = fs::read_to_string(AMDGPU_PPFEATUREMASK).unwrap_or_default();
     let s = s.trim();
     let mask: u64 = if s.starts_with("0x") || s.starts_with("0X") {
         u64::from_str_radix(&s[2..], 16).unwrap_or(0)
@@ -247,10 +250,7 @@ fn amdgpu_overdrive_enabled() -> bool {
 fn write_rdna3_fan_curve(fan_curve: &Path, duty_percent: u8) -> anyhow::Result<()> {
     let d = duty_percent.clamp(0, 100);
     // Five anchor points spanning 0–100 °C, all at the requested duty.
-    let curve = format!(
-        "0 {d}\n25 {d}\n50 {d}\n75 {d}\n100 {d}\n",
-        d = d
-    );
+    let curve = format!("0 {d}\n25 {d}\n50 {d}\n75 {d}\n100 {d}\n", d = d);
     fs::write(fan_curve, &curve)?;
     tracing::info!(
         path = %fan_curve.display(),
@@ -289,9 +289,7 @@ const LAPTOP_CHASSIS_TYPES: &[u8] = &[
 
 fn dmi_read(field: &str) -> Option<String> {
     let path = format!("/sys/class/dmi/id/{field}");
-    fs::read_to_string(path)
-        .ok()
-        .map(|s| s.trim().to_string())
+    fs::read_to_string(path).ok().map(|s| s.trim().to_string())
 }
 
 /// True when DMI chassis type reports a portable form factor.
@@ -391,7 +389,13 @@ fn find_nbfc_config() -> Option<NbfcConfig> {
     // Sanitize product name for use as filename (replace spaces/slashes).
     let safe = product
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect::<String>();
 
     let search_dirs = ["/etc/thermaliq/nbfc", "/usr/share/thermaliq/nbfc"];
@@ -437,9 +441,25 @@ fn parse_nbfc_ini(text: &str) -> Option<NbfcConfig> {
     let fans: Vec<NbfcFanConfig> = (0..fan_count)
         .filter_map(|i| {
             let reg = parse_u8(entries.get(&format!("fan{i}_write_reg"))?)?;
-            let min = parse_u8(entries.get(&format!("fan{i}_min_value")).map(|s| s.as_str()).unwrap_or("0")).unwrap_or(0);
-            let max = parse_u8(entries.get(&format!("fan{i}_max_value")).map(|s| s.as_str()).unwrap_or("255")).unwrap_or(255);
-            Some(NbfcFanConfig { write_reg: reg, min_value: min, max_value: max })
+            let min = parse_u8(
+                entries
+                    .get(&format!("fan{i}_min_value"))
+                    .map(|s| s.as_str())
+                    .unwrap_or("0"),
+            )
+            .unwrap_or(0);
+            let max = parse_u8(
+                entries
+                    .get(&format!("fan{i}_max_value"))
+                    .map(|s| s.as_str())
+                    .unwrap_or("255"),
+            )
+            .unwrap_or(255);
+            Some(NbfcFanConfig {
+                write_reg: reg,
+                min_value: min,
+                max_value: max,
+            })
         })
         .collect();
 
