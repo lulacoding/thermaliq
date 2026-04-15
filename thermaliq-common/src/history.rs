@@ -79,15 +79,16 @@ impl HistoryDb {
         let mut stmt = self.conn.prepare(
             "SELECT id, sensor_id, temp_celsius, recorded_at FROM sensor_readings WHERE sensor_id = ?1 ORDER BY recorded_at DESC LIMIT ?2"
         )?;
-        let records = stmt.query_map(params![sensor_id, n as i64], |row| {
-            Ok(SensorRecord {
-                id: row.get(0)?,
-                sensor_id: row.get(1)?,
-                temp_celsius: row.get(2)?,
-                recorded_at: row.get(3)?,
-            })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+        let records = stmt
+            .query_map(params![sensor_id, n as i64], |row| {
+                Ok(SensorRecord {
+                    id: row.get(0)?,
+                    sensor_id: row.get(1)?,
+                    temp_celsius: row.get(2)?,
+                    recorded_at: row.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(records)
     }
 
@@ -95,16 +96,17 @@ impl HistoryDb {
         let mut stmt = self.conn.prepare(
             "SELECT id, fan_id, rpm, duty_percent, recorded_at FROM fan_readings WHERE fan_id = ?1 ORDER BY recorded_at DESC LIMIT ?2"
         )?;
-        let records = stmt.query_map(params![fan_id, n as i64], |row| {
-            Ok(FanRecord {
-                id: row.get(0)?,
-                fan_id: row.get(1)?,
-                rpm: row.get(2)?,
-                duty_percent: row.get(3)?,
-                recorded_at: row.get(4)?,
-            })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+        let records = stmt
+            .query_map(params![fan_id, n as i64], |row| {
+                Ok(FanRecord {
+                    id: row.get(0)?,
+                    fan_id: row.get(1)?,
+                    rpm: row.get(2)?,
+                    duty_percent: row.get(3)?,
+                    recorded_at: row.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(records)
     }
 

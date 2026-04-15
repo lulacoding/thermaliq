@@ -38,17 +38,16 @@ impl WorkloadKind {
 
 /// Detect workload from recent thermal samples.
 /// Uses temperature as a proxy for CPU/GPU load (no direct load% available from HAL).
-fn detect_workload(
-    cpu_temp: f32,
-    gpu_temp: f32,
-    cpu_temps_5min: &[f32],
-) -> WorkloadKind {
+fn detect_workload(cpu_temp: f32, gpu_temp: f32, cpu_temps_5min: &[f32]) -> WorkloadKind {
     if cpu_temps_5min.is_empty() {
         return WorkloadKind::Unknown;
     }
 
     let avg_cpu: f32 = cpu_temps_5min.iter().sum::<f32>() / cpu_temps_5min.len() as f32;
-    let max_cpu: f32 = cpu_temps_5min.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let max_cpu: f32 = cpu_temps_5min
+        .iter()
+        .cloned()
+        .fold(f32::NEG_INFINITY, f32::max);
 
     // Emergency / Stress: sustained very high CPU
     if max_cpu >= 78.0 && avg_cpu >= 72.0 {
@@ -89,7 +88,10 @@ fn check_safety(cpu_temp: f32, gpu_temp: f32) -> Option<&'static str> {
     None
 }
 
-pub fn start_agent_loop(state: AppState, agent_db: Arc<Mutex<AgentDb>>) -> tokio::task::JoinHandle<()> {
+pub fn start_agent_loop(
+    state: AppState,
+    agent_db: Arc<Mutex<AgentDb>>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = interval(Duration::from_secs(5));
         let mut cpu_temps_5min: Vec<f32> = Vec::new();
@@ -107,17 +109,27 @@ pub fn start_agent_loop(state: AppState, agent_db: Arc<Mutex<AgentDb>>) -> tokio
             let now = unix_now();
 
             // Extract key temperatures
-            let cpu_temp = snap.sensors.iter()
-                .filter(|s| s.id.contains("cpu") || s.id.contains("package") || s.id.contains("tctl"))
+            let cpu_temp = snap
+                .sensors
+                .iter()
+                .filter(|s| {
+                    s.id.contains("cpu") || s.id.contains("package") || s.id.contains("tctl")
+                })
                 .map(|s| s.temp_celsius)
                 .fold(f32::NEG_INFINITY, f32::max);
 
-            let gpu_temp = snap.sensors.iter()
+            let gpu_temp = snap
+                .sensors
+                .iter()
                 .filter(|s| s.id.contains("gpu") || s.id.contains("edge"))
                 .map(|s| s.temp_celsius)
                 .fold(0.0_f32, f32::max);
 
-            let cpu_temp = if cpu_temp == f32::NEG_INFINITY { 0.0 } else { cpu_temp };
+            let cpu_temp = if cpu_temp == f32::NEG_INFINITY {
+                0.0
+            } else {
+                cpu_temp
+            };
 
             // Maintain 5-minute sliding window (60 samples at 5s interval)
             cpu_temps_5min.push(cpu_temp);
@@ -146,12 +158,19 @@ pub fn start_agent_loop(state: AppState, agent_db: Arc<Mutex<AgentDb>>) -> tokio
             }
 
             if workload != last_workload {
-                tracing::info!("[agent] workload changed: {:?} → {:?}", last_workload, workload);
-                let _ = state.agent_event_tx.send(serde_json::json!({
-                    "type": "workload_changed",
-                    "workload": workload.as_str(),
-                    "cpu_temp": cpu_temp,
-                }).to_string());
+                tracing::info!(
+                    "[agent] workload changed: {:?} → {:?}",
+                    last_workload,
+                    workload
+                );
+                let _ = state.agent_event_tx.send(
+                    serde_json::json!({
+                        "type": "workload_changed",
+                        "workload": workload.as_str(),
+                        "cpu_temp": cpu_temp,
+                    })
+                    .to_string(),
+                );
                 last_workload = workload.clone();
             }
 
@@ -159,17 +178,23 @@ pub fn start_agent_loop(state: AppState, agent_db: Arc<Mutex<AgentDb>>) -> tokio
             if let Some(reason) = check_safety(cpu_temp, gpu_temp) {
                 tracing::error!("[agent:SAFETY] {}", reason);
                 for fan in &snap.fans {
-                    let _ = state.hal.set_fan_duty(thermaliq_common::SetFanDuty {
-                        fan_id: fan.id.clone(),
-                        duty_percent: 100,
-                    }).await;
+                    let _ = state
+                        .hal
+                        .set_fan_duty(thermaliq_common::SetFanDuty {
+                            fan_id: fan.id.clone(),
+                            duty_percent: 100,
+                        })
+                        .await;
                 }
-                let _ = state.agent_event_tx.send(serde_json::json!({
-                    "type": "safety_emergency",
-                    "reason": reason,
-                    "cpu_temp": cpu_temp,
-                    "gpu_temp": gpu_temp,
-                }).to_string());
+                let _ = state.agent_event_tx.send(
+                    serde_json::json!({
+                        "type": "safety_emergency",
+                        "reason": reason,
+                        "cpu_temp": cpu_temp,
+                        "gpu_temp": gpu_temp,
+                    })
+                    .to_string(),
+                );
                 continue;
             }
 
@@ -192,7 +217,10 @@ pub fn start_agent_loop(state: AppState, agent_db: Arc<Mutex<AgentDb>>) -> tokio
                         db.recent_interventions_count(3600).unwrap_or(0)
                     };
                     if recent_count >= MAX_INTERVENTIONS_PER_HOUR {
-                        tracing::warn!("[agent] rate limit hit ({}/hr), skipping intervention", recent_count);
+                        tracing::warn!(
+                            "[agent] rate limit hit ({}/hr), skipping intervention",
+                            recent_count
+                        );
                         continue;
                     }
 
@@ -226,7 +254,8 @@ pub fn start_agent_loop(state: AppState, agent_db: Arc<Mutex<AgentDb>>) -> tokio
                     let before_snapshot = serde_json::to_string(&serde_json::json!({
                         "sensors": snap.sensors,
                         "fans": snap.fans,
-                    })).ok();
+                    }))
+                    .ok();
 
                     let rec = InterventionRecord {
                         id: id.clone(),
@@ -260,20 +289,26 @@ pub fn start_agent_loop(state: AppState, agent_db: Arc<Mutex<AgentDb>>) -> tokio
                             let db = agent_db.lock().await;
                             let _ = db.update_intervention_result(&id, "applied", unix_now(), None);
                         }
-                        let _ = state.agent_event_tx.send(serde_json::json!({
-                            "type": "intervention_applied",
-                            "id": &id,
-                            "action": &action,
-                            "description": &intervention.description,
-                        }).to_string());
+                        let _ = state.agent_event_tx.send(
+                            serde_json::json!({
+                                "type": "intervention_applied",
+                                "id": &id,
+                                "action": &action,
+                                "description": &intervention.description,
+                            })
+                            .to_string(),
+                        );
                     } else {
                         tracing::info!("[agent:approval] queued: {}", intervention.description);
-                        let _ = state.agent_event_tx.send(serde_json::json!({
-                            "type": "intervention_proposed",
-                            "id": &id,
-                            "action": &action,
-                            "description": &intervention.description,
-                        }).to_string());
+                        let _ = state.agent_event_tx.send(
+                            serde_json::json!({
+                                "type": "intervention_proposed",
+                                "id": &id,
+                                "action": &action,
+                                "description": &intervention.description,
+                            })
+                            .to_string(),
+                        );
                         if let Ok(mut pending) = state.pending_interventions.lock() {
                             pending.push(intervention);
                         }
@@ -286,17 +321,19 @@ pub fn start_agent_loop(state: AppState, agent_db: Arc<Mutex<AgentDb>>) -> tokio
 
 async fn apply_intervention(state: &AppState, intervention: &Intervention) {
     if let Some(profile_name) = intervention.proposed_action.strip_prefix("switch_profile:") {
-        let path = thermaliq_common::config::profiles_dir()
-            .join(format!("{profile_name}.toml"));
+        let path = thermaliq_common::config::profiles_dir().join(format!("{profile_name}.toml"));
         match thermaliq_common::config::load_profile(&path) {
             Ok(profile) => {
                 *state.active_profile.write().await = Some(profile);
                 tracing::info!("[agent] switched to profile: {profile_name}");
-                let _ = state.agent_event_tx.send(serde_json::json!({
-                    "type": "profile_changed",
-                    "profile": profile_name,
-                    "source": "agent",
-                }).to_string());
+                let _ = state.agent_event_tx.send(
+                    serde_json::json!({
+                        "type": "profile_changed",
+                        "profile": profile_name,
+                        "source": "agent",
+                    })
+                    .to_string(),
+                );
             }
             Err(e) => {
                 tracing::warn!("[agent] could not load profile {profile_name}: {e}");

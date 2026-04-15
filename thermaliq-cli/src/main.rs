@@ -8,7 +8,11 @@ use std::path::PathBuf;
 const DEFAULT_BASE_URL: &str = "http://127.0.0.1:7272";
 
 #[derive(Parser)]
-#[command(name = "tq", about = "ThermalIQ CLI — talk to the local daemon", version)]
+#[command(
+    name = "tq",
+    about = "ThermalIQ CLI — talk to the local daemon",
+    version
+)]
 struct Cli {
     /// Daemon base URL
     #[arg(long, env = "THERMALIQ_URL", default_value = DEFAULT_BASE_URL)]
@@ -155,7 +159,9 @@ fn get(client: &Client, url: &str) -> Result<Value> {
         .send()
         .with_context(|| format!("GET {url}"))?;
     let status = resp.status();
-    let body: Value = resp.json().with_context(|| format!("parse response from {url}"))?;
+    let body: Value = resp
+        .json()
+        .with_context(|| format!("parse response from {url}"))?;
     if !status.is_success() {
         anyhow::bail!("HTTP {status}: {body}");
     }
@@ -170,7 +176,9 @@ fn post_authed(client: &Client, url: &str, token: &str, body: &Value) -> Result<
         .send()
         .with_context(|| format!("POST {url}"))?;
     let status = resp.status();
-    let resp_body: Value = resp.json().with_context(|| format!("parse response from {url}"))?;
+    let resp_body: Value = resp
+        .json()
+        .with_context(|| format!("parse response from {url}"))?;
     if !status.is_success() {
         anyhow::bail!("HTTP {status}: {resp_body}");
     }
@@ -209,14 +217,21 @@ fn main() -> Result<()> {
             let agent = get(&client, &format!("{base}/api/agent/status"))?;
             println!("health:  {}", health["status"].as_str().unwrap_or("?"));
             println!("version: {}", version["version"].as_str().unwrap_or("?"));
-            println!("agent:   {} (pending: {})", agent["mode"].as_str().unwrap_or("?"), agent["pending_count"].as_u64().unwrap_or(0));
+            println!(
+                "agent:   {} (pending: {})",
+                agent["mode"].as_str().unwrap_or("?"),
+                agent["pending_count"].as_u64().unwrap_or(0)
+            );
         }
 
         Command::Profile { action } => match action {
             ProfileAction::List => {
                 let names = thermaliq_common::config::list_profiles().unwrap_or_default();
                 if names.is_empty() {
-                    println!("No profiles found in {}", thermaliq_common::config::profiles_dir().display());
+                    println!(
+                        "No profiles found in {}",
+                        thermaliq_common::config::profiles_dir().display()
+                    );
                 } else {
                     for name in &names {
                         println!("{name}");
@@ -332,8 +347,8 @@ fn main() -> Result<()> {
                 let data = get(&client, &format!("{base}/api/profiles/active"))?;
                 match data["name"].as_str() {
                     Some(name) => {
-                        let path = thermaliq_common::config::profiles_dir()
-                            .join(format!("{name}.toml"));
+                        let path =
+                            thermaliq_common::config::profiles_dir().join(format!("{name}.toml"));
                         match thermaliq_common::config::load_profile(&path) {
                             Ok(profile) => {
                                 if profile.alerts.is_empty() {
@@ -425,8 +440,19 @@ fn temp_bar(temp: f64) -> String {
     let filled = ((temp / 100.0) * 20.0).round() as usize;
     let filled = filled.min(20);
     let empty = 20 - filled;
-    let color = if temp >= 85.0 { "\x1B[31m" } else if temp >= 70.0 { "\x1B[33m" } else { "\x1B[32m" };
-    format!("{}[{}{}]\x1B[0m", color, "#".repeat(filled), ".".repeat(empty))
+    let color = if temp >= 85.0 {
+        "\x1B[31m"
+    } else if temp >= 70.0 {
+        "\x1B[33m"
+    } else {
+        "\x1B[32m"
+    };
+    format!(
+        "{}[{}{}]\x1B[0m",
+        color,
+        "#".repeat(filled),
+        ".".repeat(empty)
+    )
 }
 
 fn duty_bar(duty: u64) -> String {

@@ -1,7 +1,7 @@
 //! Daemon configuration and fan profile types.
 
-use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 // ── DaemonConfig ─────────────────────────────────────────────────────────────
 
@@ -69,7 +69,9 @@ pub struct Profile {
     pub alerts: Vec<ProfileAlert>,
 }
 
-fn default_version() -> u32 { 1 }
+fn default_version() -> u32 {
+    1
+}
 
 pub fn profiles_dir() -> PathBuf {
     dirs::config_dir()
@@ -108,15 +110,35 @@ pub fn list_profiles() -> anyhow::Result<Vec<String>> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CustomSensor {
-    TimeAverage { id: String, source: String, time_s: u64 },
-    Mix { id: String, function: MixFunction, sources: Vec<String> },
-    File { id: String, path: PathBuf },
-    Offset { id: String, source: String, offset: f32 },
+    TimeAverage {
+        id: String,
+        source: String,
+        time_s: u64,
+    },
+    Mix {
+        id: String,
+        function: MixFunction,
+        sources: Vec<String>,
+    },
+    File {
+        id: String,
+        path: PathBuf,
+    },
+    Offset {
+        id: String,
+        source: String,
+        offset: f32,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum MixFunction { Max, Min, Average, Sum }
+pub enum MixFunction {
+    Max,
+    Min,
+    Average,
+    Sum,
+}
 
 // ── Fan curves ────────────────────────────────────────────────────────────────
 
@@ -200,12 +222,24 @@ pub enum ProfileCurve {
     },
 }
 
-fn default_response_ms() -> u64 { 2000 }
-fn default_step() -> u8 { 2 }
-fn default_deadband() -> f32 { 3.0 }
-fn default_goal() -> String { "balanced".to_string() }
-fn default_lookahead() -> u64 { 300 }
-fn default_learning_rate() -> f32 { 0.1 }
+fn default_response_ms() -> u64 {
+    2000
+}
+fn default_step() -> u8 {
+    2
+}
+fn default_deadband() -> f32 {
+    3.0
+}
+fn default_goal() -> String {
+    "balanced".to_string()
+}
+fn default_lookahead() -> u64 {
+    300
+}
+fn default_learning_rate() -> f32 {
+    0.1
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphPoint {
@@ -217,7 +251,11 @@ pub struct GraphPoint {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
-pub enum FanMode { #[default] Pwm, Rpm }
+pub enum FanMode {
+    #[default]
+    Pwm,
+    Rpm,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FanControl {
@@ -235,14 +273,21 @@ pub struct FanControl {
     pub min_pwm: u8,
 }
 
-fn default_step_up() -> u8 { 10 }
-fn default_step_down() -> u8 { 3 }
+fn default_step_up() -> u8 {
+    10
+}
+fn default_step_down() -> u8 {
+    3
+}
 
 // ── Alerts ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum AlertSeverity { Warn, Crit }
+pub enum AlertSeverity {
+    Warn,
+    Crit,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

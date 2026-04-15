@@ -48,7 +48,8 @@ pub fn start_poll_loop(state: AppState, interval_ms: u64) -> tokio::task::JoinHa
                     "sensors": snap.sensors,
                     "fans": snap.fans,
                     "ts": now_ts,
-                })).unwrap_or_default();
+                }))
+                .unwrap_or_default();
                 let _ = state.sensor_tx.send(snap_json);
             }
 
@@ -77,22 +78,31 @@ pub fn start_poll_loop(state: AppState, interval_ms: u64) -> tokio::task::JoinHa
                 let profile_guard = state.active_profile.read().await;
                 if let Some(profile) = profile_guard.as_ref() {
                     for control in &profile.controls {
-                        let Some(curve) = profile.curves.iter().find(|c| curve_id(c) == control.curve) else { continue };
+                        let Some(curve) =
+                            profile.curves.iter().find(|c| curve_id(c) == control.curve)
+                        else {
+                            continue;
+                        };
                         // Source-independent curves (Flat, Mix, Sync, Ai) use temp=0.0;
                         // source-dependent curves look up the sensor reading.
                         let temp = match curve_source(curve) {
                             Some(src) => {
-                                let Some(sensor) = snap.sensors.iter().find(|s| s.id == src) else { continue };
+                                let Some(sensor) = snap.sensors.iter().find(|s| s.id == src) else {
+                                    continue;
+                                };
                                 sensor.temp_celsius
                             }
                             None => 0.0,
                         };
                         let duty = compute_duty_for_curve(curve, temp, profile);
                         let duty = duty.max(control.min_pwm);
-                        let _ = state.hal.set_fan_duty(thermaliq_common::SetFanDuty {
-                            fan_id: control.fan.clone(),
-                            duty_percent: duty,
-                        }).await;
+                        let _ = state
+                            .hal
+                            .set_fan_duty(thermaliq_common::SetFanDuty {
+                                fan_id: control.fan.clone(),
+                                duty_percent: duty,
+                            })
+                            .await;
                     }
                 }
             }
@@ -129,17 +139,33 @@ fn curve_source(c: &ProfileCurve) -> Option<&str> {
 
 fn compute_duty_for_curve(curve: &ProfileCurve, temp: f32, profile: &Profile) -> u8 {
     match curve {
-        ProfileCurve::Linear { min_temp, max_temp, min_pwm, max_pwm, .. } => {
-            if temp <= *min_temp { return *min_pwm; }
-            if temp >= *max_temp { return *max_pwm; }
+        ProfileCurve::Linear {
+            min_temp,
+            max_temp,
+            min_pwm,
+            max_pwm,
+            ..
+        } => {
+            if temp <= *min_temp {
+                return *min_pwm;
+            }
+            if temp >= *max_temp {
+                return *max_pwm;
+            }
             let t = (temp - min_temp) / (max_temp - min_temp);
             (*min_pwm as f32 + t * (*max_pwm as f32 - *min_pwm as f32)).round() as u8
         }
         ProfileCurve::Flat { pwm, .. } => *pwm,
         ProfileCurve::Graph { points, .. } => {
-            if points.is_empty() { return 50; }
-            if temp <= points.first().unwrap().temp { return points.first().unwrap().pwm; }
-            if temp >= points.last().unwrap().temp { return points.last().unwrap().pwm; }
+            if points.is_empty() {
+                return 50;
+            }
+            if temp <= points.first().unwrap().temp {
+                return points.first().unwrap().pwm;
+            }
+            if temp >= points.last().unwrap().temp {
+                return points.last().unwrap().pwm;
+            }
             for window in points.windows(2) {
                 let lo = &window[0];
                 let hi = &window[1];
@@ -151,23 +177,40 @@ fn compute_duty_for_curve(curve: &ProfileCurve, temp: f32, profile: &Profile) ->
             }
             points.last().unwrap().pwm
         }
-        ProfileCurve::Mix { function, curves, .. } => {
-            let duties: Vec<u8> = curves.iter()
+        ProfileCurve::Mix {
+            function, curves, ..
+        } => {
+            let duties: Vec<u8> = curves
+                .iter()
                 .filter_map(|cid| profile.curves.iter().find(|c| curve_id(c) == cid))
                 .map(|c| compute_duty_for_curve(c, temp, profile))
                 .collect();
-            if duties.is_empty() { return 50; }
+            if duties.is_empty() {
+                return 50;
+            }
             match function {
                 MixFunction::Max => *duties.iter().max().unwrap(),
                 MixFunction::Min => *duties.iter().min().unwrap(),
-                MixFunction::Average => (duties.iter().map(|&d| d as u32).sum::<u32>() / duties.len() as u32) as u8,
+                MixFunction::Average => {
+                    (duties.iter().map(|&d| d as u32).sum::<u32>() / duties.len() as u32) as u8
+                }
                 MixFunction::Sum => duties.iter().map(|&d| d as u32).sum::<u32>().min(100) as u8,
             }
         }
-        ProfileCurve::Trigger { idle_temp, idle_pwm, load_temp, load_pwm, .. } => {
-            if temp <= *idle_temp { *idle_pwm }
-            else if temp >= *load_temp { *load_pwm }
-            else { *idle_pwm }
+        ProfileCurve::Trigger {
+            idle_temp,
+            idle_pwm,
+            load_temp,
+            load_pwm,
+            ..
+        } => {
+            if temp <= *idle_temp {
+                *idle_pwm
+            } else if temp >= *load_temp {
+                *load_pwm
+            } else {
+                *idle_pwm
+            }
         }
         ProfileCurve::Sync { target, offset, .. } => {
             if let Some(target_curve) = profile.curves.iter().find(|c| curve_id(c) == target) {
@@ -177,20 +220,39 @@ fn compute_duty_for_curve(curve: &ProfileCurve, temp: f32, profile: &Profile) ->
                 50
             }
         }
-        ProfileCurve::Auto { idle_temp, load_temp, min_pwm, max_pwm, .. } => {
-            if temp <= *idle_temp { return *min_pwm; }
-            if temp >= *load_temp { return *max_pwm; }
+        ProfileCurve::Auto {
+            idle_temp,
+            load_temp,
+            min_pwm,
+            max_pwm,
+            ..
+        } => {
+            if temp <= *idle_temp {
+                return *min_pwm;
+            }
+            if temp >= *load_temp {
+                return *max_pwm;
+            }
             let t = (temp - idle_temp) / (load_temp - idle_temp);
             (*min_pwm as f32 + t * (*max_pwm as f32 - *min_pwm as f32)).round() as u8
         }
         ProfileCurve::Ai { .. } => 60,
-        ProfileCurve::Predictive { min_pwm, max_pwm, .. } => {
+        ProfileCurve::Predictive {
+            min_pwm, max_pwm, ..
+        } => {
             let t = (temp - 40.0) / (80.0 - 40.0);
-            (*min_pwm as f32 + t.clamp(0.0, 1.0) * (*max_pwm as f32 - *min_pwm as f32)).round() as u8
+            (*min_pwm as f32 + t.clamp(0.0, 1.0) * (*max_pwm as f32 - *min_pwm as f32)).round()
+                as u8
         }
-        ProfileCurve::Learning { base_min_pwm, base_max_pwm, .. } => {
+        ProfileCurve::Learning {
+            base_min_pwm,
+            base_max_pwm,
+            ..
+        } => {
             let t = (temp - 40.0) / (80.0 - 40.0);
-            (*base_min_pwm as f32 + t.clamp(0.0, 1.0) * (*base_max_pwm as f32 - *base_min_pwm as f32)).round() as u8
+            (*base_min_pwm as f32
+                + t.clamp(0.0, 1.0) * (*base_max_pwm as f32 - *base_min_pwm as f32))
+                .round() as u8
         }
     }
 }

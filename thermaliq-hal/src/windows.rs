@@ -122,14 +122,18 @@ impl HwinfoMapping {
         };
 
         if handle == INVALID_HANDLE_VALUE || handle.is_invalid() {
-            return Err(anyhow!("HWiNFO64 shared memory not found — is HWiNFO64 running?"));
+            return Err(anyhow!(
+                "HWiNFO64 shared memory not found — is HWiNFO64 running?"
+            ));
         }
 
         let view_mapped = unsafe { MapViewOfFile(handle, FILE_MAP_READ, 0, 0, 0) };
         // MapViewOfFile returns a handle newtype; .Value is the raw *mut c_void pointer.
         let view_ptr = view_mapped.Value;
         if view_ptr.is_null() {
-            unsafe { let _ = CloseHandle(handle); }
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
             return Err(anyhow!("MapViewOfFile failed"));
         }
 
@@ -157,8 +161,7 @@ impl HwinfoMapping {
         let mut sensors = Vec::new();
         let mut fans = Vec::new();
 
-        let reading_base =
-            unsafe { self.view.add(header.reading_section_offset as usize) };
+        let reading_base = unsafe { self.view.add(header.reading_section_offset as usize) };
 
         for i in 0..header.reading_element_count as usize {
             let reading = unsafe {
@@ -173,10 +176,7 @@ impl HwinfoMapping {
                     let temp = reading.value as f32;
                     if temp > -40.0 && temp < 150.0 {
                         sensors.push(SensorReading {
-                            id: format!(
-                                "hwinfo_{}_{}",
-                                reading.sensor_index, reading.reading_id
-                            ),
+                            id: format!("hwinfo_{}_{}", reading.sensor_index, reading.reading_id),
                             label,
                             temp_celsius: temp,
                         });
@@ -248,7 +248,9 @@ fn nvml_fans() -> Vec<FanReading> {
 
     let mut fans = Vec::new();
     for gpu_idx in 0..count {
-        let Ok(device) = nvml.device_by_index(gpu_idx) else { continue };
+        let Ok(device) = nvml.device_by_index(gpu_idx) else {
+            continue;
+        };
         let num_fans = device.num_fans().unwrap_or(1);
         for fan_idx in 0..num_fans {
             let rpm = device
@@ -379,12 +381,11 @@ fn adl_fans() -> Vec<FanReading> {
                 Ok(f) => f,
                 Err(_) => return Vec::new(),
             };
-        let get_count: libloading::Symbol<
-            unsafe extern "C" fn(AdlContextHandle, *mut i32) -> i32,
-        > = match lib.get(b"ADL2_Adapter_NumberOfAdapters_Get\0") {
-            Ok(f) => f,
-            Err(_) => return Vec::new(),
-        };
+        let get_count: libloading::Symbol<unsafe extern "C" fn(AdlContextHandle, *mut i32) -> i32> =
+            match lib.get(b"ADL2_Adapter_NumberOfAdapters_Get\0") {
+                Ok(f) => f,
+                Err(_) => return Vec::new(),
+            };
         let get_info: libloading::Symbol<
             unsafe extern "C" fn(AdlContextHandle, *mut AdlAdapterInfo, i32) -> i32,
         > = match lib.get(b"ADL2_Adapter_AdapterInfo_Get\0") {
@@ -467,12 +468,17 @@ fn adl_set_fan(fan_id: &str, duty_percent: u8) -> Result<()> {
                 i32,
                 *mut AdlContextHandle,
             ) -> i32,
-        > = lib.get(b"ADL2_Main_Control_Create\0").context("ADL2_Main_Control_Create")?;
-        let destroy: libloading::Symbol<unsafe extern "C" fn(AdlContextHandle) -> i32> =
-            lib.get(b"ADL2_Main_Control_Destroy\0").context("ADL2_Main_Control_Destroy")?;
+        > = lib
+            .get(b"ADL2_Main_Control_Create\0")
+            .context("ADL2_Main_Control_Create")?;
+        let destroy: libloading::Symbol<unsafe extern "C" fn(AdlContextHandle) -> i32> = lib
+            .get(b"ADL2_Main_Control_Destroy\0")
+            .context("ADL2_Main_Control_Destroy")?;
         let fan_set: libloading::Symbol<
             unsafe extern "C" fn(AdlContextHandle, i32, *mut AdlFanSpeedValue) -> i32,
-        > = lib.get(b"ADL2_Overdrive5_FanSpeed_Set\0").context("ADL2_Overdrive5_FanSpeed_Set")?;
+        > = lib
+            .get(b"ADL2_Overdrive5_FanSpeed_Set\0")
+            .context("ADL2_Overdrive5_FanSpeed_Set")?;
 
         let mut ctx: AdlContextHandle = std::ptr::null_mut();
         if create(adl_alloc, 1, &mut ctx) != ADL_OK {
@@ -494,7 +500,11 @@ fn adl_set_fan(fan_id: &str, duty_percent: u8) -> Result<()> {
         }
     }
 
-    tracing::info!(fan = fan_id, duty = duty_percent, "Windows: AMD ADL fan speed set");
+    tracing::info!(
+        fan = fan_id,
+        duty = duty_percent,
+        "Windows: AMD ADL fan speed set"
+    );
     Ok(())
 }
 
@@ -530,38 +540,37 @@ impl HardwareLayer for WindowsHardwareLayer {
             guard.take()
         };
 
-        let (mapping_result, sensors, fans) =
-            tokio::task::spawn_blocking(move || {
-                // Try to (re-)open HWiNFO64 mapping if we don't have one.
-                let mapping = match cached {
-                    Some(m) => Ok(m),
-                    None => HwinfoMapping::open(),
-                };
+        let (mapping_result, sensors, fans) = tokio::task::spawn_blocking(move || {
+            // Try to (re-)open HWiNFO64 mapping if we don't have one.
+            let mapping = match cached {
+                Some(m) => Ok(m),
+                None => HwinfoMapping::open(),
+            };
 
-                let (sensors, fans, new_mapping) = match mapping {
-                    Ok(m) => {
-                        let (s, mut f) = m.read_snapshot();
-                        // Augment with GPU fans (more accurate duty than HWiNFO)
-                        f.extend(nvml_fans());   // NVIDIA
-                        f.extend(adl_fans());    // AMD
-                        (s, f, Some(m))
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "HWiNFO64 not available — falling back to WMI (reduced sensor coverage). \
-                             Install HWiNFO64 from https://www.hwinfo.com/download/ for full coverage."
-                        );
-                        let (s, mut f) = wmi_snapshot();
-                        f.extend(nvml_fans());
-                        f.extend(adl_fans());
-                        (s, f, None)
-                    }
-                };
+            let (sensors, fans, new_mapping) = match mapping {
+                Ok(m) => {
+                    let (s, mut f) = m.read_snapshot();
+                    // Augment with GPU fans (more accurate duty than HWiNFO)
+                    f.extend(nvml_fans()); // NVIDIA
+                    f.extend(adl_fans()); // AMD
+                    (s, f, Some(m))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "HWiNFO64 not available — falling back to WMI (reduced sensor coverage). \
+                         Install HWiNFO64 from https://www.hwinfo.com/download/ for full coverage."
+                    );
+                    let (s, mut f) = wmi_snapshot();
+                    f.extend(nvml_fans());
+                    f.extend(adl_fans());
+                    (s, f, None)
+                }
+            };
 
-                (new_mapping, sensors, fans)
-            })
-            .await?;
+            (new_mapping, sensors, fans)
+        })
+        .await?;
 
         // Store the (possibly new) mapping back.
         *self.hwinfo.lock().unwrap() = mapping_result;

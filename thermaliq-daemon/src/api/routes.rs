@@ -22,9 +22,9 @@ use super::ws;
 /// this defeats CSRF from any webpage the user visits.
 pub fn build_router(state: AppState) -> Router {
     let cors = CorsLayer::new()
-        .allow_origin(AllowOrigin::exact(
-            HeaderValue::from_static("tauri://localhost"),
-        ))
+        .allow_origin(AllowOrigin::exact(HeaderValue::from_static(
+            "tauri://localhost",
+        )))
         .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
         .allow_headers(tower_http::cors::Any);
 
@@ -48,8 +48,14 @@ pub fn build_router(state: AppState) -> Router {
         .route("/fans/:id/pwm", post(set_fan_pwm))
         .route("/api/profiles/active", post(set_active_profile))
         .route("/api/agent/mode", post(set_agent_mode))
-        .route("/api/agent/interventions/:id/approve", post(approve_intervention))
-        .route("/api/agent/interventions/:id/reject", post(reject_intervention))
+        .route(
+            "/api/agent/interventions/:id/approve",
+            post(approve_intervention),
+        )
+        .route(
+            "/api/agent/interventions/:id/reject",
+            post(reject_intervention),
+        )
         .route("/api/shutdown", post(shutdown))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -129,7 +135,9 @@ struct LimitQuery {
     limit: usize,
 }
 
-fn default_limit() -> usize { 100 }
+fn default_limit() -> usize {
+    100
+}
 
 async fn history_sensors(
     State(state): State<AppState>,
@@ -192,13 +200,13 @@ async fn set_active_profile(
         .to_string();
 
     let path = thermaliq_common::config::profiles_dir().join(format!("{name}.toml"));
-    let profile = thermaliq_common::config::load_profile(&path)
-        .map_err(|_| StatusCode::NOT_FOUND)?;
+    let profile =
+        thermaliq_common::config::load_profile(&path).map_err(|_| StatusCode::NOT_FOUND)?;
 
     *state.active_profile.write().await = Some(profile);
-    let _ = state.agent_event_tx.send(
-        json!({ "type": "profile_changed", "profile": name }).to_string()
-    );
+    let _ = state
+        .agent_event_tx
+        .send(json!({ "type": "profile_changed", "profile": name }).to_string());
     Ok(Json(json!({ "active_profile": name })))
 }
 
@@ -214,9 +222,9 @@ async fn set_agent_mode(
         _ => return Err(StatusCode::BAD_REQUEST),
     };
     *state.agent_mode.write().await = mode;
-    let _ = state.agent_event_tx.send(
-        json!({ "type": "mode_changed", "mode": mode_str }).to_string()
-    );
+    let _ = state
+        .agent_event_tx
+        .send(json!({ "type": "mode_changed", "mode": mode_str }).to_string());
     Ok(Json(json!({ "agent_mode": mode_str })))
 }
 
@@ -229,22 +237,23 @@ async fn approve_intervention(
             .pending_interventions
             .lock()
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        let pos = pending.iter().position(|i| i.id == id)
+        let pos = pending
+            .iter()
+            .position(|i| i.id == id)
             .ok_or(StatusCode::NOT_FOUND)?;
         pending.remove(pos)
     };
 
     // Apply the intervention
     if let Some(profile_name) = intervention.proposed_action.strip_prefix("switch_profile:") {
-        let path = thermaliq_common::config::profiles_dir()
-            .join(format!("{profile_name}.toml"));
+        let path = thermaliq_common::config::profiles_dir().join(format!("{profile_name}.toml"));
         if let Ok(profile) = thermaliq_common::config::load_profile(&path) {
             *state.active_profile.write().await = Some(profile);
         }
     }
 
     let _ = state.agent_event_tx.send(
-        json!({ "type": "intervention_applied", "id": id, "status": "approved" }).to_string()
+        json!({ "type": "intervention_applied", "id": id, "status": "approved" }).to_string(),
     );
     Ok(Json(json!({ "intervention_id": id, "status": "applied" })))
 }
@@ -257,12 +266,14 @@ async fn reject_intervention(
         .pending_interventions
         .lock()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let pos = pending.iter().position(|i| i.id == id)
+    let pos = pending
+        .iter()
+        .position(|i| i.id == id)
         .ok_or(StatusCode::NOT_FOUND)?;
     pending.remove(pos);
-    let _ = state.agent_event_tx.send(
-        json!({ "type": "intervention_rejected", "id": id }).to_string()
-    );
+    let _ = state
+        .agent_event_tx
+        .send(json!({ "type": "intervention_rejected", "id": id }).to_string());
     Ok(Json(json!({ "intervention_id": id, "status": "rejected" })))
 }
 

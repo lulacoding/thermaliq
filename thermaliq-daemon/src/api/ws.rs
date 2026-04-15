@@ -3,6 +3,7 @@
 //! /ws/sensors — broadcasts HardwareSnapshot JSON at the poller interval (1 Hz).
 //! /ws/agent   — broadcasts agent state-change and intervention events.
 
+use super::auth::AppState;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -10,7 +11,6 @@ use axum::{
     },
     response::Response,
 };
-use super::auth::AppState;
 
 // ── /ws/sensors ───────────────────────────────────────────────────────────────
 

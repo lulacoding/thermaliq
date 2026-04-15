@@ -57,17 +57,14 @@ fn service_main(_args: Vec<OsString>) {
 fn run_service() -> Result<()> {
     let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
 
-    let status_handle = service_control_handler::register(
-        SERVICE_NAME,
-        move |ctrl| match ctrl {
-            ServiceControl::Stop | ServiceControl::Shutdown => {
-                let _ = shutdown_tx.send(());
-                ServiceControlHandlerResult::NoError
-            }
-            ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
-            _ => ServiceControlHandlerResult::NotImplemented,
-        },
-    )?;
+    let status_handle = service_control_handler::register(SERVICE_NAME, move |ctrl| match ctrl {
+        ServiceControl::Stop | ServiceControl::Shutdown => {
+            let _ = shutdown_tx.send(());
+            ServiceControlHandlerResult::NoError
+        }
+        ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+        _ => ServiceControlHandlerResult::NotImplemented,
+    })?;
 
     status_handle.set_service_status(ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
@@ -148,8 +145,7 @@ pub fn install_service() -> Result<()> {
 
 /// Unregister the service. Must be run as Administrator.
 pub fn uninstall_service() -> Result<()> {
-    let manager =
-        ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
     let service = manager.open_service(SERVICE_NAME, ServiceAccess::DELETE)?;
     service.delete()?;
     println!("ThermalIQ service uninstalled.");

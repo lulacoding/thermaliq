@@ -110,10 +110,7 @@ impl Default for SmcKeyData {
 
 #[link(name = "IOKit", kind = "framework")]
 extern "C" {
-    fn IOServiceGetMatchingService(
-        master_port: u32,
-        matching: *const c_void,
-    ) -> IOService;
+    fn IOServiceGetMatchingService(master_port: u32, matching: *const c_void) -> IOService;
     fn IOServiceMatching(name: *const c_char) -> *mut c_void;
     fn IOServiceOpen(
         service: IOService,
@@ -162,11 +159,9 @@ struct SmcConnection {
 impl SmcConnection {
     fn open() -> Result<Self> {
         unsafe {
-            let service_name =
-                CString::new("AppleSMC").expect("CString::new failed for AppleSMC");
+            let service_name = CString::new("AppleSMC").expect("CString::new failed for AppleSMC");
             let matching = IOServiceMatching(service_name.as_ptr());
-            let service =
-                IOServiceGetMatchingService(0, matching as *const c_void);
+            let service = IOServiceGetMatchingService(0, matching as *const c_void);
             if service == IO_OBJECT_NULL {
                 return Err(anyhow!("AppleSMC service not found"));
             }
@@ -349,8 +344,7 @@ impl HardwareLayer for MacosHardwareLayer {
                 let min_rpm = smc.read_fan_rpm(i, "Mn").unwrap_or(0.0);
                 let max_rpm = smc.read_fan_rpm(i, "Mx").unwrap_or(1.0);
                 let duty = if max_rpm > min_rpm {
-                    ((actual_rpm - min_rpm) / (max_rpm - min_rpm) * 100.0)
-                        .clamp(0.0, 100.0) as u8
+                    ((actual_rpm - min_rpm) / (max_rpm - min_rpm) * 100.0).clamp(0.0, 100.0) as u8
                 } else {
                     0
                 };
@@ -379,8 +373,7 @@ impl HardwareLayer for MacosHardwareLayer {
             let smc = SmcConnection::open()?;
             let min_rpm = smc.read_fan_rpm(fan_idx, "Mn").unwrap_or(500.0);
             let max_rpm = smc.read_fan_rpm(fan_idx, "Mx").unwrap_or(3000.0);
-            let target_rpm =
-                min_rpm + (cmd.duty_percent as f32 / 100.0) * (max_rpm - min_rpm);
+            let target_rpm = min_rpm + (cmd.duty_percent as f32 / 100.0) * (max_rpm - min_rpm);
 
             // Writing fan speed requires Ftst=1 via a privileged SMJobBless
             // helper (not yet implemented). Log intent for now.

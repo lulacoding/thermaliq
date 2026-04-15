@@ -16,7 +16,9 @@ use tracing_subscriber::EnvFilter;
 
 use api::auth::{AgentMode, AppState};
 use thermaliq_common::{
-    config::{default_config_path, default_db_path, load_daemon_config, load_profile, profiles_dir},
+    config::{
+        default_config_path, default_db_path, load_daemon_config, load_profile, profiles_dir,
+    },
     history::HistoryDb,
 };
 
@@ -120,8 +122,7 @@ pub async fn run_daemon_inner() -> Result<()> {
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("agent db path not valid UTF-8"))?;
     let agent_db = Arc::new(tokio::sync::Mutex::new(
-        agent_db::AgentDb::new(agent_db_path_str)
-            .map_err(|e| anyhow::anyhow!("agent DB: {e}"))?,
+        agent_db::AgentDb::new(agent_db_path_str).map_err(|e| anyhow::anyhow!("agent DB: {e}"))?,
     ));
 
     // Background tasks

@@ -24,14 +24,18 @@ impl LinuxHardwareLayer {
     }
 
     fn enumerate_hwmon_chips(&self) -> Vec<PathBuf> {
-        let Ok(entries) = fs::read_dir(&self.hwmon_base) else { return Vec::new() };
+        let Ok(entries) = fs::read_dir(&self.hwmon_base) else {
+            return Vec::new();
+        };
         let mut chips: Vec<PathBuf> = entries
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .filter(|p| p.file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.starts_with("hwmon"))
-                .unwrap_or(false))
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("hwmon"))
+                    .unwrap_or(false)
+            })
             .collect();
         chips.sort();
         chips
@@ -41,11 +45,13 @@ impl LinuxHardwareLayer {
         let mut sensors = Vec::new();
 
         for chip_path in self.enumerate_hwmon_chips() {
-            let chip_name = Self::read_file(&chip_path.join("name"))
-                .unwrap_or_else(|| "unknown".to_string());
+            let chip_name =
+                Self::read_file(&chip_path.join("name")).unwrap_or_else(|| "unknown".to_string());
 
             // Find all temp*_input files
-            let Ok(entries) = fs::read_dir(&chip_path) else { continue };
+            let Ok(entries) = fs::read_dir(&chip_path) else {
+                continue;
+            };
             let mut temp_files: Vec<PathBuf> = entries
                 .filter_map(|e| e.ok())
                 .map(|e| e.path())
@@ -59,21 +65,26 @@ impl LinuxHardwareLayer {
             temp_files.sort();
 
             for temp_file in temp_files {
-                let Some(temp_str) = Self::read_file(&temp_file) else { continue };
-                let Ok(raw_millideg): Result<i64, _> = temp_str.parse() else { continue };
+                let Some(temp_str) = Self::read_file(&temp_file) else {
+                    continue;
+                };
+                let Ok(raw_millideg): Result<i64, _> = temp_str.parse() else {
+                    continue;
+                };
                 let temp_celsius = raw_millideg as f32 / 1000.0;
 
                 // Get optional label
                 let label_file = temp_file.to_str().unwrap_or("").replace("_input", "_label");
-                let label = Self::read_file(Path::new(&label_file))
-                    .unwrap_or_else(|| {
-                        let stem = temp_file.file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("temp");
-                        format!("{} {}", chip_name, stem)
-                    });
+                let label = Self::read_file(Path::new(&label_file)).unwrap_or_else(|| {
+                    let stem = temp_file
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("temp");
+                    format!("{} {}", chip_name, stem)
+                });
 
-                let stem = temp_file.file_stem()
+                let stem = temp_file
+                    .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("temp");
                 let id = format!("{}_{}", chip_name, stem);
@@ -95,10 +106,12 @@ impl LinuxHardwareLayer {
         let mut fans = Vec::new();
 
         for chip_path in self.enumerate_hwmon_chips() {
-            let chip_name = Self::read_file(&chip_path.join("name"))
-                .unwrap_or_else(|| "unknown".to_string());
+            let chip_name =
+                Self::read_file(&chip_path.join("name")).unwrap_or_else(|| "unknown".to_string());
 
-            let Ok(entries) = fs::read_dir(&chip_path) else { continue };
+            let Ok(entries) = fs::read_dir(&chip_path) else {
+                continue;
+            };
             let mut fan_files: Vec<PathBuf> = entries
                 .filter_map(|e| e.ok())
                 .map(|e| e.path())
@@ -112,10 +125,15 @@ impl LinuxHardwareLayer {
             fan_files.sort();
 
             for fan_file in fan_files {
-                let Some(rpm_str) = Self::read_file(&fan_file) else { continue };
-                let Ok(rpm): Result<u32, _> = rpm_str.parse() else { continue };
+                let Some(rpm_str) = Self::read_file(&fan_file) else {
+                    continue;
+                };
+                let Ok(rpm): Result<u32, _> = rpm_str.parse() else {
+                    continue;
+                };
 
-                let stem = fan_file.file_stem()
+                let stem = fan_file
+                    .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("fan");
                 let fan_num = stem.trim_start_matches("fan");
@@ -123,7 +141,9 @@ impl LinuxHardwareLayer {
                 // Try to read corresponding pwm* for duty%
                 let pwm_file = chip_path.join(format!("pwm{}", fan_num));
                 let duty_percent = if let Some(pwm_str) = Self::read_file(&pwm_file) {
-                    pwm_str.parse::<u32>().ok()
+                    pwm_str
+                        .parse::<u32>()
+                        .ok()
                         .map(|pwm| (pwm * 100 / 255) as u8)
                         .unwrap_or(0)
                 } else {
@@ -164,17 +184,16 @@ impl HardwareLayer for LinuxHardwareLayer {
             let sensors = hal.read_sensors();
             let fans = hal.read_fans();
             Ok(HardwareSnapshot { sensors, fans })
-        }).await?
+        })
+        .await?
     }
 
     async fn set_fan_duty(&self, cmd: SetFanDuty) -> Result<()> {
         // cmd.fan_id format: "chipname_fanN" e.g. "nct6775_fan1"
-        let chip_path = self.enumerate_hwmon_chips()
-            .into_iter()
-            .find(|p| {
-                let name = Self::read_file(&p.join("name")).unwrap_or_default();
-                cmd.fan_id.starts_with(&name)
-            });
+        let chip_path = self.enumerate_hwmon_chips().into_iter().find(|p| {
+            let name = Self::read_file(&p.join("name")).unwrap_or_default();
+            cmd.fan_id.starts_with(&name)
+        });
 
         let Some(chip) = chip_path else {
             anyhow::bail!("fan {} not found", cmd.fan_id);
@@ -199,7 +218,8 @@ impl HardwareLayer for LinuxHardwareLayer {
                 "Linux: fan PWM set"
             );
             Ok(())
-        }).await?
+        })
+        .await?
     }
 }
 

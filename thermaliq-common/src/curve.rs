@@ -37,7 +37,8 @@ impl FanCurve {
             let hi = &window[1];
             if temp >= lo.temp_celsius && temp <= hi.temp_celsius {
                 let t = (temp - lo.temp_celsius) / (hi.temp_celsius - lo.temp_celsius);
-                let duty = lo.duty_percent as f32 + t * (hi.duty_percent as f32 - lo.duty_percent as f32);
+                let duty =
+                    lo.duty_percent as f32 + t * (hi.duty_percent as f32 - lo.duty_percent as f32);
                 return duty.round().clamp(0.0, 100.0) as u8;
             }
         }
@@ -124,9 +125,18 @@ mod tests {
     fn simple_curve() -> FanCurve {
         FanCurve {
             points: vec![
-                CurvePoint { temp_celsius: 30.0, duty_percent: 20 },
-                CurvePoint { temp_celsius: 60.0, duty_percent: 50 },
-                CurvePoint { temp_celsius: 90.0, duty_percent: 100 },
+                CurvePoint {
+                    temp_celsius: 30.0,
+                    duty_percent: 20,
+                },
+                CurvePoint {
+                    temp_celsius: 60.0,
+                    duty_percent: 50,
+                },
+                CurvePoint {
+                    temp_celsius: 90.0,
+                    duty_percent: 100,
+                },
             ],
         }
     }
@@ -185,7 +195,7 @@ mod tests {
     fn fan_stops_below_stop_percent() {
         let mut ctrl = default_controller();
         ctrl.compute_duty(60.0); // start fan
-        // Curve at 30°C gives 20%, which equals stop_percent(20), so stops
+                                 // Curve at 30°C gives 20%, which equals stop_percent(20), so stops
         let duty = ctrl.compute_duty(30.0);
         assert_eq!(duty, 0, "fan should stop below stop_percent");
     }

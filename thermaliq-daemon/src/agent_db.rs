@@ -106,7 +106,12 @@ impl AgentDb {
         Ok(())
     }
 
-    pub fn insert_sample(&self, sensor_id: &str, temp_celsius: f32, workload: Option<&str>) -> Result<()> {
+    pub fn insert_sample(
+        &self,
+        sensor_id: &str,
+        temp_celsius: f32,
+        workload: Option<&str>,
+    ) -> Result<()> {
         self.conn.execute(
             "INSERT INTO thermal_samples (sensor_id, temp_celsius, workload) VALUES (?1, ?2, ?3)",
             params![sensor_id, temp_celsius, workload],
@@ -126,7 +131,13 @@ impl AgentDb {
         Ok(temps)
     }
 
-    pub fn record_profile_stat(&self, profile_name: &str, avg_cpu_temp: f32, avg_fan_duty: f32, thermal_headroom: f32) -> Result<()> {
+    pub fn record_profile_stat(
+        &self,
+        profile_name: &str,
+        avg_cpu_temp: f32,
+        avg_fan_duty: f32,
+        thermal_headroom: f32,
+    ) -> Result<()> {
         self.conn.execute(
             "INSERT INTO profile_stats (profile_name, avg_cpu_temp, avg_fan_duty, thermal_headroom)
              VALUES (?1, ?2, ?3, ?4)",
@@ -139,17 +150,19 @@ impl AgentDb {
         let cutoff = unix_now() - window_secs;
         let mut stmt = self.conn.prepare(
             "SELECT id, sensor_id, temp_celsius, workload, sampled_at FROM thermal_samples
-             WHERE sensor_id = ?1 AND sampled_at >= ?2 ORDER BY sampled_at ASC"
+             WHERE sensor_id = ?1 AND sampled_at >= ?2 ORDER BY sampled_at ASC",
         )?;
-        let rows = stmt.query_map(params![sensor_id, cutoff], |row| {
-            Ok(ThermalSample {
-                id: row.get(0)?,
-                sensor_id: row.get(1)?,
-                temp_celsius: row.get(2)?,
-                workload: row.get(3)?,
-                sampled_at: row.get(4)?,
-            })
-        })?.collect::<std::result::Result<Vec<_>, _>>()?;
+        let rows = stmt
+            .query_map(params![sensor_id, cutoff], |row| {
+                Ok(ThermalSample {
+                    id: row.get(0)?,
+                    sensor_id: row.get(1)?,
+                    temp_celsius: row.get(2)?,
+                    workload: row.get(3)?,
+                    sampled_at: row.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
@@ -167,7 +180,13 @@ impl AgentDb {
         Ok(())
     }
 
-    pub fn update_intervention_result(&self, id: &str, result: &str, applied_at: i64, after_snapshot: Option<&str>) -> Result<()> {
+    pub fn update_intervention_result(
+        &self,
+        id: &str,
+        result: &str,
+        applied_at: i64,
+        after_snapshot: Option<&str>,
+    ) -> Result<()> {
         self.conn.execute(
             "UPDATE interventions SET result=?1, applied_at=?2, after_snapshot=?3 WHERE id=?4",
             params![result, applied_at, after_snapshot, id],
@@ -197,22 +216,24 @@ impl AgentDb {
         let mut stmt = self.conn.prepare(
             "SELECT id, trigger_reason, proposed_action, proposed_at, approved_at, applied_at,
              result, before_snapshot, after_snapshot, rolled_back_at
-             FROM interventions ORDER BY proposed_at DESC LIMIT ?1"
+             FROM interventions ORDER BY proposed_at DESC LIMIT ?1",
         )?;
-        let rows = stmt.query_map(params![limit as i64], |row| {
-            Ok(InterventionRecord {
-                id: row.get(0)?,
-                trigger_reason: row.get(1)?,
-                proposed_action: row.get(2)?,
-                proposed_at: row.get(3)?,
-                approved_at: row.get(4)?,
-                applied_at: row.get(5)?,
-                result: row.get(6)?,
-                before_snapshot: row.get(7)?,
-                after_snapshot: row.get(8)?,
-                rolled_back_at: row.get(9)?,
-            })
-        })?.collect::<std::result::Result<Vec<_>, _>>()?;
+        let rows = stmt
+            .query_map(params![limit as i64], |row| {
+                Ok(InterventionRecord {
+                    id: row.get(0)?,
+                    trigger_reason: row.get(1)?,
+                    proposed_action: row.get(2)?,
+                    proposed_at: row.get(3)?,
+                    approved_at: row.get(4)?,
+                    applied_at: row.get(5)?,
+                    result: row.get(6)?,
+                    before_snapshot: row.get(7)?,
+                    after_snapshot: row.get(8)?,
+                    rolled_back_at: row.get(9)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 }

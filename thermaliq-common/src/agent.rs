@@ -42,7 +42,9 @@ pub struct AgentStateMachine {
 
 impl AgentStateMachine {
     pub fn new() -> Self {
-        Self { state: AgentState::Sampling }
+        Self {
+            state: AgentState::Sampling,
+        }
     }
 
     /// Apply a transition. Returns Err if the transition is illegal in current state.
@@ -51,7 +53,9 @@ impl AgentStateMachine {
             // From Sampling
             (AgentState::Sampling, AgentTransition::AnalysisComplete) => AgentState::Analyzing,
             (AgentState::Sampling, AgentTransition::FaultDetected { reason }) => {
-                AgentState::Error { reason: reason.clone() }
+                AgentState::Error {
+                    reason: reason.clone(),
+                }
             }
             (AgentState::Sampling, AgentTransition::Suspend) => AgentState::Suspended,
 
@@ -61,12 +65,16 @@ impl AgentStateMachine {
             }
             (AgentState::Analyzing, AgentTransition::StartSampling) => AgentState::Sampling,
             (AgentState::Analyzing, AgentTransition::FaultDetected { reason }) => {
-                AgentState::Degraded { reason: reason.clone() }
+                AgentState::Degraded {
+                    reason: reason.clone(),
+                }
             }
 
             // From Proposing
             (AgentState::Proposing, AgentTransition::ProposeIntervention { id }) => {
-                AgentState::Awaiting { intervention_id: id.clone() }
+                AgentState::Awaiting {
+                    intervention_id: id.clone(),
+                }
             }
             (AgentState::Proposing, AgentTransition::StartSampling) => AgentState::Sampling,
 
@@ -74,20 +82,26 @@ impl AgentStateMachine {
             (AgentState::Awaiting { .. }, AgentTransition::UserApproved) => AgentState::Executing,
             (AgentState::Awaiting { .. }, AgentTransition::UserRejected) => AgentState::Sampling,
             (AgentState::Awaiting { .. }, AgentTransition::FaultDetected { reason }) => {
-                AgentState::Error { reason: reason.clone() }
+                AgentState::Error {
+                    reason: reason.clone(),
+                }
             }
 
             // From Executing
             (AgentState::Executing, AgentTransition::ExecutionComplete) => AgentState::Verifying,
             (AgentState::Executing, AgentTransition::FaultDetected { reason }) => {
-                AgentState::Error { reason: reason.clone() }
+                AgentState::Error {
+                    reason: reason.clone(),
+                }
             }
 
             // From Verifying
             (AgentState::Verifying, AgentTransition::VerificationPassed) => AgentState::Sampling,
             (AgentState::Verifying, AgentTransition::VerificationFailed) => AgentState::RollingBack,
             (AgentState::Verifying, AgentTransition::FaultDetected { reason }) => {
-                AgentState::Error { reason: reason.clone() }
+                AgentState::Error {
+                    reason: reason.clone(),
+                }
             }
 
             // From RollingBack
@@ -95,7 +109,9 @@ impl AgentStateMachine {
                 reason: "rolled back after failed verification".into(),
             },
             (AgentState::RollingBack, AgentTransition::FaultDetected { reason }) => {
-                AgentState::Error { reason: reason.clone() }
+                AgentState::Error {
+                    reason: reason.clone(),
+                }
             }
 
             // From Error — only Reset recovers
@@ -111,11 +127,7 @@ impl AgentStateMachine {
             (AgentState::Suspended, AgentTransition::Resume) => AgentState::Sampling,
 
             // All other combinations are illegal
-            _ => bail!(
-                "illegal transition {:?} in state {:?}",
-                t,
-                self.state
-            ),
+            _ => bail!("illegal transition {:?} in state {:?}", t, self.state),
         };
         self.state = next;
         Ok(())
@@ -193,8 +205,10 @@ mod tests {
     fn full_happy_path() {
         let mut sm = AgentStateMachine::new();
         sm.transition(AgentTransition::AnalysisComplete).unwrap();
-        sm.transition(AgentTransition::ProposeIntervention { id: "p1".into() }).unwrap();
-        sm.transition(AgentTransition::ProposeIntervention { id: "i1".into() }).unwrap();
+        sm.transition(AgentTransition::ProposeIntervention { id: "p1".into() })
+            .unwrap();
+        sm.transition(AgentTransition::ProposeIntervention { id: "i1".into() })
+            .unwrap();
         sm.transition(AgentTransition::UserApproved).unwrap();
         sm.transition(AgentTransition::ExecutionComplete).unwrap();
         sm.transition(AgentTransition::VerificationPassed).unwrap();
@@ -204,7 +218,10 @@ mod tests {
     #[test]
     fn error_state_recovers_via_reset() {
         let mut sm = AgentStateMachine::new();
-        sm.transition(AgentTransition::FaultDetected { reason: "test".into() }).unwrap();
+        sm.transition(AgentTransition::FaultDetected {
+            reason: "test".into(),
+        })
+        .unwrap();
         assert!(matches!(sm.state, AgentState::Error { .. }));
         sm.transition(AgentTransition::Reset).unwrap();
         assert_eq!(sm.state, AgentState::Sampling);
