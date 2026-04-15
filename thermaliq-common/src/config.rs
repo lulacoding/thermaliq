@@ -3,6 +3,35 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+// ── Schedule ──────────────────────────────────────────────────────────────────
+
+/// One entry in the time-based profile schedule.
+///
+/// Example TOML:
+/// ```toml
+/// [[schedule]]
+/// days = ["mon", "tue", "wed", "thu", "fri"]
+/// time = "22:00-08:00"
+/// profile = "silent"
+/// note = "Quiet hours on weeknights"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleEntry {
+    /// Days to activate this entry.
+    /// Accepted values: "mon", "tue", "wed", "thu", "fri", "sat", "sun".
+    /// Empty vec = every day.
+    #[serde(default)]
+    pub days: Vec<String>,
+    /// Time window in 24-hour "HH:MM-HH:MM" format (local time).
+    /// Midnight-spanning ranges are supported, e.g. "22:00-08:00".
+    pub time: String,
+    /// Profile name to activate during this window.
+    pub profile: String,
+    /// Human-readable note (optional).
+    #[serde(default)]
+    pub note: String,
+}
+
 // ── DaemonConfig ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -13,6 +42,9 @@ pub struct DaemonConfig {
     pub db_path: Option<PathBuf>,
     pub log_level: String,
     pub default_profile: String,
+    /// Optional time-based profile schedule evaluated every 60 s.
+    #[serde(default)]
+    pub schedule: Vec<ScheduleEntry>,
 }
 
 impl Default for DaemonConfig {
@@ -23,6 +55,7 @@ impl Default for DaemonConfig {
             db_path: None,
             log_level: "info".to_string(),
             default_profile: "balanced".to_string(),
+            schedule: Vec::new(),
         }
     }
 }
@@ -67,6 +100,9 @@ pub struct Profile {
     pub controls: Vec<FanControl>,
     #[serde(default)]
     pub alerts: Vec<ProfileAlert>,
+    /// Per-application profile overrides. Evaluated in order; first match wins.
+    #[serde(default)]
+    pub app_rules: Vec<AppRule>,
 }
 
 fn default_version() -> u32 {
@@ -245,6 +281,24 @@ fn default_learning_rate() -> f32 {
 pub struct GraphPoint {
     pub temp: f32,
     pub pwm: u8,
+}
+
+// ── Application rules ────────────────────────────────────────────────────────
+
+/// Switch to a named profile when a specific process is running.
+///
+/// Rules are evaluated in definition order; the first match wins.
+/// Priority: app rules > profile default; safety enforcer always wins.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppRule {
+    /// Process name to match (case-insensitive substring match).
+    /// Examples: "blender", "steam", "code"
+    pub process: String,
+    /// Profile to activate while this process is running.
+    pub profile: String,
+    /// Human-readable note (optional).
+    #[serde(default)]
+    pub note: String,
 }
 
 // ── Fan controls ──────────────────────────────────────────────────────────────

@@ -38,6 +38,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/profiles/active", get(get_active_profile))
         .route("/api/agent/status", get(agent_status))
         .route("/api/agent/interventions", get(list_interventions))
+        .route("/api/schedule", get(list_schedule))
         .route("/api/history/sensors/:sensor_id", get(history_sensors))
         .route("/api/history/fans/:fan_id", get(history_fans))
         .route("/api/calibration/:fan_id", get(get_calibration))
@@ -58,6 +59,7 @@ pub fn build_router(state: AppState) -> Router {
             post(reject_intervention),
         )
         .route("/api/calibration/:fan_id/run", post(run_calibration))
+        .route("/api/profiles/generate", post(generate_profile))
         .route("/api/shutdown", post(shutdown))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -129,6 +131,11 @@ async fn list_interventions(State(state): State<AppState>) -> Json<Value> {
         .map(|v| v.clone())
         .unwrap_or_default();
     Json(json!({ "interventions": interventions }))
+}
+
+async fn list_schedule(State(state): State<AppState>) -> Json<Value> {
+    let entries = state.schedule.read().await.clone();
+    Json(json!({ "schedule": entries }))
 }
 
 #[derive(Deserialize)]
@@ -283,6 +290,45 @@ async fn reject_intervention(
 async fn shutdown(State(state): State<AppState>) -> Json<Value> {
     let _ = state.shutdown_tx.send(true);
     Json(json!({ "status": "shutting_down" }))
+}
+
+// ── Profile generation ────────────────────────────────────────────────────────
+
+/// `POST /api/profiles/generate` — generate a profile from a natural language prompt.
+///
+/// Body: `{"prompt": "make it quiet for video calls"}`
+/// Response: `{"name": "...", "toml": "...", "path": "..."}`
+///
+/// Requires `ANTHROPIC_API_KEY` in the daemon's environment.
+/// The generated profile is validated and saved to profiles_dir automatically.
+async fn generate_profile(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, StatusCode> {
+    let prompt = body["prompt"].as_str().ok_or(StatusCode::BAD_REQUEST)?;
+
+    let snapshot = state.hal.snapshot().await.ok();
+    let gen = crate::profile_gen::generate_profile(prompt, snapshot.as_ref())
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, "profile generation failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let path = crate::profile_gen::save_profile(&gen).map_err(|e| {
+        tracing::warn!(error = %e, "profile save failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let _ = state
+        .agent_event_tx
+        .send(json!({ "type": "profile_generated", "name": gen.name }).to_string());
+
+    Ok(Json(json!({
+        "name": gen.name,
+        "toml": gen.toml,
+        "path": path.display().to_string(),
+    })))
 }
 
 // ── Fan calibration ───────────────────────────────────────────────────────────

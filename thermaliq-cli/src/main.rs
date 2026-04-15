@@ -78,8 +78,19 @@ enum Command {
         #[arg(long, default_value = "1000")]
         interval_ms: u64,
     },
+    /// Schedule management
+    Schedule {
+        #[command(subcommand)]
+        action: ScheduleAction,
+    },
     /// Stop the daemon
     Stop,
+}
+
+#[derive(Subcommand)]
+enum ScheduleAction {
+    /// Show the configured time-based profile schedule
+    List,
 }
 
 #[derive(Subcommand)]
@@ -97,6 +108,11 @@ enum ProfileAction {
     Show {
         /// Profile name
         name: String,
+    },
+    /// Generate a new profile from a natural language description (requires ANTHROPIC_API_KEY on daemon)
+    Create {
+        /// Natural language description, e.g. "make it quiet for video calls"
+        prompt: String,
     },
 }
 
@@ -270,6 +286,26 @@ fn main() -> Result<()> {
                 let profile = thermaliq_common::config::load_profile(&path)
                     .with_context(|| format!("load profile {name}"))?;
                 print_json(&serde_json::to_value(&profile)?)?;
+            }
+            ProfileAction::Create { prompt } => {
+                let token = require_token(&cli.token)?;
+                eprintln!("Generating profile… (this may take a few seconds)");
+                // Profile generation can take 5-15s depending on API latency.
+                let long_client = reqwest::blocking::Client::builder()
+                    .timeout(std::time::Duration::from_secs(30))
+                    .build()?;
+                let resp = post_authed(
+                    &long_client,
+                    &format!("{base}/api/profiles/generate"),
+                    &token,
+                    &serde_json::json!({ "prompt": prompt }),
+                )?;
+                let name = resp["name"].as_str().unwrap_or("?");
+                let path = resp["path"].as_str().unwrap_or("?");
+                println!("Profile '{name}' saved to {path}");
+                if let Some(toml) = resp["toml"].as_str() {
+                    println!("\n{toml}");
+                }
             }
         },
 
@@ -475,6 +511,43 @@ fn main() -> Result<()> {
                 thread::sleep(Duration::from_millis(*interval_ms));
             }
         }
+
+        Command::Schedule { action } => match action {
+            ScheduleAction::List => {
+                let data = get(&client, &format!("{base}/api/schedule"))?;
+                let empty = vec![];
+                let entries = data["schedule"].as_array().unwrap_or(&empty);
+                if entries.is_empty() {
+                    println!("No schedule entries configured.");
+                    println!("Add [[schedule]] entries to your daemon config.toml.");
+                } else {
+                    for entry in entries {
+                        let days = entry["days"]
+                            .as_array()
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|v| v.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            })
+                            .unwrap_or_default();
+                        let days_str = if days.is_empty() {
+                            "every day".to_string()
+                        } else {
+                            days
+                        };
+                        let time = entry["time"].as_str().unwrap_or("?");
+                        let profile = entry["profile"].as_str().unwrap_or("?");
+                        let note = entry["note"].as_str().unwrap_or("");
+                        if note.is_empty() {
+                            println!("  [{days_str}] {time} → {profile}");
+                        } else {
+                            println!("  [{days_str}] {time} → {profile}  ({note})");
+                        }
+                    }
+                }
+            }
+        },
 
         Command::Stop => {
             let token = require_token(&cli.token)?;

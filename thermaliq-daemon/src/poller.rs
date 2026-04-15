@@ -13,6 +13,9 @@ pub fn start_poll_loop(state: AppState, interval_ms: u64) -> tokio::task::JoinHa
         // Track whether each fan is currently spinning (for 0-RPM hysteresis).
         let mut fan_running: std::collections::HashMap<String, bool> =
             std::collections::HashMap::new();
+        // Track last-sent duty for smooth ramp (step_up_pct / step_down_pct).
+        let mut fan_current_duty: std::collections::HashMap<String, u8> =
+            std::collections::HashMap::new();
 
         loop {
             ticker.tick().await;
@@ -138,12 +141,32 @@ pub fn start_poll_loop(state: AppState, interval_ms: u64) -> tokio::task::JoinHa
                         // Update running state for next tick.
                         fan_running.insert(control.fan.clone(), effective_duty > 0);
 
+                        // ── Smooth ramp ───────────────────────────────────────
+                        // Clamp duty change per tick to step_up_pct / step_down_pct
+                        // so profile switches ramp gradually rather than jumping.
+                        let current = fan_current_duty
+                            .get(&control.fan)
+                            .copied()
+                            .unwrap_or(effective_duty);
+                        let ramped_duty = if effective_duty > current {
+                            current
+                                .saturating_add(control.step_up_pct)
+                                .min(effective_duty)
+                        } else if effective_duty < current {
+                            current
+                                .saturating_sub(control.step_down_pct)
+                                .max(effective_duty)
+                        } else {
+                            effective_duty
+                        };
+                        fan_current_duty.insert(control.fan.clone(), ramped_duty);
+
                         let dc_mode = control.mode == FanMode::Dc;
                         let _ = state
                             .hal
                             .set_fan_duty(thermaliq_common::SetFanDuty {
                                 fan_id: control.fan.clone(),
-                                duty_percent: effective_duty,
+                                duty_percent: ramped_duty,
                                 dc_mode,
                             })
                             .await;
