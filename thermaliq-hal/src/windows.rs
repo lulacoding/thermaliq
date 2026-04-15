@@ -220,17 +220,69 @@ fn cstr_to_string(bytes: &[u8]) -> String {
 
 // ── WMI fallback ──────────────────────────────────────────────────────────────
 //
-// Phase 1: WMI COM fallback is stubbed out. The windows 0.58 crate relocates
-// VARIANT and related COM types across feature-gated sub-modules that vary by
-// version; a full WMI integration will be added in Phase 2 once verified on a
-// live Windows machine. HWiNFO64 covers the primary use-case.
+// Used when HWiNFO64 is not running. Coverage is limited — ACPI thermal zones
+// only, no ISA/SMBus sensors. Win32_Fan rarely returns useful data on consumer
+// hardware so fans are not queried here.
 
 fn wmi_snapshot() -> (Vec<SensorReading>, Vec<FanReading>) {
-    tracing::warn!(
-        "HWiNFO64 not running and WMI fallback is not yet implemented. \
-         Install HWiNFO64 from https://www.hwinfo.com/download/ for sensor data."
-    );
-    (Vec::new(), Vec::new())
+    use serde::Deserialize;
+    use wmi::{COMLibrary, WMIConnection};
+
+    #[derive(Deserialize)]
+    #[serde(rename = "MSAcpi_ThermalZoneTemperature")]
+    struct ThermalZone {
+        #[serde(rename = "CurrentTemperature")]
+        current_temperature: u32, // deci-Kelvin: divide by 10, subtract 273.15
+        #[serde(rename = "InstanceName")]
+        instance_name: String,
+    }
+
+    let com = match COMLibrary::new() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "WMI COM init failed");
+            return (Vec::new(), Vec::new());
+        }
+    };
+
+    let conn = match WMIConnection::with_namespace_path("ROOT\\WMI", com.into()) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "WMI connection failed — install HWiNFO64 from https://www.hwinfo.com/download/ for full sensor coverage"
+            );
+            return (Vec::new(), Vec::new());
+        }
+    };
+
+    let zones: Vec<ThermalZone> = match conn.query() {
+        Ok(z) => z,
+        Err(e) => {
+            tracing::warn!(error = %e, "WMI MSAcpi_ThermalZoneTemperature query failed");
+            return (Vec::new(), Vec::new());
+        }
+    };
+
+    let sensors: Vec<SensorReading> = zones
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, z)| {
+            let temp = (z.current_temperature as f32 / 10.0) - 273.15;
+            if temp > -40.0 && temp < 150.0 {
+                Some(SensorReading {
+                    id: format!("wmi_thermal_{i}"),
+                    label: z.instance_name,
+                    temp_celsius: temp,
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    tracing::debug!(count = sensors.len(), "WMI thermal zones enumerated");
+    (sensors, Vec::new())
 }
 
 // ── NVML GPU fans ─────────────────────────────────────────────────────────────
