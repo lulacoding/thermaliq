@@ -183,6 +183,7 @@ pub fn start_agent_loop(
                         .set_fan_duty(thermaliq_common::SetFanDuty {
                             fan_id: fan.id.clone(),
                             duty_percent: 100,
+                            dc_mode: false,
                         })
                         .await;
                 }

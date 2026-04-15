@@ -24,7 +24,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, watch, RwLock};
 
-use thermaliq_common::config::Profile;
+use thermaliq_common::config::{Profile, ScheduleEntry};
 use thermaliq_common::history::HistoryDb;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -58,6 +58,8 @@ pub struct AppState {
     pub sensor_tx: Arc<broadcast::Sender<String>>,
     /// Broadcasts JSON agent events to /ws/agent clients.
     pub agent_event_tx: Arc<broadcast::Sender<String>>,
+    /// Time-based profile schedule, updated at runtime.
+    pub schedule: Arc<RwLock<Vec<ScheduleEntry>>>,
 }
 
 impl axum::extract::FromRef<AppState> for Arc<String> {

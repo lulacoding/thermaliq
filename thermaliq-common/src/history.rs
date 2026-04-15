@@ -1,6 +1,7 @@
 use anyhow::Result;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SensorRecord {
@@ -17,6 +18,28 @@ pub struct FanRecord {
     pub rpm: u32,
     pub duty_percent: u8,
     pub recorded_at: i64,
+}
+
+/// One measured point from a fan calibration sweep.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalibrationStep {
+    pub duty_percent: u8,
+    pub rpm: u32,
+}
+
+/// Full result of a fan calibration run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalibrationResult {
+    pub fan_id: String,
+    pub calibrated_at: i64,
+    /// Lowest duty% at which the fan starts spinning (0 → starts immediately).
+    pub start_percent: u8,
+    /// Highest duty% at which the fan stops (0 → never stops in measured range).
+    pub stop_percent: u8,
+    pub min_rpm: u32,
+    pub max_rpm: u32,
+    /// Full RPM-vs-duty sweep (21 points: 0, 5, 10, …, 100 %).
+    pub steps: Vec<CalibrationStep>,
 }
 
 pub struct HistoryDb {
@@ -55,6 +78,17 @@ impl HistoryDb {
                 recorded_at INTEGER NOT NULL DEFAULT (unixepoch())
             );
             CREATE INDEX IF NOT EXISTS idx_fan_readings_fan_id ON fan_readings(fan_id, recorded_at);
+            CREATE TABLE IF NOT EXISTS fan_calibration (
+                id INTEGER PRIMARY KEY,
+                fan_id TEXT NOT NULL,
+                calibrated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                start_percent INTEGER NOT NULL,
+                stop_percent INTEGER NOT NULL,
+                min_rpm INTEGER NOT NULL,
+                max_rpm INTEGER NOT NULL,
+                steps_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_fan_calibration_fan_id ON fan_calibration(fan_id, calibrated_at);
         ")?;
         Ok(())
     }
@@ -108,6 +142,68 @@ impl HistoryDb {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(records)
+    }
+
+    /// Average temperature for `sensor_id` over the last `seconds` of history.
+    /// Returns `None` when no rows exist in that window.
+    pub fn query_sensor_avg_last_seconds(
+        &self,
+        sensor_id: &str,
+        seconds: u64,
+    ) -> Result<Option<f32>> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let cutoff = now - seconds as i64;
+        let mut stmt = self.conn.prepare(
+            "SELECT AVG(temp_celsius) FROM sensor_readings \
+             WHERE sensor_id = ?1 AND recorded_at >= ?2",
+        )?;
+        let avg: Option<f64> = stmt.query_row(params![sensor_id, cutoff], |row| row.get(0))?;
+        Ok(avg.map(|v| v as f32))
+    }
+
+    pub fn store_calibration(&self, result: &CalibrationResult) -> Result<()> {
+        let steps_json = serde_json::to_string(&result.steps)?;
+        self.conn.execute(
+            "INSERT INTO fan_calibration \
+             (fan_id, calibrated_at, start_percent, stop_percent, min_rpm, max_rpm, steps_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                result.fan_id,
+                result.calibrated_at,
+                result.start_percent as i64,
+                result.stop_percent as i64,
+                result.min_rpm as i64,
+                result.max_rpm as i64,
+                steps_json,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Retrieve the most recent calibration result for a fan, if any.
+    pub fn get_calibration(&self, fan_id: &str) -> Result<Option<CalibrationResult>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT fan_id, calibrated_at, start_percent, stop_percent, min_rpm, max_rpm, steps_json \
+             FROM fan_calibration WHERE fan_id = ?1 ORDER BY calibrated_at DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![fan_id])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        let steps_json: String = row.get(6)?;
+        let steps: Vec<CalibrationStep> = serde_json::from_str(&steps_json)?;
+        Ok(Some(CalibrationResult {
+            fan_id: row.get(0)?,
+            calibrated_at: row.get(1)?,
+            start_percent: row.get::<_, i64>(2)? as u8,
+            stop_percent: row.get::<_, i64>(3)? as u8,
+            min_rpm: row.get::<_, i64>(4)? as u32,
+            max_rpm: row.get::<_, i64>(5)? as u32,
+            steps,
+        }))
     }
 
     pub fn prune_older_than(&self, cutoff_unix: i64) -> Result<usize> {

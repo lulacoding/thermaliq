@@ -62,14 +62,35 @@ enum Command {
         #[command(subcommand)]
         action: AlertAction,
     },
+    /// Calibrate a fan: ramp 0→100% in 5% steps, record RPM, store result
+    Calibrate {
+        /// Fan ID (e.g. nct6775_fan1)
+        fan_id: String,
+    },
+    /// Show stored calibration result for a fan
+    CalibrationResult {
+        /// Fan ID
+        fan_id: String,
+    },
     /// Live-stream sensor and fan data to the terminal (Ctrl+C to stop)
     Watch {
         /// Poll interval in milliseconds
         #[arg(long, default_value = "1000")]
         interval_ms: u64,
     },
+    /// Schedule management
+    Schedule {
+        #[command(subcommand)]
+        action: ScheduleAction,
+    },
     /// Stop the daemon
     Stop,
+}
+
+#[derive(Subcommand)]
+enum ScheduleAction {
+    /// Show the configured time-based profile schedule
+    List,
 }
 
 #[derive(Subcommand)]
@@ -87,6 +108,11 @@ enum ProfileAction {
     Show {
         /// Profile name
         name: String,
+    },
+    /// Generate a new profile from a natural language description (requires ANTHROPIC_API_KEY on daemon)
+    Create {
+        /// Natural language description, e.g. "make it quiet for video calls"
+        prompt: String,
     },
 }
 
@@ -261,6 +287,26 @@ fn main() -> Result<()> {
                     .with_context(|| format!("load profile {name}"))?;
                 print_json(&serde_json::to_value(&profile)?)?;
             }
+            ProfileAction::Create { prompt } => {
+                let token = require_token(&cli.token)?;
+                eprintln!("Generating profile… (this may take a few seconds)");
+                // Profile generation can take 5-15s depending on API latency.
+                let long_client = reqwest::blocking::Client::builder()
+                    .timeout(std::time::Duration::from_secs(30))
+                    .build()?;
+                let resp = post_authed(
+                    &long_client,
+                    &format!("{base}/api/profiles/generate"),
+                    &token,
+                    &serde_json::json!({ "prompt": prompt }),
+                )?;
+                let name = resp["name"].as_str().unwrap_or("?");
+                let path = resp["path"].as_str().unwrap_or("?");
+                println!("Profile '{name}' saved to {path}");
+                if let Some(toml) = resp["toml"].as_str() {
+                    println!("\n{toml}");
+                }
+            }
         },
 
         Command::Fan { id, pwm } => {
@@ -370,6 +416,51 @@ fn main() -> Result<()> {
             }
         },
 
+        Command::Calibrate { fan_id } => {
+            let token = require_token(&cli.token)?;
+            eprintln!("Calibrating fan '{fan_id}' — ramping 0→100% in 5% steps (≈42 s)…");
+            // Calibration blocks for ~42 s; use a 120 s timeout.
+            let long_client = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(120))
+                .build()?;
+            let resp = post_authed(
+                &long_client,
+                &format!("{base}/api/calibration/{fan_id}/run"),
+                &token,
+                &serde_json::json!({}),
+            )?;
+            let start = resp["start_percent"].as_u64().unwrap_or(0);
+            let stop = resp["stop_percent"].as_u64().unwrap_or(0);
+            let min_rpm = resp["min_rpm"].as_u64().unwrap_or(0);
+            let max_rpm = resp["max_rpm"].as_u64().unwrap_or(0);
+            println!("Calibration complete:");
+            println!("  start_percent : {start}%");
+            println!("  stop_percent  : {stop}%");
+            println!("  min_rpm       : {min_rpm}");
+            println!("  max_rpm       : {max_rpm}");
+            println!("\nFull RPM table:");
+            if let Some(steps) = resp["steps"].as_array() {
+                for s in steps {
+                    let duty = s["duty_percent"].as_u64().unwrap_or(0);
+                    let rpm = s["rpm"].as_u64().unwrap_or(0);
+                    println!("  {:3}%  {:5} RPM", duty, rpm);
+                }
+            }
+        }
+
+        Command::CalibrationResult { fan_id } => {
+            let data = get(&client, &format!("{base}/api/calibration/{fan_id}"))?;
+            let start = data["start_percent"].as_u64().unwrap_or(0);
+            let stop = data["stop_percent"].as_u64().unwrap_or(0);
+            let min_rpm = data["min_rpm"].as_u64().unwrap_or(0);
+            let max_rpm = data["max_rpm"].as_u64().unwrap_or(0);
+            println!("Fan '{fan_id}' calibration:");
+            println!("  start_percent : {start}%");
+            println!("  stop_percent  : {stop}%");
+            println!("  min_rpm       : {min_rpm}");
+            println!("  max_rpm       : {max_rpm}");
+        }
+
         Command::Watch { interval_ms } => {
             use std::thread;
             use std::time::Duration;
@@ -420,6 +511,43 @@ fn main() -> Result<()> {
                 thread::sleep(Duration::from_millis(*interval_ms));
             }
         }
+
+        Command::Schedule { action } => match action {
+            ScheduleAction::List => {
+                let data = get(&client, &format!("{base}/api/schedule"))?;
+                let empty = vec![];
+                let entries = data["schedule"].as_array().unwrap_or(&empty);
+                if entries.is_empty() {
+                    println!("No schedule entries configured.");
+                    println!("Add [[schedule]] entries to your daemon config.toml.");
+                } else {
+                    for entry in entries {
+                        let days = entry["days"]
+                            .as_array()
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|v| v.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            })
+                            .unwrap_or_default();
+                        let days_str = if days.is_empty() {
+                            "every day".to_string()
+                        } else {
+                            days
+                        };
+                        let time = entry["time"].as_str().unwrap_or("?");
+                        let profile = entry["profile"].as_str().unwrap_or("?");
+                        let note = entry["note"].as_str().unwrap_or("");
+                        if note.is_empty() {
+                            println!("  [{days_str}] {time} → {profile}");
+                        } else {
+                            println!("  [{days_str}] {time} → {profile}  ({note})");
+                        }
+                    }
+                }
+            }
+        },
 
         Command::Stop => {
             let token = require_token(&cli.token)?;

@@ -3,6 +3,35 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+// ── Schedule ──────────────────────────────────────────────────────────────────
+
+/// One entry in the time-based profile schedule.
+///
+/// Example TOML:
+/// ```toml
+/// [[schedule]]
+/// days = ["mon", "tue", "wed", "thu", "fri"]
+/// time = "22:00-08:00"
+/// profile = "silent"
+/// note = "Quiet hours on weeknights"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleEntry {
+    /// Days to activate this entry.
+    /// Accepted values: "mon", "tue", "wed", "thu", "fri", "sat", "sun".
+    /// Empty vec = every day.
+    #[serde(default)]
+    pub days: Vec<String>,
+    /// Time window in 24-hour "HH:MM-HH:MM" format (local time).
+    /// Midnight-spanning ranges are supported, e.g. "22:00-08:00".
+    pub time: String,
+    /// Profile name to activate during this window.
+    pub profile: String,
+    /// Human-readable note (optional).
+    #[serde(default)]
+    pub note: String,
+}
+
 // ── DaemonConfig ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -13,6 +42,9 @@ pub struct DaemonConfig {
     pub db_path: Option<PathBuf>,
     pub log_level: String,
     pub default_profile: String,
+    /// Optional time-based profile schedule evaluated every 60 s.
+    #[serde(default)]
+    pub schedule: Vec<ScheduleEntry>,
 }
 
 impl Default for DaemonConfig {
@@ -23,6 +55,7 @@ impl Default for DaemonConfig {
             db_path: None,
             log_level: "info".to_string(),
             default_profile: "balanced".to_string(),
+            schedule: Vec::new(),
         }
     }
 }
@@ -67,6 +100,9 @@ pub struct Profile {
     pub controls: Vec<FanControl>,
     #[serde(default)]
     pub alerts: Vec<ProfileAlert>,
+    /// Per-application profile overrides. Evaluated in order; first match wins.
+    #[serde(default)]
+    pub app_rules: Vec<AppRule>,
 }
 
 fn default_version() -> u32 {
@@ -247,6 +283,24 @@ pub struct GraphPoint {
     pub pwm: u8,
 }
 
+// ── Application rules ────────────────────────────────────────────────────────
+
+/// Switch to a named profile when a specific process is running.
+///
+/// Rules are evaluated in definition order; the first match wins.
+/// Priority: app rules > profile default; safety enforcer always wins.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppRule {
+    /// Process name to match (case-insensitive substring match).
+    /// Examples: "blender", "steam", "code"
+    pub process: String,
+    /// Profile to activate while this process is running.
+    pub profile: String,
+    /// Human-readable note (optional).
+    #[serde(default)]
+    pub note: String,
+}
+
 // ── Fan controls ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -255,6 +309,8 @@ pub enum FanMode {
     #[default]
     Pwm,
     Rpm,
+    /// DC (voltage) control — `pwm1_enable=2` on Linux.
+    Dc,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -271,6 +327,14 @@ pub struct FanControl {
     pub offset_pct: i8,
     #[serde(default)]
     pub min_pwm: u8,
+    /// Duty% below which the fan stops (0-RPM hysteresis lower bound).
+    /// Set from calibration or user config. None = no hysteresis.
+    #[serde(default)]
+    pub stop_percent: Option<u8>,
+    /// Duty% above which the fan starts after being stopped.
+    /// Should be ≥ stop_percent. None = no hysteresis.
+    #[serde(default)]
+    pub start_percent: Option<u8>,
 }
 
 fn default_step_up() -> u8 {

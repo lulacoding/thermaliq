@@ -4,11 +4,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{interval, Duration};
 
 use crate::api::auth::AppState;
-use thermaliq_common::config::{MixFunction, Profile, ProfileCurve};
+use thermaliq_common::config::{CustomSensor, FanMode, MixFunction, Profile, ProfileCurve};
+use thermaliq_common::SensorReading;
 
 pub fn start_poll_loop(state: AppState, interval_ms: u64) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = interval(Duration::from_millis(interval_ms));
+        // Track whether each fan is currently spinning (for 0-RPM hysteresis).
+        let mut fan_running: std::collections::HashMap<String, bool> =
+            std::collections::HashMap::new();
+        // Track last-sent duty for smooth ramp (step_up_pct / step_down_pct).
+        let mut fan_current_duty: std::collections::HashMap<String, u8> =
+            std::collections::HashMap::new();
 
         loop {
             ticker.tick().await;
@@ -77,6 +84,14 @@ pub fn start_poll_loop(state: AppState, interval_ms: u64) -> tokio::task::JoinHa
             {
                 let profile_guard = state.active_profile.read().await;
                 if let Some(profile) = profile_guard.as_ref() {
+                    // Evaluate custom (virtual) sensors and merge with hardware readings.
+                    let virtual_sensors = {
+                        let db = state.history.lock().ok();
+                        evaluate_custom_sensors(&profile.sensors, &snap.sensors, db.as_deref())
+                    };
+                    let all_sensors: Vec<&SensorReading> =
+                        snap.sensors.iter().chain(virtual_sensors.iter()).collect();
+
                     for control in &profile.controls {
                         let Some(curve) =
                             profile.curves.iter().find(|c| curve_id(c) == control.curve)
@@ -87,20 +102,72 @@ pub fn start_poll_loop(state: AppState, interval_ms: u64) -> tokio::task::JoinHa
                         // source-dependent curves look up the sensor reading.
                         let temp = match curve_source(curve) {
                             Some(src) => {
-                                let Some(sensor) = snap.sensors.iter().find(|s| s.id == src) else {
+                                let Some(sensor) = all_sensors.iter().find(|s| s.id == src) else {
                                     continue;
                                 };
                                 sensor.temp_celsius
                             }
                             None => 0.0,
                         };
-                        let duty = compute_duty_for_curve(curve, temp, profile);
-                        let duty = duty.max(control.min_pwm);
+                        let raw_duty = compute_duty_for_curve(curve, temp, profile);
+                        let raw_duty = raw_duty.max(control.min_pwm);
+
+                        // ── 0-RPM hysteresis ─────────────────────────────────
+                        // If start_percent and stop_percent are configured, apply
+                        // deadband logic to prevent fan chatter at low duty values.
+                        let effective_duty = match (control.stop_percent, control.start_percent) {
+                            (Some(stop), Some(start)) => {
+                                let currently_running =
+                                    fan_running.get(&control.fan).copied().unwrap_or(false);
+                                if currently_running {
+                                    // Fan is spinning — keep it on unless below stop_percent.
+                                    if raw_duty <= stop {
+                                        0
+                                    } else {
+                                        raw_duty
+                                    }
+                                } else {
+                                    // Fan is stopped — only start if above start_percent.
+                                    if raw_duty > start {
+                                        raw_duty
+                                    } else {
+                                        0
+                                    }
+                                }
+                            }
+                            _ => raw_duty,
+                        };
+
+                        // Update running state for next tick.
+                        fan_running.insert(control.fan.clone(), effective_duty > 0);
+
+                        // ── Smooth ramp ───────────────────────────────────────
+                        // Clamp duty change per tick to step_up_pct / step_down_pct
+                        // so profile switches ramp gradually rather than jumping.
+                        let current = fan_current_duty
+                            .get(&control.fan)
+                            .copied()
+                            .unwrap_or(effective_duty);
+                        let ramped_duty = if effective_duty > current {
+                            current
+                                .saturating_add(control.step_up_pct)
+                                .min(effective_duty)
+                        } else if effective_duty < current {
+                            current
+                                .saturating_sub(control.step_down_pct)
+                                .max(effective_duty)
+                        } else {
+                            effective_duty
+                        };
+                        fan_current_duty.insert(control.fan.clone(), ramped_duty);
+
+                        let dc_mode = control.mode == FanMode::Dc;
                         let _ = state
                             .hal
                             .set_fan_duty(thermaliq_common::SetFanDuty {
                                 fan_id: control.fan.clone(),
-                                duty_percent: duty,
+                                duty_percent: ramped_duty,
+                                dc_mode,
                             })
                             .await;
                     }
@@ -108,6 +175,128 @@ pub fn start_poll_loop(state: AppState, interval_ms: u64) -> tokio::task::JoinHa
             }
         }
     })
+}
+
+// ── Custom sensor evaluation ──────────────────────────────────────────────────
+
+/// Whitelisted path prefixes for `CustomSensor::File` reads.
+/// Prevents reading arbitrary system files.
+const FILE_SENSOR_ALLOWED_PREFIXES: &[&str] = &[
+    "/sys/class/hwmon/",
+    "/sys/class/thermal/",
+    "/sys/bus/platform/",
+    "/proc/acpi/",
+];
+
+/// Evaluate all custom sensors in the profile, returning synthesized `SensorReading`s.
+///
+/// Virtual sensor IDs can be used as `source` in any curve just like hardware IDs.
+fn evaluate_custom_sensors(
+    sensors: &[CustomSensor],
+    hw: &[SensorReading],
+    db: Option<&thermaliq_common::history::HistoryDb>,
+) -> Vec<SensorReading> {
+    let mut out = Vec::with_capacity(sensors.len());
+    // Build a combined lookup (hw + already-computed virtual) so sensors can
+    // reference each other in definition order.
+    let mut all: Vec<SensorReading> = hw.to_vec();
+
+    for cs in sensors {
+        let reading = match cs {
+            CustomSensor::TimeAverage { id, source, time_s } => {
+                // Query rolling average from history DB.
+                let avg = db
+                    .and_then(|d| d.query_sensor_avg_last_seconds(source, *time_s).ok())
+                    .flatten()
+                    // Fall back to current live reading if history is sparse.
+                    .or_else(|| all.iter().find(|s| &s.id == source).map(|s| s.temp_celsius));
+
+                avg.map(|temp| SensorReading {
+                    id: id.clone(),
+                    label: format!("{source} ({time_s}s avg)"),
+                    temp_celsius: temp,
+                })
+            }
+
+            CustomSensor::Mix {
+                id,
+                function,
+                sources,
+            } => {
+                let temps: Vec<f32> = sources
+                    .iter()
+                    .filter_map(|src| all.iter().find(|s| &s.id == src))
+                    .map(|s| s.temp_celsius)
+                    .collect();
+
+                if temps.is_empty() {
+                    None
+                } else {
+                    let temp = match function {
+                        MixFunction::Max => temps.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
+                        MixFunction::Min => temps.iter().cloned().fold(f32::INFINITY, f32::min),
+                        MixFunction::Average => temps.iter().sum::<f32>() / temps.len() as f32,
+                        MixFunction::Sum => temps.iter().sum(),
+                    };
+                    Some(SensorReading {
+                        id: id.clone(),
+                        label: format!("Mix({:?}) of {}", function, sources.join(", ")),
+                        temp_celsius: temp,
+                    })
+                }
+            }
+
+            CustomSensor::File { id, path } => {
+                // Security: only allow reads from whitelisted path prefixes.
+                let path_str = path.to_string_lossy();
+                let allowed = FILE_SENSOR_ALLOWED_PREFIXES
+                    .iter()
+                    .any(|prefix| path_str.starts_with(prefix));
+
+                if !allowed {
+                    tracing::warn!(
+                        sensor = %id,
+                        path = %path_str,
+                        "CustomSensor::File path not in allowlist — skipped"
+                    );
+                    None
+                } else {
+                    std::fs::read_to_string(path).ok().and_then(|s| {
+                        let s = s.trim();
+                        // Accept plain float ("45.5") or hwmon millidegrees ("45500").
+                        let temp =
+                            s.parse::<f32>()
+                                .ok()
+                                .map(|v| if v > 1000.0 { v / 1000.0 } else { v })?;
+                        if temp > -40.0 && temp < 200.0 {
+                            Some(SensorReading {
+                                id: id.clone(),
+                                label: format!("File({})", path.display()),
+                                temp_celsius: temp,
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                }
+            }
+
+            CustomSensor::Offset { id, source, offset } => {
+                all.iter().find(|s| &s.id == source).map(|s| SensorReading {
+                    id: id.clone(),
+                    label: format!("{source} + {offset:+.1}°C"),
+                    temp_celsius: s.temp_celsius + offset,
+                })
+            }
+        };
+
+        if let Some(r) = reading {
+            all.push(r.clone());
+            out.push(r);
+        }
+    }
+
+    out
 }
 
 fn curve_id(c: &ProfileCurve) -> &str {

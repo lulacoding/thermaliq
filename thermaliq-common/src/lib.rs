@@ -32,9 +32,13 @@ pub struct HardwareSnapshot {
 }
 
 /// Command to set a fan's duty cycle.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SetFanDuty {
     pub fan_id: String,
     /// Target duty cycle 0–100.
     pub duty_percent: u8,
+    /// Use DC (voltage) control instead of PWM on supported hardware.
+    /// Linux: writes `pwm1_enable=2` instead of `1`. Ignored on other platforms.
+    #[serde(default)]
+    pub dc_mode: bool,
 }
