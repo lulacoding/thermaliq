@@ -1,4 +1,20 @@
 //! Linux Hardware Abstraction Layer — reads sensors via hwmon sysfs.
+//!
+//! ## AMD GPU Fan Control
+//!
+//! Two code paths exist depending on GPU generation:
+//!
+//! - **RDNA2 and older** (`pwm1_enable=1` + `pwm1`): traditional hwmon sysfs,
+//!   works on any kernel.
+//!
+//! - **RDNA3 / Navi3x** (`gpu_od/fan_ctrl/fan_curve`, kernel 6.7+): OverDrive8
+//!   fan curve interface. Requires `amdgpu.ppfeaturemask=0xffffffff` (bit 22 =
+//!   `PP_OVERDRIVE_MASK`). If the ppfeaturemask bit is missing, ThermalIQ logs a
+//!   clear warning and falls back to the traditional pwm path.
+//!
+//! Fan curve write format (kernel 6.7+):
+//!   `"<temp_celsius> <fan_speed_percent>\n"` — one pair per line, 2–5 points.
+//!   Zero-RPM mode toggled via `fan_zero_rpm` (kernel 6.13+).
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -7,6 +23,15 @@ use std::path::{Path, PathBuf};
 use thermaliq_common::{FanReading, HardwareSnapshot, SensorReading, SetFanDuty};
 
 use super::HardwareLayer;
+
+// ── RDNA3 OverDrive constants ──────────────────────────────────────────────
+
+/// amdgpu kernel parameter path for OverDrive feature mask.
+const AMDGPU_PPFEATUREMASK: &str = "/sys/module/amdgpu/parameters/ppfeaturemask";
+/// Bit 22 — PP_OVERDRIVE_MASK — required for OD fan curve writes.
+const PP_OVERDRIVE_BIT: u64 = 1 << 22;
+/// sysfs root for DRM cards.
+const DRM_CLASS: &str = "/sys/class/drm";
 
 pub struct LinuxHardwareLayer {
     hwmon_base: PathBuf,
@@ -168,6 +193,81 @@ impl LinuxHardwareLayer {
     }
 }
 
+// ── RDNA3 helpers ─────────────────────────────────────────────────────────
+
+/// Map an hwmon chip path to its DRM card path by comparing PCI device symlinks.
+///
+/// e.g. `/sys/class/hwmon/hwmon5` → `/sys/class/drm/card0`
+fn find_drm_card_for_hwmon(hwmon_chip: &Path) -> Option<PathBuf> {
+    let hwmon_dev = fs::canonicalize(hwmon_chip.join("device")).ok()?;
+    let entries = fs::read_dir(DRM_CLASS).ok()?;
+    for entry in entries.filter_map(|e| e.ok()) {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // Skip render nodes and port connectors (cardN-HDMI-A-N etc.)
+        if !name.starts_with("card") || name.contains('-') {
+            continue;
+        }
+        let card_path = entry.path();
+        if let Ok(card_dev) = fs::canonicalize(card_path.join("device")) {
+            if card_dev == hwmon_dev {
+                return Some(card_path);
+            }
+        }
+    }
+    None
+}
+
+/// Return the RDNA3 fan_curve sysfs path for a DRM card, if it exists.
+///
+/// Present on kernel 6.7+ with RDNA3 (Navi3x) hardware.
+fn rdna3_fan_curve_path(card_path: &Path) -> Option<PathBuf> {
+    let p = card_path.join("device/gpu_od/fan_ctrl/fan_curve");
+    if p.exists() { Some(p) } else { None }
+}
+
+/// Check whether amdgpu has OverDrive enabled (ppfeaturemask bit 22).
+fn amdgpu_overdrive_enabled() -> bool {
+    let s = fs::read_to_string(AMDGPU_PPFEATUREMASK)
+        .unwrap_or_default();
+    let s = s.trim();
+    let mask: u64 = if s.starts_with("0x") || s.starts_with("0X") {
+        u64::from_str_radix(&s[2..], 16).unwrap_or(0)
+    } else {
+        s.parse().unwrap_or(0)
+    };
+    (mask & PP_OVERDRIVE_BIT) != 0
+}
+
+/// Write a flat fan duty curve via the RDNA3 OverDrive sysfs interface.
+///
+/// Curve format (kernel 6.7+): one `"<temp_celsius> <fan_pct>\n"` per line.
+/// Five evenly-spaced temperature anchors are used so the GPU firmware
+/// interpolates a smooth ramp rather than a step function.
+fn write_rdna3_fan_curve(fan_curve: &Path, duty_percent: u8) -> anyhow::Result<()> {
+    let d = duty_percent.clamp(0, 100);
+    // Five anchor points spanning 0–100 °C, all at the requested duty.
+    let curve = format!(
+        "0 {d}\n25 {d}\n50 {d}\n75 {d}\n100 {d}\n",
+        d = d
+    );
+    fs::write(fan_curve, &curve)?;
+    tracing::info!(
+        path = %fan_curve.display(),
+        duty = duty_percent,
+        "Linux RDNA3: fan curve written via OverDrive sysfs"
+    );
+    Ok(())
+}
+
+/// Toggle zero-RPM mode for RDNA3 (kernel 6.13+). Silently ignored on older kernels.
+fn set_rdna3_zero_rpm(card_path: &Path, enable: bool) {
+    let p = card_path.join("device/gpu_od/fan_ctrl/fan_zero_rpm");
+    if p.exists() {
+        let _ = fs::write(&p, if enable { "1\n" } else { "0\n" });
+    }
+}
+
 impl Default for LinuxHardwareLayer {
     fn default() -> Self {
         Self::new()
@@ -189,32 +289,60 @@ impl HardwareLayer for LinuxHardwareLayer {
     }
 
     async fn set_fan_duty(&self, cmd: SetFanDuty) -> Result<()> {
-        // cmd.fan_id format: "chipname_fanN" e.g. "nct6775_fan1"
+        // cmd.fan_id format: "chipname_fanN" e.g. "nct6775_fan1" or "amdgpu_fan1"
         let chip_path = self.enumerate_hwmon_chips().into_iter().find(|p| {
             let name = Self::read_file(&p.join("name")).unwrap_or_default();
             cmd.fan_id.starts_with(&name)
         });
 
         let Some(chip) = chip_path else {
-            anyhow::bail!("fan {} not found", cmd.fan_id);
+            anyhow::bail!("fan '{}' not found in hwmon", cmd.fan_id);
         };
 
-        // Extract fan number from id: "chipname_fanN" → "N"
+        let chip_name = Self::read_file(&chip.join("name")).unwrap_or_default();
+        let duty = cmd.duty_percent;
+
+        // ── RDNA3 path (kernel 6.7+, amdgpu OverDrive) ──────────────────────
+        if chip_name == "amdgpu" {
+            if let Some(card) = find_drm_card_for_hwmon(&chip) {
+                if let Some(fan_curve) = rdna3_fan_curve_path(&card) {
+                    if !amdgpu_overdrive_enabled() {
+                        tracing::warn!(
+                            fan = %cmd.fan_id,
+                            "RDNA3 OverDrive fan curve requires amdgpu.ppfeaturemask=0xffffffff. \
+                             Add 'options amdgpu ppfeaturemask=0xffffffff' to \
+                             /etc/modprobe.d/amdgpu.conf and reboot. \
+                             Falling back to traditional PWM."
+                        );
+                        // Fall through to traditional PWM below.
+                    } else {
+                        let card_clone = card.clone();
+                        return tokio::task::spawn_blocking(move || {
+                            write_rdna3_fan_curve(&fan_curve, duty)?;
+                            // Disable zero-RPM when duty > 0 so fan spins immediately.
+                            set_rdna3_zero_rpm(&card_clone, duty == 0);
+                            Ok(())
+                        })
+                        .await?;
+                    }
+                }
+            }
+        }
+
+        // ── Traditional hwmon PWM (RDNA2, Navi1x, motherboard fans) ─────────
         let fan_part = cmd.fan_id.rsplit("fan").next().unwrap_or("1");
         let pwm_path = chip.join(format!("pwm{}", fan_part));
         let pwm_enable_path = chip.join(format!("pwm{}_enable", fan_part));
-
-        let pwm_value = (cmd.duty_percent as u32 * 255 / 100).clamp(0, 255);
+        let pwm_value = (duty as u32 * 255 / 100).clamp(0, 255);
 
         tokio::task::spawn_blocking(move || {
-            // Enable manual control
+            // Enable manual PWM control (pwm1_enable=1).
             fs::write(&pwm_enable_path, "1\n").ok();
-            // Write PWM value
             fs::write(&pwm_path, format!("{}\n", pwm_value))?;
             tracing::info!(
                 fan = %cmd.fan_id,
                 pwm = pwm_value,
-                duty = cmd.duty_percent,
+                duty = duty,
                 "Linux: fan PWM set"
             );
             Ok(())
