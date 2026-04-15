@@ -26,6 +26,7 @@
 //!
 //! - Intel Mac SMC fan keys use **fp2_14 fixed-point** encoding.
 //! - Apple Silicon SMC fan keys use **IEEE 754 float (little-endian)**.
+//!
 //! Both must be handled; detect via IOKit registry property `board-id`.
 //!
 //! ## M3/M4 Firmware Floor

@@ -76,6 +76,7 @@ struct HwinfoHeader {
 }
 
 #[repr(C)]
+#[allow(dead_code)]
 struct HwinfoSensor {
     sensor_id: u32,
     sensor_inst: u32,
@@ -136,7 +137,7 @@ impl HwinfoMapping {
         let header = unsafe { &*(view_ptr as *const HwinfoHeader) };
         if header.signature != HWINFO_SIGNATURE {
             unsafe {
-                UnmapViewOfFile(view_mapped);
+                let _ = UnmapViewOfFile(view_mapped);
                 let _ = CloseHandle(handle);
             }
             return Err(anyhow!(
@@ -203,7 +204,7 @@ impl Drop for HwinfoMapping {
         unsafe {
             // UnmapViewOfFile takes a handle newtype wrapping *mut c_void.
             // Transmute from our raw pointer — the layout is identical.
-            UnmapViewOfFile(std::mem::transmute(self.view as *mut std::ffi::c_void));
+            let _ = UnmapViewOfFile(std::mem::transmute(self.view as *mut std::ffi::c_void));
             let _ = CloseHandle(self.handle);
         }
     }

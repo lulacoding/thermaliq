@@ -36,22 +36,22 @@ pub fn platform_hal() -> Box<dyn HardwareLayer> {
     #[cfg(feature = "mock-hardware")]
     {
         tracing::info!("mock-hardware feature enabled — using MockHardwareLayer");
-        return Box::new(mock::MockHardwareLayer::new());
+        Box::new(mock::MockHardwareLayer::new())
     }
 
     #[cfg(all(target_os = "linux", not(feature = "mock-hardware")))]
     {
-        return Box::new(linux::LinuxHardwareLayer::new());
+        Box::new(linux::LinuxHardwareLayer::new())
     }
 
     #[cfg(all(target_os = "macos", not(feature = "mock-hardware")))]
     {
-        return Box::new(macos::MacosHardwareLayer::new());
+        Box::new(macos::MacosHardwareLayer::new())
     }
 
     #[cfg(all(target_os = "windows", not(feature = "mock-hardware")))]
     {
-        return Box::new(windows::WindowsHardwareLayer::new());
+        Box::new(windows::WindowsHardwareLayer::new())
     }
 
     #[cfg(not(any(
