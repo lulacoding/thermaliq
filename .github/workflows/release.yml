@@ -136,6 +136,14 @@ jobs:
         if: matrix.os == 'windows-latest'
         run: cargo build --release --target ${{ matrix.target }}
 
+      - name: Stage daemon binary for Tauri bundle (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path thermaliq-ui\src-tauri\resources | Out-Null
+          Copy-Item "target\${{ matrix.target }}\release\thermaliq-daemon.exe" `
+                    "thermaliq-ui\src-tauri\resources\thermaliq-daemon.exe"
+
       - name: Build Tauri app (Windows)
         if: matrix.os == 'windows-latest'
         uses: tauri-apps/tauri-action@v0

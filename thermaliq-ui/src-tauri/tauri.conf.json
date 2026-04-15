@@ -41,6 +41,9 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "resources": [
+      "resources/thermaliq-daemon.exe"
+    ],
     "windows": {
       "nsis": {
         "installMode": "perMachine",
@@ -48,7 +51,8 @@
         "compression": "lzma",
         "startMenuFolder": "ThermalIQ",
         "createDesktopShortcut": true,
-        "createStartMenuShortcut": true
+        "createStartMenuShortcut": true,
+        "include": "nsis/installer-hooks.nsi"
       },
       "wix": {
         "language": "en-US"

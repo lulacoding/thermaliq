@@ -6,3 +6,4 @@ Cargo.lock
 .omc/state/
 .omc/sessions/
 .omc/project-memory.json
+thermaliq-ui/src-tauri/resources/thermaliq-daemon.exe
