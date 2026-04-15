@@ -62,6 +62,16 @@ enum Command {
         #[command(subcommand)]
         action: AlertAction,
     },
+    /// Calibrate a fan: ramp 0→100% in 5% steps, record RPM, store result
+    Calibrate {
+        /// Fan ID (e.g. nct6775_fan1)
+        fan_id: String,
+    },
+    /// Show stored calibration result for a fan
+    CalibrationResult {
+        /// Fan ID
+        fan_id: String,
+    },
     /// Live-stream sensor and fan data to the terminal (Ctrl+C to stop)
     Watch {
         /// Poll interval in milliseconds
@@ -369,6 +379,53 @@ fn main() -> Result<()> {
                 }
             }
         },
+
+        Command::Calibrate { fan_id } => {
+            let token = require_token(&cli.token)?;
+            eprintln!(
+                "Calibrating fan '{fan_id}' — ramping 0→100% in 5% steps (≈42 s)…"
+            );
+            // Calibration blocks for ~42 s; use a 120 s timeout.
+            let long_client = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(120))
+                .build()?;
+            let resp = post_authed(
+                &long_client,
+                &format!("{base}/api/calibration/{fan_id}/run"),
+                &token,
+                &serde_json::json!({}),
+            )?;
+            let start = resp["start_percent"].as_u64().unwrap_or(0);
+            let stop = resp["stop_percent"].as_u64().unwrap_or(0);
+            let min_rpm = resp["min_rpm"].as_u64().unwrap_or(0);
+            let max_rpm = resp["max_rpm"].as_u64().unwrap_or(0);
+            println!("Calibration complete:");
+            println!("  start_percent : {start}%");
+            println!("  stop_percent  : {stop}%");
+            println!("  min_rpm       : {min_rpm}");
+            println!("  max_rpm       : {max_rpm}");
+            println!("\nFull RPM table:");
+            if let Some(steps) = resp["steps"].as_array() {
+                for s in steps {
+                    let duty = s["duty_percent"].as_u64().unwrap_or(0);
+                    let rpm = s["rpm"].as_u64().unwrap_or(0);
+                    println!("  {:3}%  {:5} RPM", duty, rpm);
+                }
+            }
+        }
+
+        Command::CalibrationResult { fan_id } => {
+            let data = get(&client, &format!("{base}/api/calibration/{fan_id}"))?;
+            let start = data["start_percent"].as_u64().unwrap_or(0);
+            let stop = data["stop_percent"].as_u64().unwrap_or(0);
+            let min_rpm = data["min_rpm"].as_u64().unwrap_or(0);
+            let max_rpm = data["max_rpm"].as_u64().unwrap_or(0);
+            println!("Fan '{fan_id}' calibration:");
+            println!("  start_percent : {start}%");
+            println!("  stop_percent  : {stop}%");
+            println!("  min_rpm       : {min_rpm}");
+            println!("  max_rpm       : {max_rpm}");
+        }
 
         Command::Watch { interval_ms } => {
             use std::thread;

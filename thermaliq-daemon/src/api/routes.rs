@@ -40,6 +40,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/agent/interventions", get(list_interventions))
         .route("/api/history/sensors/:sensor_id", get(history_sensors))
         .route("/api/history/fans/:fan_id", get(history_fans))
+        .route("/api/calibration/:fan_id", get(get_calibration))
         .route("/ws/sensors", get(ws::ws_sensors))
         .route("/ws/agent", get(ws::ws_agent));
 
@@ -56,6 +57,7 @@ pub fn build_router(state: AppState) -> Router {
             "/api/agent/interventions/:id/reject",
             post(reject_intervention),
         )
+        .route("/api/calibration/:fan_id/run", post(run_calibration))
         .route("/api/shutdown", post(shutdown))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -280,4 +282,134 @@ async fn reject_intervention(
 async fn shutdown(State(state): State<AppState>) -> Json<Value> {
     let _ = state.shutdown_tx.send(true);
     Json(json!({ "status": "shutting_down" }))
+}
+
+// ── Fan calibration ───────────────────────────────────────────────────────────
+
+/// `GET /api/calibration/:fan_id` — return the most recent stored result.
+async fn get_calibration(
+    State(state): State<AppState>,
+    Path(fan_id): Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    let result = state
+        .history
+        .lock()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .get_calibration(&fan_id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    match result {
+        Some(r) => Ok(Json(json!(r))),
+        None => Err(StatusCode::NOT_FOUND),
+    }
+}
+
+/// `POST /api/calibration/:fan_id/run` — ramp the fan 0→100% in 5% steps,
+/// measure RPM at each point, derive start/stop/min/max, store and return the result.
+///
+/// Takes ~42 s (21 steps × 2 s settle time). The HTTP connection stays open
+/// for the duration; clients should set a ≥60 s timeout.
+async fn run_calibration(
+    State(state): State<AppState>,
+    Path(fan_id): Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use thermaliq_common::history::{CalibrationResult, CalibrationStep};
+    use thermaliq_common::SetFanDuty;
+    use tokio::time::{sleep, Duration};
+
+    const SETTLE_MS: u64 = 2_000;
+    const STEP: u8 = 5;
+
+    let mut steps: Vec<CalibrationStep> = Vec::new();
+
+    // Up-ramp: 0, 5, 10, …, 100
+    for duty in (0u8..=100).step_by(STEP as usize) {
+        state
+            .hal
+            .set_fan_duty(SetFanDuty {
+                fan_id: fan_id.clone(),
+                duty_percent: duty,
+            })
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        sleep(Duration::from_millis(SETTLE_MS)).await;
+
+        let snap = state
+            .hal
+            .snapshot()
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        let rpm = snap
+            .fans
+            .iter()
+            .find(|f| f.id == fan_id)
+            .map(|f| f.rpm)
+            .unwrap_or(0);
+
+        steps.push(CalibrationStep { duty_percent: duty, rpm });
+    }
+
+    // Restore fan to auto / 0% after sweep.
+    let _ = state
+        .hal
+        .set_fan_duty(SetFanDuty {
+            fan_id: fan_id.clone(),
+            duty_percent: 0,
+        })
+        .await;
+
+    // Derive metrics from sweep data.
+    let start_percent = steps
+        .iter()
+        .find(|s| s.rpm > 0)
+        .map(|s| s.duty_percent)
+        .unwrap_or(0);
+
+    let stop_percent = steps
+        .iter()
+        .rev()
+        .find(|s| s.rpm == 0)
+        .map(|s| s.duty_percent)
+        .unwrap_or(0);
+
+    let spinning: Vec<u32> = steps.iter().filter(|s| s.rpm > 0).map(|s| s.rpm).collect();
+    let min_rpm = spinning.iter().copied().min().unwrap_or(0);
+    let max_rpm = spinning.iter().copied().max().unwrap_or(0);
+
+    let calibrated_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    let result = CalibrationResult {
+        fan_id: fan_id.clone(),
+        calibrated_at,
+        start_percent,
+        stop_percent,
+        min_rpm,
+        max_rpm,
+        steps,
+    };
+
+    // Persist to history DB.
+    state
+        .history
+        .lock()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .store_calibration(&result)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    tracing::info!(
+        fan = %fan_id,
+        start_percent,
+        stop_percent,
+        min_rpm,
+        max_rpm,
+        "fan calibration complete"
+    );
+
+    Ok(Json(json!(result)))
 }
