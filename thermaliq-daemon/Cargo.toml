@@ -23,7 +23,7 @@ tracing-subscriber = { workspace = true }
 axum = { version = "0.7", features = ["macros", "ws"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["cors"] }
-rand = "0.8"
+rand = "0.10"
 hex = "0.4"
 dirs = "5"
 toml = { workspace = true }
