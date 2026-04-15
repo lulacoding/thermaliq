@@ -1,19 +1,102 @@
-import { useState } from "react";
-import { CheckCircle, Zap } from "lucide-react";
+import { useState, useEffect } from "react";
+import { CheckCircle, Zap, AlertCircle } from "lucide-react";
+import { useToken } from "../hooks/useToken";
 
 type Step = "detect" | "spinning" | "results" | "confirm";
 
-export default function CalibrationWizard() {
-  const [step, setStep] = useState<Step>("detect");
-  const [fans, setFans] = useState<{ name: string; minRpm: number; maxRpm: number }[]>([]);
+interface Fan {
+  name: string;
+  minRpm: number;
+  maxRpm: number;
+}
 
-  const handleStartCalibration = () => {
-    setFans([
-      { name: "CPU Fan", minRpm: 800, maxRpm: 3600 },
-      { name: "Chassis Fan 1", minRpm: 500, maxRpm: 2400 },
-    ]);
+const API_BASE = "http://127.0.0.1:7272";
+
+export default function CalibrationWizard() {
+  const { token } = useToken();
+  const [step, setStep] = useState<Step>("detect");
+  const [fans, setFans] = useState<Fan[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [availableFans, setAvailableFans] = useState<
+    Array<{ id: string; label: string }>
+  >([]);
+
+  useEffect(() => {
+    const fetchFans = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/fans`);
+        if (!res.ok) throw new Error("Failed to fetch fans");
+        const data = (await res.json()) as {
+          fans: Array<{ id: string; label: string }>;
+        };
+        setAvailableFans(data.fans);
+      } catch (err) {
+        console.error("Failed to fetch fans:", err);
+        setError(err instanceof Error ? err.message : "Failed to load fans");
+      }
+    };
+    fetchFans();
+  }, []);
+
+  const handleStartCalibration = async () => {
+    if (!token) {
+      setError("No API token — cannot run calibration");
+      return;
+    }
+
+    setError(null);
     setStep("spinning");
-    setTimeout(() => setStep("results"), 3000);
+    setFans([]);
+
+    try {
+      // Calibrate each fan sequentially
+      const results: Fan[] = [];
+
+      for (const fan of availableFans) {
+        try {
+          // Run calibration (takes ~42 seconds, set 60s timeout)
+          const calRes = await fetch(`${API_BASE}/api/calibration/${fan.id}/run`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${token}`,
+            },
+            timeout: 60000,
+          });
+
+          if (!calRes.ok) {
+            throw new Error(`Calibration failed for ${fan.label}`);
+          }
+
+          const calData = (await calRes.json()) as {
+            fan_id: string;
+            start_percent: number;
+            stop_percent: number;
+            min_rpm: number;
+            max_rpm: number;
+          };
+
+          results.push({
+            name: fan.label,
+            minRpm: calData.min_rpm,
+            maxRpm: calData.max_rpm,
+          });
+        } catch (err) {
+          console.error(`Calibration error for ${fan.label}:`, err);
+          setError(
+            err instanceof Error ? err.message : "Calibration failed"
+          );
+          setStep("detect");
+          return;
+        }
+      }
+
+      setFans(results);
+      setStep("results");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Calibration failed");
+      setStep("detect");
+    }
   };
 
   const handleConfirm = () => {
@@ -32,6 +115,13 @@ export default function CalibrationWizard() {
       </div>
 
       <div style={styles.wizard}>
+        {error && (
+          <div style={styles.errorBanner}>
+            <AlertCircle size={16} />
+            <span>{error}</span>
+          </div>
+        )}
+
         {step === "detect" && (
           <div style={styles.stepContent}>
             <div style={styles.stepIcon}>
@@ -42,8 +132,12 @@ export default function CalibrationWizard() {
               This wizard will scan your system and measure the RPM range of each connected fan.
               It takes about 2-3 minutes.
             </p>
-            <button style={styles.primaryButton} onClick={handleStartCalibration}>
-              Start Calibration
+            <button
+              style={styles.primaryButton}
+              onClick={handleStartCalibration}
+              disabled={availableFans.length === 0}
+            >
+              {availableFans.length === 0 ? "Loading fans..." : "Start Calibration"}
             </button>
           </div>
         )}
@@ -246,6 +340,18 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: 13,
     cursor: "pointer",
     transition: "background 0.15s",
+  },
+  errorBanner: {
+    display: "flex",
+    alignItems: "center",
+    gap: 12,
+    padding: "12px 16px",
+    background: "rgba(239, 68, 68, 0.1)",
+    border: "1px solid rgba(239, 68, 68, 0.3)",
+    borderRadius: "var(--radius-sm)",
+    color: "#ef4444",
+    fontSize: 13,
+    marginBottom: 24,
   },
   nextSteps: {
     textAlign: "left",

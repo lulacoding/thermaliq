@@ -1,10 +1,76 @@
 import { useState, useEffect } from "react";
 import { Zap, AlertCircle } from "lucide-react";
+import { useToken } from "../hooks/useToken";
+
+interface Intervention {
+  id: string;
+  description: string;
+  proposed_at: number;
+  proposed_action: string;
+}
+
+interface AgentStatusData {
+  mode: "Passive" | "Approval" | "Autonomous";
+  pending_count: number;
+}
+
+const API_BASE = "http://127.0.0.1:7272";
 
 export default function AgentPanel() {
+  const { token } = useToken();
   const [agentStatus, setAgentStatus] = useState<"idle" | "active" | "error">("active");
-  const [decisionCount, setDecisionCount] = useState(42);
-  const [lastAction, setLastAction] = useState("Switched to balanced profile • 2m ago");
+  const [agentMode, setAgentMode] = useState<"Passive" | "Approval" | "Autonomous">("Approval");
+  const [decisionCount, setDecisionCount] = useState(0);
+  const [lastAction, setLastAction] = useState("Waiting for first intervention...");
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  // Fetch agent status and recent interventions on mount
+  useEffect(() => {
+    const fetchAgentData = async () => {
+      try {
+        setLoading(true);
+        setError(null);
+
+        // Fetch agent status (mode and pending count)
+        const statusRes = await fetch(`${API_BASE}/api/agent/status`);
+        if (!statusRes.ok) throw new Error("Failed to fetch agent status");
+        const statusData = (await statusRes.json()) as AgentStatusData;
+        setAgentMode(statusData.mode);
+
+        // Fetch recent interventions
+        const interventionsRes = await fetch(`${API_BASE}/api/agent/interventions`);
+        if (!interventionsRes.ok) throw new Error("Failed to fetch interventions");
+        const interventionsData = (await interventionsRes.json()) as {
+          interventions: Intervention[];
+        };
+
+        // Count total interventions made (approximation via pending count + interface history)
+        setDecisionCount(interventionsData.interventions.length);
+
+        // Extract last action from most recent intervention
+        if (interventionsData.interventions.length > 0) {
+          const latest = interventionsData.interventions[0];
+          const timeDiff = Math.floor((Date.now() - latest.proposed_at) / 1000);
+          const timeStr =
+            timeDiff < 60
+              ? `${timeDiff}s ago`
+              : timeDiff < 3600
+              ? `${Math.floor(timeDiff / 60)}m ago`
+              : `${Math.floor(timeDiff / 3600)}h ago`;
+          setLastAction(`${latest.description} • ${timeStr}`);
+        }
+      } catch (err) {
+        console.error("Failed to fetch agent data:", err);
+        setError(err instanceof Error ? err.message : "Failed to load agent data");
+        setAgentStatus("error");
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    fetchAgentData();
+  }, []);
 
   return (
     <div style={styles.container}>
@@ -17,21 +83,25 @@ export default function AgentPanel() {
       <div style={{...styles.section, ...styles.sectionCard}}>
         <div style={styles.cardAccentBar} />
         <h2 style={styles.sectionTitle}>Agent Status</h2>
-        <div style={styles.statusContent}>
-          <div style={styles.statusIndicator}>
-            <div style={{...styles.statusDot, ...styles[`status${agentStatus}`]}} />
-            <span style={styles.statusText}>
-              {agentStatus === "active" && "Active"}
-              {agentStatus === "idle" && "Idle"}
-              {agentStatus === "error" && "Error"}
-            </span>
+        {error ? (
+          <p style={{color: "var(--red)", fontSize: 13}}>{error}</p>
+        ) : (
+          <div style={styles.statusContent}>
+            <div style={styles.statusIndicator}>
+              <div style={{...styles.statusDot, ...styles[`status${agentStatus}`]}} />
+              <span style={styles.statusText}>
+                {agentStatus === "active" && "Active"}
+                {agentStatus === "idle" && "Idle"}
+                {agentStatus === "error" && "Error"}
+              </span>
+            </div>
+            <p style={styles.statusDetail}>
+              {agentStatus === "active" && "Agent is running and monitoring thermal conditions"}
+              {agentStatus === "idle" && "Agent is idle — system is in standby"}
+              {agentStatus === "error" && "Agent encountered an error — check settings"}
+            </p>
           </div>
-          <p style={styles.statusDetail}>
-            {agentStatus === "active" && "Agent is running and monitoring thermal conditions"}
-            {agentStatus === "idle" && "Agent is idle — system is in standby"}
-            {agentStatus === "error" && "Agent encountered an error — check settings"}
-          </p>
-        </div>
+        )}
       </div>
 
       {/* Recent Actions */}
@@ -64,7 +134,7 @@ export default function AgentPanel() {
         <div style={{...styles.cardAccentBar, background: 'var(--secondary)'}} />
         <h2 style={styles.sectionTitle}>Trust Level</h2>
         <p style={styles.trustText}>
-          Current mode: <span style={{color: 'var(--accent)', fontWeight: 600}}>Bounded</span>
+          Current mode: <span style={{color: 'var(--accent)', fontWeight: 600}}>{agentMode}</span>
         </p>
         <p style={styles.trustDescription}>
           The agent can make autonomous decisions within configured safety guardrails. Adjust trust level in Settings.
