@@ -47,9 +47,10 @@ fn send_notification(title: String, body: String) {
 
 fn setup_tray(app: &mut tauri::App, state: Arc<Mutex<TrayState>>) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "Show ThermalIQ", true, None::<&str>)?;
+    let agent_toggle = MenuItem::with_id(app, "agent_toggle", "⏸ Pause AI Agent", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &sep, &quit])?;
+    let menu = Menu::with_items(app, &[&show, &agent_toggle, &sep, &quit])?;
 
     let state_clone = Arc::clone(&state);
 
@@ -65,6 +66,9 @@ fn setup_tray(app: &mut tauri::App, state: Arc<Mutex<TrayState>>) -> tauri::Resu
                 show_main_window(app);
             } else if id == "quit" {
                 app.exit(0);
+            } else if id == "agent_toggle" {
+                let token = state_clone.lock().unwrap().token.clone();
+                toggle_agent(token);
             } else if id.starts_with("profile_") {
                 let profile_name = id.trim_start_matches("profile_").to_string();
                 let token = state_clone.lock().unwrap().token.clone();
@@ -252,6 +256,31 @@ fn apply_profile(profile_name: String, token: String) {
         match result {
             Ok(_) => tracing::info!(profile = %profile_name, "tray: profile applied"),
             Err(e) => tracing::warn!(profile = %profile_name, error = %e, "tray: profile apply failed"),
+        }
+    });
+}
+
+fn toggle_agent(token: String) {
+    std::thread::spawn(move || {
+        // Get current agent status
+        let status_result = ureq::get(&format!("{API_BASE}/api/agent/status"))
+            .set("Authorization", &format!("Bearer {token}"))
+            .call()
+            .ok()
+            .and_then(|r| r.into_json::<serde_json::Value>().ok());
+
+        if let Some(status) = status_result {
+            let current_state = status["state"].as_str().unwrap_or("unknown");
+            let new_state = if current_state == "running" { "paused" } else { "running" };
+
+            // POST to toggle agent state
+            let result = ureq::post(&format!("{API_BASE}/api/agent/{new_state}"))
+                .set("Authorization", &format!("Bearer {token}"))
+                .call();
+            match result {
+                Ok(_) => tracing::info!(state = new_state, "tray: agent toggled"),
+                Err(e) => tracing::warn!(error = %e, "tray: agent toggle failed"),
+            }
         }
     });
 }
