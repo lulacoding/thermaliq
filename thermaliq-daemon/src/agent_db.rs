@@ -1,5 +1,7 @@
 //! Agent memory database — persistent SQLite store for thermal intelligence.
 
+#![allow(dead_code)]
+
 use anyhow::Result;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};

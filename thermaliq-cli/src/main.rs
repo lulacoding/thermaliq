@@ -373,7 +373,7 @@ fn main() -> Result<()> {
                         println!("SENSORS");
                         if let Some(arr) = data["sensors"].as_array() {
                             for s in arr {
-                                let id = s["id"].as_str().unwrap_or("?");
+                                let _id = s["id"].as_str().unwrap_or("?");
                                 let label = s["label"].as_str().unwrap_or("?");
                                 let temp = s["temp_celsius"].as_f64().unwrap_or(0.0);
                                 let bar = temp_bar(temp);

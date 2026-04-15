@@ -56,7 +56,7 @@ impl AgentStateMachine {
             (AgentState::Sampling, AgentTransition::Suspend) => AgentState::Suspended,
 
             // From Analyzing
-            (AgentState::Analyzing, AgentTransition::ProposeIntervention { id }) => {
+            (AgentState::Analyzing, AgentTransition::ProposeIntervention { id: _ }) => {
                 AgentState::Proposing
             }
             (AgentState::Analyzing, AgentTransition::StartSampling) => AgentState::Sampling,
