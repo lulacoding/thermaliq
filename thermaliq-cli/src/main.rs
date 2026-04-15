@@ -98,6 +98,11 @@ enum ProfileAction {
         /// Profile name
         name: String,
     },
+    /// Generate a new profile from a natural language description (requires ANTHROPIC_API_KEY on daemon)
+    Create {
+        /// Natural language description, e.g. "make it quiet for video calls"
+        prompt: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -270,6 +275,26 @@ fn main() -> Result<()> {
                 let profile = thermaliq_common::config::load_profile(&path)
                     .with_context(|| format!("load profile {name}"))?;
                 print_json(&serde_json::to_value(&profile)?)?;
+            }
+            ProfileAction::Create { prompt } => {
+                let token = require_token(&cli.token)?;
+                eprintln!("Generating profile… (this may take a few seconds)");
+                // Profile generation can take 5-15s depending on API latency.
+                let long_client = reqwest::blocking::Client::builder()
+                    .timeout(std::time::Duration::from_secs(30))
+                    .build()?;
+                let resp = post_authed(
+                    &long_client,
+                    &format!("{base}/api/profiles/generate"),
+                    &token,
+                    &serde_json::json!({ "prompt": prompt }),
+                )?;
+                let name = resp["name"].as_str().unwrap_or("?");
+                let path = resp["path"].as_str().unwrap_or("?");
+                println!("Profile '{name}' saved to {path}");
+                if let Some(toml) = resp["toml"].as_str() {
+                    println!("\n{toml}");
+                }
             }
         },
 

@@ -3,6 +3,7 @@ mod agent_task;
 mod app_monitor;
 mod api;
 mod poller;
+mod profile_gen;
 mod token;
 
 #[cfg(target_os = "windows")]
