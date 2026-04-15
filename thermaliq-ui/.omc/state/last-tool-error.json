@@ -1,7 +1,7 @@
 {
   "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"npm run tauri dev\",\"timeout\":60000,\"description\":\"Start Tauri development server to verify UI compiles and renders\"}",
-  "error": "Exit code 1\n\n> thermaliq-ui@0.1.0 tauri\n> tauri dev\n\n     Running BeforeDevCommand (`npm run dev`)\n     Running DevCommand (`cargo  run --no-default-features --color always --`)\n        Info Watching /Users/samalesci-bateman/dev/Thermaliq/thermaliq-ui/src-tauri for changes...\n\n> thermaliq-ui@0.1.0 dev\n> vite\n\nerror when starting dev server:\nError: Port 1420 is already in use\n    at Server.onError (file:///Users/samalesci-bateman/dev/Thermaliq/thermaliq-ui/node_modules/vite/dist/node/chunks/dep-B...",
-  "timestamp": "2026-04-15T12:26:56.790Z",
+  "tool_input_preview": "{\"command\":\"npx tsc --noEmit src/components/SettingsPanel.tsx 2>&1\"}",
+  "error": "Exit code 2\nerror TS2468: Cannot find global value 'Promise'.\nnode_modules/@types/babel__template/index.d.ts(11,28): error TS2583: Cannot find name 'Set'. Do you need to change your target library? Try changing the 'lib' compiler option to 'es2015' or later.\nnode_modules/@types/babel__traverse/index.d.ts(63,15): error TS2583: Cannot find name 'WeakMap'. Do you need to change your target library? Try changing the 'lib' compiler option to 'es2015' or later.\nnode_modules/@types/babel__traverse/inde...",
+  "timestamp": "2026-04-15T13:05:52.388Z",
   "retry_count": 1
 }

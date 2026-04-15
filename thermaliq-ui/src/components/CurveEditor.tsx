@@ -1,11 +1,13 @@
-import { useState } from "react";
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Dot } from "recharts";
+import { useState, useEffect } from "react";
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 
 interface Breakpoint {
   id: string;
   temp: number;
   duty: number;
 }
+
+const API_BASE = "http://127.0.0.1:7272";
 
 export default function CurveEditor() {
   const [aiInput, setAiInput] = useState("");
@@ -18,6 +20,13 @@ export default function CurveEditor() {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editTemp, setEditTemp] = useState("");
   const [editDuty, setEditDuty] = useState("");
+  const [profileName, setProfileName] = useState("custom");
+  const [fanId, setFanId] = useState("cpu_fan");
+  const [aiLoading, setAiLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [success, setSuccess] = useState<string | null>(null);
+  const [apiToken, setApiToken] = useState<string | null>(null);
 
   const handleChartClick = (data: any) => {
     // Allow adding new points by clicking on the chart
@@ -54,11 +63,110 @@ export default function CurveEditor() {
     setBreakpoints(breakpoints.filter((bp) => bp.id !== id));
   };
 
-  const handleAiDescribe = () => {
-    if (aiInput.trim()) {
-      console.log("AI Describe request:", aiInput);
-      // TODO: Send to daemon API for AI curve generation
+  // Load API token from localStorage on mount
+  useEffect(() => {
+    const token = localStorage.getItem("api_token");
+    if (token) {
+      setApiToken(token);
+    }
+  }, []);
+
+  const handleAiDescribe = async () => {
+    if (!aiInput.trim()) {
+      return;
+    }
+
+    try {
+      setAiLoading(true);
+      setError(null);
+      setSuccess(null);
+
+      const token = apiToken || localStorage.getItem("api_token");
+      const headers: HeadersInit = {
+        "Content-Type": "application/json",
+      };
+      if (token) {
+        headers["Authorization"] = `Bearer ${token}`;
+      }
+
+      const response = await fetch(`${API_BASE}/api/curves/ai-generate`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          prompt: aiInput,
+          fan_id: fanId,
+        }),
+      });
+
+      if (!response.ok) {
+        const errorData = await response.text();
+        throw new Error(`Failed to generate curve: ${errorData}`);
+      }
+
+      const data = await response.json();
+
+      // Extract curve points from AI response
+      if (data.curve && data.curve.points) {
+        const aiPoints: Breakpoint[] = data.curve.points.map(
+          (point: any, idx: number) => ({
+            id: `ai_${idx}`,
+            temp: Math.round(point.temp_celsius),
+            duty: Math.round(point.duty_percent),
+          })
+        );
+        setBreakpoints(aiPoints.sort((a, b) => a.temp - b.temp));
+        setSuccess(`AI generated curve: ${data.generated_profile}`);
+        setTimeout(() => setSuccess(null), 3000);
+      }
+
       setAiInput("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to generate curve");
+    } finally {
+      setAiLoading(false);
+    }
+  };
+
+  const handleSave = async () => {
+    try {
+      setSaving(true);
+      setError(null);
+      setSuccess(null);
+
+      const token = apiToken || localStorage.getItem("api_token");
+      const headers: HeadersInit = {
+        "Content-Type": "application/json",
+      };
+      if (token) {
+        headers["Authorization"] = `Bearer ${token}`;
+      }
+
+      const points = breakpoints.map((bp) => ({
+        temp_celsius: bp.temp,
+        duty_percent: bp.duty,
+      }));
+
+      const response = await fetch(`${API_BASE}/api/curves/save`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          profile: profileName,
+          fan_id: fanId,
+          points,
+        }),
+      });
+
+      if (!response.ok) {
+        const errorData = await response.text();
+        throw new Error(`Failed to save curve: ${errorData}`);
+      }
+
+      setSuccess("Curve saved successfully!");
+      setTimeout(() => setSuccess(null), 3000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to save curve");
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -75,6 +183,37 @@ export default function CurveEditor() {
         <p style={styles.subtitle}>Drag points on the chart or edit the table below. Use AI to generate curves automatically.</p>
       </div>
 
+      {error && <div style={styles.errorBox}>{error}</div>}
+      {success && <div style={styles.successBox}>{success}</div>}
+
+      {/* Profile & Fan Selection */}
+      <div style={{...styles.section, ...styles.sectionCard}}>
+        <div style={styles.cardAccentBar} />
+        <h2 style={styles.sectionTitle}>Curve Settings</h2>
+        <div style={styles.settingRow}>
+          <div style={styles.settingGroup}>
+            <label style={styles.label}>Profile Name</label>
+            <input
+              type="text"
+              style={styles.input}
+              value={profileName}
+              onChange={(e) => setProfileName(e.target.value)}
+              placeholder="e.g., balanced, performance"
+            />
+          </div>
+          <div style={styles.settingGroup}>
+            <label style={styles.label}>Fan ID</label>
+            <input
+              type="text"
+              style={styles.input}
+              value={fanId}
+              onChange={(e) => setFanId(e.target.value)}
+              placeholder="e.g., cpu_fan, gpu_fan"
+            />
+          </div>
+        </div>
+      </div>
+
       {/* AI Describe Input */}
       <div style={{...styles.section, ...styles.sectionCard}}>
         <div style={styles.cardAccentBar} />
@@ -87,9 +226,17 @@ export default function CurveEditor() {
             value={aiInput}
             onChange={(e) => setAiInput(e.target.value)}
             onKeyPress={(e) => e.key === "Enter" && handleAiDescribe()}
+            disabled={aiLoading}
           />
-          <button style={styles.aiButton} onClick={handleAiDescribe}>
-            Generate
+          <button
+            style={{
+              ...styles.aiButton,
+              ...(aiLoading ? styles.buttonDisabled : {}),
+            }}
+            onClick={handleAiDescribe}
+            disabled={aiLoading}
+          >
+            {aiLoading ? "Generating..." : "Generate"}
           </button>
         </div>
       </div>
@@ -210,7 +357,16 @@ export default function CurveEditor() {
 
       {/* Save Button */}
       <div style={styles.footer}>
-        <button style={styles.saveButton}>Save Curve</button>
+        <button
+          style={{
+            ...styles.saveButton,
+            ...(saving ? styles.buttonDisabled : {}),
+          }}
+          onClick={handleSave}
+          disabled={saving}
+        >
+          {saving ? "Saving..." : "Save Curve"}
+        </button>
       </div>
     </div>
   );
@@ -357,5 +513,54 @@ const styles: Record<string, React.CSSProperties> = {
     fontWeight: 600,
     fontSize: 13,
     cursor: "pointer",
+  },
+  buttonDisabled: {
+    opacity: 0.5,
+    cursor: "not-allowed",
+  },
+  errorBox: {
+    padding: "12px 16px",
+    marginBottom: 24,
+    background: "rgba(255, 87, 51, 0.1)",
+    border: "1px solid rgba(255, 87, 51, 0.3)",
+    borderRadius: "var(--radius)",
+    color: "#FF5733",
+    fontSize: 13,
+    fontWeight: 500,
+  },
+  successBox: {
+    padding: "12px 16px",
+    marginBottom: 24,
+    background: "rgba(0, 255, 65, 0.1)",
+    border: "1px solid rgba(0, 255, 65, 0.3)",
+    borderRadius: "var(--radius)",
+    color: "#00FF41",
+    fontSize: 13,
+    fontWeight: 500,
+  },
+  settingRow: {
+    display: "flex",
+    gap: 16,
+  },
+  settingGroup: {
+    flex: 1,
+    marginBottom: 16,
+  },
+  label: {
+    display: "block",
+    fontSize: 13,
+    color: "var(--text-primary)",
+    marginBottom: 6,
+    fontWeight: 500,
+  },
+  input: {
+    width: "100%",
+    padding: "8px 12px",
+    background: "var(--bg-card)",
+    border: "1px solid var(--border)",
+    borderRadius: "var(--radius)",
+    color: "var(--text-primary)",
+    fontSize: 13,
+    fontFamily: "inherit",
   },
 };

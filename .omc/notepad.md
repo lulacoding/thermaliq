@@ -3,7 +3,7 @@
 
 ## Priority Context
 <!-- ALWAYS loaded. Keep under 500 chars. Critical discoveries only. -->
-THERMALIQ Lane 2 (Multi-Provider AI) IN PROGRESS: Phase 1+2 complete (AIProvider trait, 5 implementations, agent_task integration). Phase 3 remaining: POST /api/settings/ai-provider endpoint to dynamically save/reload config. ~1h remaining on Lane 2.
+THERMALIQ Week 1 UI Backend Integration in progress. ✅ SettingsPanel complete (commit 820f3b0). Next: CurveEditor backend wiring (POST /api/curves/ai-generate, POST /api/curves/save), then ProfileManager, HardwareDetect, Dashboard. Target v1.0 May 6 (20 days).
 
 ## Working Memory
 <!-- Session notes. Auto-pruned after 7 days. -->
