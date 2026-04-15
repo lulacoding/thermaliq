@@ -1,12 +1,12 @@
 # ThermalIQ
 
-**AI-native thermal management for macOS and Linux.**
+**AI-native thermal management for Windows, macOS, and Linux.**
 
 ThermalIQ is a background daemon that monitors your system's temperatures and intelligently controls fan speeds — with an optional 24/7 AI agent that adapts cooling to your workload in real time.
 
-[![Rust](https://img.shields.io/badge/rust-1.78%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.94%2B-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)](#)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)](#)
 
 ---
 

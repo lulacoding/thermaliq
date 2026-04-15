@@ -41,11 +41,16 @@
 //! built-in notarize action, which has a known hang bug (tauri-apps/tauri
 //! issues #14579, #8630).
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use std::ffi::{c_char, c_void, CString};
+use std::io::{BufRead, BufReader, Write};
 use std::mem;
+use std::os::unix::net::UnixStream;
+use std::time::Duration;
 use thermaliq_common::{FanReading, HardwareSnapshot, SensorReading, SetFanDuty};
+
+const HELPER_SOCKET_PATH: &str = "/var/run/thermaliq/helper.sock";
 
 use crate::HardwareLayer;
 
@@ -368,23 +373,43 @@ impl HardwareLayer for MacosHardwareLayer {
             .strip_prefix("fan_")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
+        let duty = cmd.duty_percent;
 
-        tokio::task::spawn_blocking(move || {
-            let smc = SmcConnection::open()?;
-            let min_rpm = smc.read_fan_rpm(fan_idx, "Mn").unwrap_or(500.0);
-            let max_rpm = smc.read_fan_rpm(fan_idx, "Mx").unwrap_or(3000.0);
-            let target_rpm = min_rpm + (cmd.duty_percent as f32 / 100.0) * (max_rpm - min_rpm);
+        tokio::task::spawn_blocking(move || send_helper_command(fan_idx, duty)).await?
+    }
+}
 
-            // Writing fan speed requires Ftst=1 via a privileged SMJobBless
-            // helper (not yet implemented). Log intent for now.
-            tracing::info!(
-                fan = fan_idx,
-                target_rpm = target_rpm,
-                duty = cmd.duty_percent,
-                "macOS: fan speed target set (SMC write requires entitlement)"
-            );
-            Ok(())
-        })
-        .await?
+fn send_helper_command(fan_idx: u8, duty: u8) -> Result<()> {
+    let stream = UnixStream::connect(HELPER_SOCKET_PATH).map_err(|e| {
+        anyhow!(
+            "thermaliq-helper not running — install via ThermalIQ.app to enable fan control ({e})"
+        )
+    })?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+
+    let mut writer = stream.try_clone().context("cloning helper socket stream")?;
+    let request = format!(r#"{{"cmd":"set_fan","fan_idx":{fan_idx},"duty":{duty}}}"#);
+    writeln!(writer, "{request}").context("writing helper request")?;
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .context("reading helper response")?;
+
+    // Minimal JSON check: the helper responds with either {"ok":true}
+    // or {"ok":false,"error":"..."}. Avoid a full JSON dep in this crate.
+    if line.contains("\"ok\":true") {
+        Ok(())
+    } else if let Some(start) = line.find("\"error\":\"") {
+        let rest = &line[start + 9..];
+        let end = rest.find('"').unwrap_or(rest.len());
+        Err(anyhow!("helper error: {}", &rest[..end]))
+    } else {
+        Err(anyhow!(
+            "helper returned unexpected response: {}",
+            line.trim()
+        ))
     }
 }
