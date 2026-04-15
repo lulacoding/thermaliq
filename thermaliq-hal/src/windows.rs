@@ -46,7 +46,10 @@ use windows::{
     core::PCWSTR,
     Win32::{
         Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE},
-        System::Memory::{MapViewOfFile, OpenFileMappingW, UnmapViewOfFile, FILE_MAP_READ},
+        System::Memory::{
+            MapViewOfFile, OpenFileMappingW, UnmapViewOfFile, FILE_MAP_READ,
+            MEMORY_MAPPED_VIEW_ADDRESS,
+        },
     },
 };
 
@@ -202,9 +205,9 @@ impl HwinfoMapping {
 impl Drop for HwinfoMapping {
     fn drop(&mut self) {
         unsafe {
-            // UnmapViewOfFile takes a handle newtype wrapping *mut c_void.
-            // Transmute from our raw pointer — the layout is identical.
-            let _ = UnmapViewOfFile(std::mem::transmute(self.view as *mut std::ffi::c_void));
+            let _ = UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: self.view as *mut std::ffi::c_void,
+            });
             let _ = CloseHandle(self.handle);
         }
     }
