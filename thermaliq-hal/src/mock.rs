@@ -112,6 +112,7 @@ mod tests {
         hal.set_fan_duty(SetFanDuty {
             fan_id: "cpu_fan".into(),
             duty_percent: 75,
+            dc_mode: false,
         })
         .await
         .unwrap();
@@ -127,6 +128,7 @@ mod tests {
             .set_fan_duty(SetFanDuty {
                 fan_id: "nonexistent".into(),
                 duty_percent: 50,
+                dc_mode: false,
             })
             .await;
         assert!(result.is_err());

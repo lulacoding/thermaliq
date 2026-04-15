@@ -255,6 +255,8 @@ pub enum FanMode {
     #[default]
     Pwm,
     Rpm,
+    /// DC (voltage) control — `pwm1_enable=2` on Linux.
+    Dc,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -271,6 +273,14 @@ pub struct FanControl {
     pub offset_pct: i8,
     #[serde(default)]
     pub min_pwm: u8,
+    /// Duty% below which the fan stops (0-RPM hysteresis lower bound).
+    /// Set from calibration or user config. None = no hysteresis.
+    #[serde(default)]
+    pub stop_percent: Option<u8>,
+    /// Duty% above which the fan starts after being stopped.
+    /// Should be ≥ stop_percent. None = no hysteresis.
+    #[serde(default)]
+    pub start_percent: Option<u8>,
 }
 
 fn default_step_up() -> u8 {

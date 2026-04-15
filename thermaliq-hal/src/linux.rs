@@ -595,15 +595,17 @@ impl HardwareLayer for LinuxHardwareLayer {
         let pwm_path = chip.join(format!("pwm{}", fan_part));
         let pwm_enable_path = chip.join(format!("pwm{}_enable", fan_part));
         let pwm_value = (duty as u32 * 255 / 100).clamp(0, 255);
+        // pwm1_enable=1 → PWM control; pwm1_enable=2 → DC (voltage) control.
+        let enable_value = if cmd.dc_mode { "2\n" } else { "1\n" };
 
         tokio::task::spawn_blocking(move || {
-            // Enable manual PWM control (pwm1_enable=1).
-            fs::write(&pwm_enable_path, "1\n").ok();
+            fs::write(&pwm_enable_path, enable_value).ok();
             fs::write(&pwm_path, format!("{}\n", pwm_value))?;
             tracing::info!(
                 fan = %cmd.fan_id,
                 pwm = pwm_value,
                 duty = duty,
+                dc_mode = cmd.dc_mode,
                 "Linux: fan PWM set"
             );
             Ok(())

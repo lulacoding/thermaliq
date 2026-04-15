@@ -4,12 +4,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{interval, Duration};
 
 use crate::api::auth::AppState;
-use thermaliq_common::config::{CustomSensor, MixFunction, Profile, ProfileCurve};
+use thermaliq_common::config::{CustomSensor, FanMode, MixFunction, Profile, ProfileCurve};
 use thermaliq_common::SensorReading;
 
 pub fn start_poll_loop(state: AppState, interval_ms: u64) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = interval(Duration::from_millis(interval_ms));
+        // Track whether each fan is currently spinning (for 0-RPM hysteresis).
+        let mut fan_running: std::collections::HashMap<String, bool> =
+            std::collections::HashMap::new();
 
         loop {
             ticker.tick().await;
@@ -106,13 +109,39 @@ pub fn start_poll_loop(state: AppState, interval_ms: u64) -> tokio::task::JoinHa
                             }
                             None => 0.0,
                         };
-                        let duty = compute_duty_for_curve(curve, temp, profile);
-                        let duty = duty.max(control.min_pwm);
+                        let raw_duty = compute_duty_for_curve(curve, temp, profile);
+                        let raw_duty = raw_duty.max(control.min_pwm);
+
+                        // ── 0-RPM hysteresis ─────────────────────────────────
+                        // If start_percent and stop_percent are configured, apply
+                        // deadband logic to prevent fan chatter at low duty values.
+                        let effective_duty = match (control.stop_percent, control.start_percent) {
+                            (Some(stop), Some(start)) => {
+                                let currently_running = fan_running
+                                    .get(&control.fan)
+                                    .copied()
+                                    .unwrap_or(false);
+                                if currently_running {
+                                    // Fan is spinning — keep it on unless below stop_percent.
+                                    if raw_duty <= stop { 0 } else { raw_duty }
+                                } else {
+                                    // Fan is stopped — only start if above start_percent.
+                                    if raw_duty > start { raw_duty } else { 0 }
+                                }
+                            }
+                            _ => raw_duty,
+                        };
+
+                        // Update running state for next tick.
+                        fan_running.insert(control.fan.clone(), effective_duty > 0);
+
+                        let dc_mode = control.mode == FanMode::Dc;
                         let _ = state
                             .hal
                             .set_fan_duty(thermaliq_common::SetFanDuty {
                                 fan_id: control.fan.clone(),
-                                duty_percent: duty,
+                                duty_percent: effective_duty,
+                                dc_mode,
                             })
                             .await;
                     }
