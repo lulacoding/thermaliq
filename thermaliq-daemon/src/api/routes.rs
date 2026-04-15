@@ -185,6 +185,7 @@ async fn set_fan_pwm(
         .set_fan_duty(thermaliq_common::SetFanDuty {
             fan_id: fan_id.clone(),
             duty_percent: duty,
+            dc_mode: false,
         })
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -330,6 +331,7 @@ async fn run_calibration(
             .set_fan_duty(SetFanDuty {
                 fan_id: fan_id.clone(),
                 duty_percent: duty,
+                dc_mode: false,
             })
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -358,6 +360,7 @@ async fn run_calibration(
         .set_fan_duty(SetFanDuty {
             fan_id: fan_id.clone(),
             duty_percent: 0,
+            dc_mode: false,
         })
         .await;
 
