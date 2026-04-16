@@ -2,6 +2,7 @@ import { Wifi, WifiOff, Wind, Zap } from "lucide-react";
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 import { useDaemon, type Sensor, type Fan } from "../hooks/useDaemon";
 import { useState, useEffect } from "react";
+import { useTranslation } from "react-i18next";
 
 function tempColor(c: number): string {
   if (c >= 85) return "var(--red)";
@@ -89,6 +90,7 @@ function FanSpinner({ fan, index }: { fan: Fan; index: number }) {
 }
 
 export default function Dashboard() {
+  const { t } = useTranslation();
   const { sensors, fans, connected } = useDaemon();
   const [chartData, setChartData] = useState(generateChartData(sensors));
 
@@ -102,17 +104,17 @@ export default function Dashboard() {
   return (
     <div style={styles.root}>
       <div style={styles.header}>
-        <h1 style={styles.title}>Dashboard</h1>
+        <h1 style={styles.title}>{t('dashboard.title')}</h1>
         <div style={styles.connBadge}>
           {connected ? (
             <span className="badge badge-green">
               <Wifi size={10} />
-              Live
+              {t('common.connected')}
             </span>
           ) : (
             <span className="badge badge-red">
               <WifiOff size={10} />
-              Disconnected
+              {t('common.disconnected')}
             </span>
           )}
         </div>
@@ -121,7 +123,7 @@ export default function Dashboard() {
       {!connected && sensors.length === 0 && (
         <div style={styles.emptyState}>
           <WifiOff size={32} color="var(--text-muted)" />
-          <p style={styles.emptyText}>Connecting to daemon at 127.0.0.1:7272…</p>
+          <p style={styles.emptyText}>{t('dashboard.subtitle')}</p>
           <p style={styles.emptySubtext}>
             Make sure <span className="mono">thermaliqd</span> is running.
           </p>
@@ -175,21 +177,21 @@ export default function Dashboard() {
             {/* Fan Group — 3 cols × 2 rows */}
             <div style={{ ...styles.card, gridColumn: "span 3", gridRow: "span 2" }}>
               <div style={styles.cardAccentBar} />
-              <div style={styles.cardLabel}>Fans</div>
+              <div style={styles.cardLabel}>{t('dashboard.fans')}</div>
               <div style={styles.fanGroupCount} className="mono">{fans.length}</div>
             </div>
 
             {/* AI Status + Hardware — 7 cols × 2 rows */}
             <div style={{ ...styles.card, gridColumn: "span 7", gridRow: "span 2" }}>
               <div style={styles.cardAccentBar} />
-              <div style={styles.cardLabel}>AI Agent</div>
+              <div style={styles.cardLabel}>{t('agent.title')}</div>
               <div style={styles.agentRow}>
                 <div style={styles.agentStatus}>
                   <Zap size={12} color="var(--accent)" style={{ marginRight: 4 }} />
-                  <span className="mono">Active</span>
+                  <span className="mono">{t('agent.statusActive')}</span>
                 </div>
                 <div style={styles.hardwareInfo} className="mono">
-                  {sensors.length} sensors • {fans.length} fans
+                  {sensors.length} {t('common.unknown')} • {fans.length} {t('dashboard.fans')}
                 </div>
               </div>
             </div>
@@ -197,7 +199,7 @@ export default function Dashboard() {
             {/* Temperature Chart — 12 cols × 3 rows (below CPU) */}
             <div style={{ ...styles.card, gridColumn: "span 12", gridRow: "span 3", marginTop: 8 }}>
               <div style={styles.cardAccentBar} />
-              <div style={styles.cardLabel}>1-Hour Temperature Trend</div>
+              <div style={styles.cardLabel}>{t('dashboard.tempTrends')}</div>
               <ResponsiveContainer width="100%" height={160}>
                 <LineChart data={chartData} margin={{ top: 5, right: 10, left: -20, bottom: 5 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" vertical={false} />
@@ -239,7 +241,7 @@ export default function Dashboard() {
           {/* Terminal Panel — Bottom 40% */}
           <div style={styles.terminalPanel}>
             <div style={styles.terminalHeader}>
-              <span style={styles.terminalTitle}>AGENT LOG</span>
+              <span style={styles.terminalTitle}>{t('dashboard.systemLog')}</span>
               <div style={styles.statusSquare} />
             </div>
             <div style={styles.logContainer}>
@@ -255,7 +257,7 @@ export default function Dashboard() {
             </div>
             <div style={styles.terminalFooter}>
               <span className="mono" style={styles.profileLabel}>
-                Profile: Balanced • Fans: {fans.length}
+                Profile: Balanced • {t('dashboard.fans')}: {fans.length}
               </span>
             </div>
           </div>

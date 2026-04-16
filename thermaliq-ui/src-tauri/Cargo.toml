@@ -1,6 +1,6 @@
 [package]
 name = "thermaliq-ui"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 
 # Declare this as its own workspace root so Cargo doesn't walk up to
@@ -19,6 +19,7 @@ tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-fs = "2"
 tauri-plugin-shell = "2"
 tauri-plugin-notification = "2"
+tauri-plugin-updater = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "2", features = ["json"] }

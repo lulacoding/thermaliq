@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import { Zap } from "lucide-react";
+import { useTranslation } from "react-i18next";
 
 interface Intervention {
   id: string;
@@ -16,10 +17,11 @@ interface AgentStatusData {
 const API_BASE = "http://127.0.0.1:7272";
 
 export default function AgentPanel() {
+  const { t } = useTranslation();
   const [agentStatus, setAgentStatus] = useState<"idle" | "active" | "error">("active");
   const [agentMode, setAgentMode] = useState<"Passive" | "Approval" | "Autonomous">("Approval");
   const [decisionCount, setDecisionCount] = useState(0);
-  const [lastAction, setLastAction] = useState("Waiting for first intervention...");
+  const [lastAction, setLastAction] = useState(t("agent.waitingForIntervention"));
   const [error, setError] = useState<string | null>(null);
 
   // Fetch agent status and recent interventions on mount
@@ -69,14 +71,14 @@ export default function AgentPanel() {
   return (
     <div style={styles.container}>
       <div style={styles.header}>
-        <h1 style={styles.title}>AI Agent</h1>
-        <p style={styles.subtitle}>Autonomous thermal management with configurable trust levels</p>
+        <h1 style={styles.title}>{t("agent.title")}</h1>
+        <p style={styles.subtitle}>{t("agent.subtitle")}</p>
       </div>
 
       {/* Agent Status */}
       <div style={{...styles.section, ...styles.sectionCard}}>
         <div style={styles.cardAccentBar} />
-        <h2 style={styles.sectionTitle}>Agent Status</h2>
+        <h2 style={styles.sectionTitle}>{t("agent.status")}</h2>
         {error ? (
           <p style={{color: "var(--red)", fontSize: 13}}>{error}</p>
         ) : (
@@ -84,15 +86,15 @@ export default function AgentPanel() {
             <div style={styles.statusIndicator}>
               <div style={{...styles.statusDot, ...styles[`status${agentStatus}`]}} />
               <span style={styles.statusText}>
-                {agentStatus === "active" && "Active"}
-                {agentStatus === "idle" && "Idle"}
-                {agentStatus === "error" && "Error"}
+                {agentStatus === "active" && t("agent.statusActive")}
+                {agentStatus === "idle" && t("agent.statusIdle")}
+                {agentStatus === "error" && t("agent.statusError")}
               </span>
             </div>
             <p style={styles.statusDetail}>
-              {agentStatus === "active" && "Agent is running and monitoring thermal conditions"}
-              {agentStatus === "idle" && "Agent is idle — system is in standby"}
-              {agentStatus === "error" && "Agent encountered an error — check settings"}
+              {agentStatus === "active" && t("agent.statusDetailActive")}
+              {agentStatus === "idle" && t("agent.statusDetailIdle")}
+              {agentStatus === "error" && t("agent.statusDetailError")}
             </p>
           </div>
         )}
@@ -101,14 +103,14 @@ export default function AgentPanel() {
       {/* Recent Actions */}
       <div style={{...styles.section, ...styles.sectionCard}}>
         <div style={styles.cardAccentBar} />
-        <h2 style={styles.sectionTitle}>Recent Actions</h2>
+        <h2 style={styles.sectionTitle}>{t("agent.recentActions")}</h2>
         <div style={styles.actionList}>
           <div style={styles.actionItem}>
             <Zap size={14} color="var(--accent)" style={{ marginRight: 8 }} />
             <span style={styles.actionText}>{lastAction}</span>
           </div>
           <div style={styles.actionMeta}>
-            <span className="mono">{decisionCount} decisions made this session</span>
+            <span className="mono">{decisionCount} {t("agent.decisionsThisSession")}</span>
           </div>
         </div>
       </div>
@@ -116,22 +118,22 @@ export default function AgentPanel() {
       {/* Controls */}
       <div style={{...styles.section, ...styles.sectionCard}}>
         <div style={styles.cardAccentBar} />
-        <h2 style={styles.sectionTitle}>Controls</h2>
+        <h2 style={styles.sectionTitle}>{t("agent.controls")}</h2>
         <div style={styles.controlGroup}>
-          <button style={styles.button}>Pause Agent</button>
-          <button style={{...styles.button, background: "var(--secondary)"}}>View Logs</button>
+          <button style={styles.button}>{t("agent.pauseAgent")}</button>
+          <button style={{...styles.button, background: "var(--secondary)"}}>{t("agent.viewLogs")}</button>
         </div>
       </div>
 
       {/* Trust Level Info */}
       <div style={{...styles.section, ...styles.sectionCard}}>
         <div style={{...styles.cardAccentBar, background: 'var(--secondary)'}} />
-        <h2 style={styles.sectionTitle}>Trust Level</h2>
+        <h2 style={styles.sectionTitle}>{t("agent.trustLevel")}</h2>
         <p style={styles.trustText}>
-          Current mode: <span style={{color: 'var(--accent)', fontWeight: 600}}>{agentMode}</span>
+          {t("agent.mode")}: <span style={{color: 'var(--accent)', fontWeight: 600}}>{agentMode}</span>
         </p>
         <p style={styles.trustDescription}>
-          The agent can make autonomous decisions within configured safety guardrails. Adjust trust level in Settings.
+          {t("settings.guardrails")}
         </p>
       </div>
     </div>

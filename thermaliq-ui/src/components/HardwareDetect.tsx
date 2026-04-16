@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import { AlertCircle, CheckCircle, Loader } from "lucide-react";
+import { useTranslation } from "react-i18next";
 
 interface DetectedHardware {
   fans: string[];
@@ -11,6 +12,7 @@ interface DetectedHardware {
 const API_BASE = "http://127.0.0.1:7272";
 
 export default function HardwareDetect() {
+  const { t } = useTranslation();
   const [stage, setStage] = useState<"detecting" | "results" | "confirm">("detecting");
   const [hardware, setHardware] = useState<DetectedHardware>({
     fans: [],
@@ -18,10 +20,18 @@ export default function HardwareDetect() {
     gpus: [],
     storage: { path: "~/.config/thermaliq/", size: "< 1 MB" },
   });
+  const [hwinfoAvailable, setHwinfoAvailable] = useState<boolean>(false);
 
   useEffect(() => {
     const detectHardware = async () => {
       try {
+        // Fetch HWiNFO64 status
+        const hwinfoRes = await fetch(`${API_BASE}/api/system/hwinfo-status`);
+        if (hwinfoRes.ok) {
+          const hwinfoData = (await hwinfoRes.json()) as { hwinfo_available: boolean };
+          setHwinfoAvailable(hwinfoData.hwinfo_available);
+        }
+
         // Fetch sensors
         const sensorsRes = await fetch(`${API_BASE}/sensors`);
         if (!sensorsRes.ok) throw new Error(`Sensors fetch failed: ${sensorsRes.statusText}`);
@@ -129,8 +139,8 @@ export default function HardwareDetect() {
       <div style={styles.container}>
         <div style={styles.centerContent}>
           <Loader size={48} color="var(--accent)" style={{ animation: "spin 2s linear infinite" }} />
-          <h2 style={styles.detectingTitle}>Detecting Hardware...</h2>
-          <p style={styles.detectingText}>Scanning for fans, sensors, and GPUs. This usually takes a moment.</p>
+          <h2 style={styles.detectingTitle}>{t("hardware.detecting")}</h2>
+          <p style={styles.detectingText}>{t("dashboard.subtitle")}</p>
         </div>
         <style>{`
           @keyframes spin {
@@ -147,12 +157,12 @@ export default function HardwareDetect() {
       <div style={styles.container}>
         <div style={styles.centerContent}>
           <CheckCircle size={48} color="var(--accent)" />
-          <h2 style={styles.confirmTitle}>All Set!</h2>
+          <h2 style={styles.confirmTitle}>{t("common.success")}</h2>
           <p style={styles.confirmText}>
-            ThermalIQ is ready to manage your cooling. Go to the Dashboard to see live temperatures and create profiles.
+            {t("dashboard.subtitle")}
           </p>
           <button style={styles.button} onClick={() => window.location.reload()}>
-            Open Dashboard
+            {t("common.confirm")}
           </button>
         </div>
       </div>
@@ -162,14 +172,22 @@ export default function HardwareDetect() {
   return (
     <div style={styles.container}>
       <div style={styles.header}>
-        <h1 style={styles.title}>Hardware Detected</h1>
-        <p style={styles.subtitle}>ThermalIQ found the following devices on your system.</p>
+        <h1 style={styles.title}>{t("hardware.title")}</h1>
+        <p style={styles.subtitle}>{t("hardware.subtitle")}</p>
+      </div>
+
+      {/* HWiNFO64 Status Banner (Windows only) */}
+      <div style={{...styles.infoBanner, backgroundColor: hwinfoAvailable ? "var(--success-bg)" : "var(--warning-bg)"}}>
+        <AlertCircle size={16} color={hwinfoAvailable ? "var(--success)" : "var(--warning)"} />
+        <p style={styles.bannerText}>
+          {hwinfoAvailable ? t("hardware.hwinfoActive") : t("hardware.hwinfoMissing")}
+        </p>
       </div>
 
       {/* Fans */}
       <div style={{...styles.section, ...styles.sectionCard}}>
         <div style={styles.cardAccentBar} />
-        <h2 style={styles.sectionTitle}>✓ Fans</h2>
+        <h2 style={styles.sectionTitle}>✓ {t("hardware.fans")}</h2>
         <div style={styles.itemList}>
           {hardware.fans.map((fan, i) => (
             <div key={i} style={styles.item}>
@@ -183,7 +201,7 @@ export default function HardwareDetect() {
       {/* Sensors */}
       <div style={{...styles.section, ...styles.sectionCard}}>
         <div style={styles.cardAccentBar} />
-        <h2 style={styles.sectionTitle}>✓ Temperature Sensors</h2>
+        <h2 style={styles.sectionTitle}>✓ {t("hardware.sensors")}</h2>
         <div style={styles.itemList}>
           {hardware.sensors.map((sensor, i) => (
             <div key={i} style={styles.item}>
@@ -200,7 +218,7 @@ export default function HardwareDetect() {
       {/* GPUs */}
       <div style={{...styles.section, ...styles.sectionCard}}>
         <div style={styles.cardAccentBar} />
-        <h2 style={styles.sectionTitle}>✓ Graphics Cards</h2>
+        <h2 style={styles.sectionTitle}>✓ {t("hardware.gpus")}</h2>
         <div style={styles.itemList}>
           {hardware.gpus.map((gpu, i) => (
             <div key={i} style={styles.item}>
@@ -214,7 +232,7 @@ export default function HardwareDetect() {
       {/* Storage */}
       <div style={{...styles.section, ...styles.sectionCard}}>
         <div style={styles.cardAccentBar} />
-        <h2 style={styles.sectionTitle}>✓ Configuration</h2>
+        <h2 style={styles.sectionTitle}>✓ {t("hardware.storage")}</h2>
         <div style={styles.storageBox}>
           <div style={styles.storageItem}>
             <span style={styles.storageLabel}>Config Path:</span>
@@ -232,14 +250,14 @@ export default function HardwareDetect() {
         <div style={styles.cardAccentBar} />
         <AlertCircle size={16} color="var(--text-muted)" />
         <p style={styles.infoText}>
-          ThermalIQ will monitor these devices and automatically control your fans based on temperature. You can adjust curves and settings at any time.
+          {t("dashboard.subtitle")}
         </p>
       </div>
 
       {/* Action Button */}
       <div style={styles.footer}>
         <button style={styles.button} onClick={handleConfirm}>
-          Continue to Dashboard
+          {t("hardware.confirm")}
         </button>
       </div>
     </div>
@@ -404,6 +422,19 @@ const styles: Record<string, React.CSSProperties> = {
   infoText: {
     fontSize: 12,
     color: "var(--text-secondary)",
+    margin: 0,
+  },
+  infoBanner: {
+    display: "flex",
+    gap: 12,
+    padding: "12px 16px",
+    borderRadius: "var(--radius)",
+    marginBottom: 24,
+    alignItems: "center",
+  },
+  bannerText: {
+    fontSize: 12,
+    color: "var(--text-primary)",
     margin: 0,
   },
   footer: {

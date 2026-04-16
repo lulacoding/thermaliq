@@ -35,6 +35,7 @@ pub fn build_router(state: AppState) -> Router {
     let public = Router::new()
         .route("/health", get(health))
         .route("/api/version", get(version))
+        .route("/api/system/hwinfo-status", get(hwinfo_status))
         .route("/sensors", get(list_sensors))
         .route("/fans", get(list_fans))
         .route("/api/profiles", get(list_profiles))
@@ -60,6 +61,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/fans/:id/pwm", post(set_fan_pwm))
         .route("/api/profiles/active", post(set_active_profile))
         .route("/api/agent/mode", post(set_agent_mode))
+        .route("/api/agent/paused", post(pause_agent))
+        .route("/api/agent/running", post(resume_agent))
         .route(
             "/api/agent/interventions/:id/approve",
             post(approve_intervention),
@@ -93,6 +96,27 @@ async fn health() -> Json<Value> {
 
 async fn version() -> Json<Value> {
     Json(json!({ "version": env!("CARGO_PKG_VERSION") }))
+}
+
+async fn hwinfo_status(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
+    #[cfg(target_os = "windows")]
+    {
+        // Windows: check if HWiNFO64 shared memory mapping succeeded
+        let snap = state
+            .hal
+            .snapshot()
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        // If we successfully got sensors, HWiNFO64 is likely available
+        // (or we fell back to WMI which also works)
+        let has_hwinfo = snap.sensors.iter().any(|s| s.label.contains("HWiNFO"));
+        Ok(Json(json!({ "hwinfo_available": !snap.sensors.is_empty() })))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // macOS/Linux: HWiNFO64 is Windows-only
+        Ok(Json(json!({ "hwinfo_available": false })))
+    }
 }
 
 async fn list_sensors(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
@@ -205,6 +229,8 @@ async fn set_fan_pwm(
             fan_id: fan_id.clone(),
             duty_percent: duty,
             dc_mode: false,
+            start_percent: None,
+            stop_percent: None,
         })
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -248,6 +274,22 @@ async fn set_agent_mode(
         .agent_event_tx
         .send(json!({ "type": "mode_changed", "mode": mode_str }).to_string());
     Ok(Json(json!({ "agent_mode": mode_str })))
+}
+
+async fn pause_agent(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
+    *state.agent_mode.write().await = AgentMode::Passive;
+    let _ = state
+        .agent_event_tx
+        .send(json!({ "type": "mode_changed", "mode": "passive" }).to_string());
+    Ok(Json(json!({ "agent_mode": "passive", "status": "paused" })))
+}
+
+async fn resume_agent(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
+    *state.agent_mode.write().await = AgentMode::Approval;
+    let _ = state
+        .agent_event_tx
+        .send(json!({ "type": "mode_changed", "mode": "approval" }).to_string());
+    Ok(Json(json!({ "agent_mode": "approval", "status": "running" })))
 }
 
 async fn approve_intervention(
@@ -390,6 +432,8 @@ async fn run_calibration(
                 fan_id: fan_id.clone(),
                 duty_percent: duty,
                 dc_mode: false,
+                start_percent: None,
+                stop_percent: None,
             })
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -422,6 +466,8 @@ async fn run_calibration(
             fan_id: fan_id.clone(),
             duty_percent: 0,
             dc_mode: false,
+            start_percent: None,
+            stop_percent: None,
         })
         .await;
 

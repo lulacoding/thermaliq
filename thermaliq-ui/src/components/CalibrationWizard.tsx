@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import { CheckCircle, Zap, AlertCircle } from "lucide-react";
 import { useToken } from "../hooks/useToken";
+import { useTranslation } from "react-i18next";
 
 type Step = "detect" | "spinning" | "results" | "confirm";
 
@@ -13,6 +14,7 @@ interface Fan {
 const API_BASE = "http://127.0.0.1:7272";
 
 export default function CalibrationWizard() {
+  const { t } = useTranslation();
   const { token } = useToken();
   const [step, setStep] = useState<Step>("detect");
   const [fans, setFans] = useState<Fan[]>([]);
@@ -111,9 +113,9 @@ export default function CalibrationWizard() {
     <div style={styles.container}>
       <div style={styles.header}>
         <div style={styles.headerContent}>
-          <h1 style={styles.title}>Fan Calibration</h1>
+          <h1 style={styles.title}>{t("calibration.title")}</h1>
           <p style={styles.subtitle}>
-            Let ThermalIQ learn your fan capabilities for optimal thermal control
+            {t("calibration.subtitle")}
           </p>
         </div>
       </div>
@@ -131,17 +133,16 @@ export default function CalibrationWizard() {
             <div style={styles.stepIcon}>
               <Zap size={32} color="var(--accent)" />
             </div>
-            <h2 style={styles.stepTitle}>Detect Connected Fans</h2>
+            <h2 style={styles.stepTitle}>{t("calibration.detectTitle")}</h2>
             <p style={styles.stepDescription}>
-              This wizard will scan your system and measure the RPM range of each connected fan.
-              It takes about 2-3 minutes.
+              {t("calibration.detectDescription")}
             </p>
             <button
               style={styles.primaryButton}
               onClick={handleStartCalibration}
               disabled={availableFans.length === 0}
             >
-              {availableFans.length === 0 ? "Loading fans..." : "Start Calibration"}
+              {availableFans.length === 0 ? t("calibration.loadingFans") : t("calibration.startButton")}
             </button>
           </div>
         )}
@@ -151,9 +152,9 @@ export default function CalibrationWizard() {
             <div style={styles.spinnerContainer}>
               <div style={styles.spinner}></div>
             </div>
-            <h2 style={styles.stepTitle}>Calibrating Fans...</h2>
+            <h2 style={styles.stepTitle}>{t("calibration.spinningTitle")}</h2>
             <p style={styles.stepDescription}>
-              Testing fan speeds. This may sound loud—it's normal.
+              {t("calibration.spinningDescription")}
             </p>
           </div>
         )}
@@ -163,7 +164,7 @@ export default function CalibrationWizard() {
             <div style={styles.stepIcon}>
               <CheckCircle size={32} color="var(--accent)" />
             </div>
-            <h2 style={styles.stepTitle}>Calibration Results</h2>
+            <h2 style={styles.stepTitle}>{t("calibration.resultsTitle")}</h2>
 
             <div style={styles.fansList}>
               {fans.map((fan) => (
@@ -171,7 +172,7 @@ export default function CalibrationWizard() {
                   <div style={styles.fanCardAccentBar} />
                   <div style={styles.fanName}>{fan.name}</div>
                   <div style={styles.fanRange}>
-                    <span style={styles.fanRangeLabel}>Range:</span>
+                    <span style={styles.fanRangeLabel}>{t("calibration.rangeLabel")}</span>
                     <span style={styles.fanRangeValue}>
                       {fan.minRpm} – {fan.maxRpm} RPM
                     </span>
@@ -181,10 +182,10 @@ export default function CalibrationWizard() {
             </div>
 
             <button style={styles.primaryButton} onClick={handleConfirm}>
-              Apply & Continue
+              {t("calibration.applyButton")}
             </button>
             <button style={styles.secondaryButton} onClick={() => setStep("detect")}>
-              Re-calibrate
+              {t("calibration.recalibrateButton")}
             </button>
           </div>
         )}
@@ -194,20 +195,20 @@ export default function CalibrationWizard() {
             <div style={styles.stepIcon}>
               <CheckCircle size={32} color="var(--green)" />
             </div>
-            <h2 style={styles.stepTitle}>Calibration Complete!</h2>
+            <h2 style={styles.stepTitle}>{t("calibration.confirmTitle")}</h2>
             <p style={styles.stepDescription}>
-              Your fans are now calibrated. ThermalIQ will use this data to generate optimal fan curves.
+              {t("calibration.confirmDescription")}
             </p>
             <div style={styles.nextSteps}>
-              <h3 style={styles.nextStepsTitle}>Next Steps:</h3>
+              <h3 style={styles.nextStepsTitle}>{t("calibration.nextStepsTitle")}</h3>
               <ul style={styles.nextStepsList}>
-                <li>Check the Dashboard to see your sensor readings</li>
-                <li>Create or customize fan curves in Profiles</li>
-                <li>Enable AI agent for autonomous thermal management</li>
+                <li>{t("calibration.nextStep1")}</li>
+                <li>{t("calibration.nextStep2")}</li>
+                <li>{t("calibration.nextStep3")}</li>
               </ul>
             </div>
             <button style={styles.primaryButton} onClick={() => setStep("detect")}>
-              Done
+              {t("calibration.doneButton")}
             </button>
           </div>
         )}

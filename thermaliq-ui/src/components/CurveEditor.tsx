@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { useTranslation } from "react-i18next";
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 
 interface Breakpoint {
@@ -10,6 +11,7 @@ interface Breakpoint {
 const API_BASE = "http://127.0.0.1:7272";
 
 export default function CurveEditor() {
+  const { t } = useTranslation();
   const [aiInput, setAiInput] = useState("");
   const [breakpoints, setBreakpoints] = useState<Breakpoint[]>([
     { id: "1", temp: 30, duty: 20 },
@@ -179,8 +181,8 @@ export default function CurveEditor() {
   return (
     <div style={styles.container}>
       <div style={styles.header}>
-        <h1 style={styles.title}>Curve Editor</h1>
-        <p style={styles.subtitle}>Drag points on the chart or edit the table below. Use AI to generate curves automatically.</p>
+        <h1 style={styles.title}>{t("curveEditor.title")}</h1>
+        <p style={styles.subtitle}>{t("curveEditor.subtitle")}</p>
       </div>
 
       {error && <div style={styles.errorBox}>{error}</div>}
@@ -189,26 +191,26 @@ export default function CurveEditor() {
       {/* Profile & Fan Selection */}
       <div style={{...styles.section, ...styles.sectionCard}}>
         <div style={styles.cardAccentBar} />
-        <h2 style={styles.sectionTitle}>Curve Settings</h2>
+        <h2 style={styles.sectionTitle}>{t("curveEditor.settings")}</h2>
         <div style={styles.settingRow}>
           <div style={styles.settingGroup}>
-            <label style={styles.label}>Profile Name</label>
+            <label style={styles.label}>{t("curveEditor.profileName")}</label>
             <input
               type="text"
               style={styles.input}
               value={profileName}
               onChange={(e) => setProfileName(e.target.value)}
-              placeholder="e.g., balanced, performance"
+              placeholder={t("curveEditor.profilePlaceholder")}
             />
           </div>
           <div style={styles.settingGroup}>
-            <label style={styles.label}>Fan ID</label>
+            <label style={styles.label}>{t("curveEditor.fanId")}</label>
             <input
               type="text"
               style={styles.input}
               value={fanId}
               onChange={(e) => setFanId(e.target.value)}
-              placeholder="e.g., cpu_fan, gpu_fan"
+              placeholder={t("curveEditor.fanIdPlaceholder")}
             />
           </div>
         </div>
@@ -217,12 +219,12 @@ export default function CurveEditor() {
       {/* AI Describe Input */}
       <div style={{...styles.section, ...styles.sectionCard}}>
         <div style={styles.cardAccentBar} />
-        <h2 style={styles.sectionTitle}>AI Curve Generation</h2>
+        <h2 style={styles.sectionTitle}>{t("curveEditor.aiGeneration")}</h2>
         <div style={styles.aiInputGroup}>
           <input
             type="text"
             style={styles.aiInput}
-            placeholder="Describe what you want: e.g., 'aggressive cooling' or 'silent mode'"
+            placeholder={t("curveEditor.aiPrompt")}
             value={aiInput}
             onChange={(e) => setAiInput(e.target.value)}
             onKeyPress={(e) => e.key === "Enter" && handleAiDescribe()}
@@ -236,7 +238,7 @@ export default function CurveEditor() {
             onClick={handleAiDescribe}
             disabled={aiLoading}
           >
-            {aiLoading ? "Generating..." : "Generate"}
+            {aiLoading ? t("curveEditor.generating") : t("curveEditor.generate")}
           </button>
         </div>
       </div>
@@ -244,18 +246,18 @@ export default function CurveEditor() {
       {/* Chart */}
       <div style={{...styles.section, ...styles.sectionCard}}>
         <div style={styles.cardAccentBar} />
-        <h2 style={styles.sectionTitle}>Fan Curve</h2>
+        <h2 style={styles.sectionTitle}>{t("curveEditor.fanCurve")}</h2>
         <div style={styles.chartContainer}>
           <ResponsiveContainer width="100%" height={300}>
             <LineChart data={chartData}>
               <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
               <XAxis
                 dataKey="temp"
-                label={{ value: "Temperature (°C)", position: "insideBottomRight", offset: -5 }}
+                label={{ value: t("curveEditor.temperature"), position: "insideBottomRight", offset: -5 }}
                 stroke="var(--text-muted)"
               />
               <YAxis
-                label={{ value: "Fan Duty (%)", angle: -90, position: "insideLeft" }}
+                label={{ value: t("curveEditor.fanDuty"), angle: -90, position: "insideLeft" }}
                 domain={[0, 100]}
                 stroke="var(--text-muted)"
               />
@@ -277,21 +279,21 @@ export default function CurveEditor() {
               />
             </LineChart>
           </ResponsiveContainer>
-          <p style={styles.chartHint}>Click on the chart to add new points</p>
+          <p style={styles.chartHint}>{t("curveEditor.chartHint")}</p>
         </div>
       </div>
 
       {/* Breakpoint Table */}
       <div style={{...styles.section, ...styles.sectionCard}}>
         <div style={styles.cardAccentBar} />
-        <h2 style={styles.sectionTitle}>Breakpoints</h2>
+        <h2 style={styles.sectionTitle}>{t("curveEditor.breakpoints")}</h2>
         <div style={styles.tableContainer}>
           <table style={styles.table}>
             <thead>
               <tr>
-                <th style={styles.th}>Temperature (°C)</th>
-                <th style={styles.th}>Fan Duty (%)</th>
-                <th style={styles.th}>Action</th>
+                <th style={styles.th}>{t("curveEditor.temperature")}</th>
+                <th style={styles.th}>{t("curveEditor.fanDuty")}</th>
+                <th style={styles.th}>{t("curveEditor.action")}</th>
               </tr>
             </thead>
             <tbody>
@@ -340,10 +342,10 @@ export default function CurveEditor() {
                       ) : (
                         <>
                           <button style={styles.actionButton} onClick={() => handleEditStart(bp)}>
-                            Edit
+                            {t("curveEditor.edit")}
                           </button>
                           <button style={{ ...styles.actionButton, color: "var(--red)" }} onClick={() => handleDelete(bp.id)}>
-                            Delete
+                            {t("curveEditor.delete")}
                           </button>
                         </>
                       )}
@@ -365,7 +367,7 @@ export default function CurveEditor() {
           onClick={handleSave}
           disabled={saving}
         >
-          {saving ? "Saving..." : "Save Curve"}
+          {saving ? t("curveEditor.saving") : t("curveEditor.saveCurve")}
         </button>
       </div>
     </div>

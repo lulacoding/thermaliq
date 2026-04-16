@@ -249,36 +249,90 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Required for git-cliff to access full history
+
+      - name: Generate CHANGELOG with git-cliff
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --verbose
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts/
 
+      - name: Generate winget manifest
+        run: |
+          # Extract version from tag (strip 'v' prefix)
+          VERSION=${{ github.ref_name }}
+          VERSION=${VERSION#v}
+
+          # Create new winget manifest directory
+          WINGET_DIR="packaging/winget/manifests/t/thermaliq/ThermalIQ/$VERSION"
+          mkdir -p "$WINGET_DIR"
+
+          # Copy and update manifest files from 0.3.0 template
+          for file in packaging/winget/manifests/t/thermaliq/ThermalIQ/0.3.0/*; do
+            filename=$(basename "$file")
+            sed "s/0\.3\.0/$VERSION/g" "$file" > "$WINGET_DIR/$filename"
+          done
+
+          # Find the NSIS installer in artifacts
+          NSIS_FILE=$(find artifacts -name "*_x64-setup.exe" -type f | head -1)
+          if [ -z "$NSIS_FILE" ]; then
+            echo "Warning: NSIS installer not found, using placeholder SHA256"
+            SHA256="0000000000000000000000000000000000000000000000000000000000000000"
+          else
+            SHA256=$(sha256sum "$NSIS_FILE" | awk '{print $1}')
+          fi
+
+          # Update installer SHA256 and URL
+          INSTALLER_YAML="$WINGET_DIR/thermaliq.ThermalIQ.installer.yaml"
+          sed -i "s/InstallerSha256: .*/InstallerSha256: $SHA256/" "$INSTALLER_YAML"
+          sed -i "s|InstallerUrl: .*|InstallerUrl: https://github.com/lulacoding/thermaliq/releases/download/v$VERSION/ThermalIQ_${VERSION}_x64-setup.exe|" "$INSTALLER_YAML"
+
+          # Upload manifests as artifact for manual submission to winget-pkgs
+          tar czf winget-manifests-$VERSION.tar.gz -C packaging/winget/manifests t/
+          echo "Winget manifests generated for version $VERSION"
+
+      - name: Read CHANGELOG for release body
+        id: changelog
+        run: |
+          # Extract the first release section (up to next ## or end of file)
+          sed -n '/^## \[/,/^## \[/p' CHANGELOG.md | head -n -1 > /tmp/release_notes.md
+          # Append installation instructions
+          cat >> /tmp/release_notes.md << 'EOF'
+
+## Installation
+
+**Windows**
+```powershell
+winget install thermaliq.ThermalIQ
+```
+Or download the NSIS installer below.
+
+**macOS**
+```bash
+brew tap thermaliq/tap && brew install thermaliq
+```
+Or download the DMG below.
+
+**Linux**
+```bash
+curl -fsSL https://thermaliq.dev/install.sh | sh
+```
+EOF
+          # Store the result in an environment variable for use in the release
+          BODY=$(cat /tmp/release_notes.md)
+          echo "body<<EOF" >> $GITHUB_OUTPUT
+          echo "$BODY" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
       - name: Create draft release
         uses: softprops/action-gh-release@v2
         with:
           draft: true
-          generate_release_notes: true
           files: artifacts/**/*
-          body: |
-            ## Installation
-
-            **Windows**
-            ```powershell
-            winget install thermaliq.ThermalIQ
-            ```
-            Or download the NSIS installer below.
-
-            **macOS**
-            ```bash
-            brew tap thermaliq/tap && brew install thermaliq
-            ```
-            Or download the DMG below.
-
-            **Linux**
-            ```bash
-            curl -fsSL https://thermaliq.dev/install.sh | sh
-            ```
-
-            See [CHANGELOG.md](CHANGELOG.md) for full release notes.
+          body: ${{ steps.changelog.outputs.body }}

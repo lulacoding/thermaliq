@@ -41,4 +41,10 @@ pub struct SetFanDuty {
     /// Linux: writes `pwm1_enable=2` instead of `1`. Ignored on other platforms.
     #[serde(default)]
     pub dc_mode: bool,
+    /// Minimum duty to start the fan (0–100). Linux: written to gpu_od/fan_ctrl/fan_start_speed.
+    #[serde(default)]
+    pub start_percent: Option<u8>,
+    /// Temperature threshold for 0-RPM stop mode (°C). Linux: written to gpu_od/fan_ctrl/fan_zero_rpm_stop_temperature.
+    #[serde(default)]
+    pub stop_percent: Option<u8>,
 }

@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { useTranslation } from "react-i18next";
 
 interface Settings {
   provider: string;
@@ -15,6 +16,7 @@ interface Settings {
 const API_BASE = "http://127.0.0.1:7272";
 
 export default function SettingsPanel() {
+  const { t } = useTranslation();
   const [settings, setSettings] = useState<Settings>({
     provider: "anthropic",
     api_key: "",
@@ -220,8 +222,8 @@ export default function SettingsPanel() {
   return (
     <div style={styles.container}>
       <div style={styles.header}>
-        <h1 style={styles.title}>Settings</h1>
-        <p style={styles.subtitle}>Configure API keys, trust levels, and safety guardrails</p>
+        <h1 style={styles.title}>{t("settings.title")}</h1>
+        <p style={styles.subtitle}>{t("settings.subtitle")}</p>
       </div>
 
       {error && <div style={styles.errorBox}>{error}</div>}
@@ -229,35 +231,35 @@ export default function SettingsPanel() {
 
       <div style={{...styles.section, ...styles.sectionCard}}>
         <div style={styles.cardAccentBar} />
-        <h2 style={styles.sectionTitle}>AI Provider</h2>
+        <h2 style={styles.sectionTitle}>{t("settings.aiProvider")}</h2>
         <div style={styles.settingGroup}>
-          <label style={styles.label}>API Provider</label>
+          <label style={styles.label}>{t("settings.providerLabel")}</label>
           <select
             style={styles.select}
             value={settings.provider}
             onChange={handleProviderChange}
             disabled={loading}
           >
-            <option value="anthropic">Anthropic (Claude)</option>
-            <option value="openai">OpenAI</option>
-            <option value="gemini">Google Gemini</option>
-            <option value="ollama">Ollama (Local)</option>
-            <option value="openrouter">OpenRouter</option>
+            <option value="anthropic">{t("settings.providerAnthropic")}</option>
+            <option value="openai">{t("settings.providerOpenAI")}</option>
+            <option value="gemini">{t("settings.providerGemini")}</option>
+            <option value="ollama">{t("settings.providerOllama")}</option>
+            <option value="openrouter">{t("settings.providerOpenRouter")}</option>
           </select>
         </div>
         {settings.provider !== "ollama" && (
           <div style={styles.settingGroup}>
-            <label style={styles.label}>API Key</label>
+            <label style={styles.label}>{t("settings.apiKeyLabel")}</label>
             <input
               type="password"
               style={styles.input}
-              placeholder="Enter your API key"
+              placeholder={t("settings.apiKeyPlaceholder")}
               value={settings.api_key}
               onChange={handleApiKeyChange}
               disabled={loading}
             />
             {!settings.api_key && settings.provider !== "ollama" && (
-              <p style={styles.helperText}>API key required for this provider</p>
+              <p style={styles.helperText}>{t("settings.apiKeyRequired")}</p>
             )}
           </div>
         )}
@@ -265,27 +267,27 @@ export default function SettingsPanel() {
 
       <div style={{...styles.section, ...styles.sectionCard}}>
         <div style={{...styles.cardAccentBar, background: "var(--secondary)"}} />
-        <h2 style={styles.sectionTitle}>Trust Level</h2>
+        <h2 style={styles.sectionTitle}>{t("settings.trustLevel")}</h2>
         <div style={styles.settingGroup}>
-          <label style={styles.label}>Agent Autonomy</label>
+          <label style={styles.label}>{t("settings.agentAutonomy")}</label>
           <select
             style={styles.select}
             value={settings.trust_level}
             onChange={handleTrustLevelChange}
             disabled={loading}
           >
-            <option value="passive">Passive (monitoring only)</option>
-            <option value="approval">Approval Required (AI proposes, you approve)</option>
-            <option value="autonomous">Full Auto (AI makes all decisions)</option>
+            <option value="passive">{t("settings.trustPassive")}</option>
+            <option value="approval">{t("settings.trustApproval")}</option>
+            <option value="autonomous">{t("settings.trustAutonomous")}</option>
           </select>
         </div>
       </div>
 
       <div style={{...styles.section, ...styles.sectionCard}}>
         <div style={styles.cardAccentBar} />
-        <h2 style={styles.sectionTitle}>Safety Guardrails</h2>
+        <h2 style={styles.sectionTitle}>{t("settings.guardrails")}</h2>
         <div style={styles.settingGroup}>
-          <label style={styles.label}>Minimum Fan Duty (%)</label>
+          <label style={styles.label}>{t("settings.minFanDuty")}</label>
           <input
             type="number"
             style={styles.input}
@@ -297,10 +299,10 @@ export default function SettingsPanel() {
             }
             disabled={loading}
           />
-          <p style={styles.helperText}>Fans will never go below this duty cycle</p>
+          <p style={styles.helperText}>{t("settings.minFanDutyHelper")}</p>
         </div>
         <div style={styles.settingGroup}>
-          <label style={styles.label}>Thermal Kill-Switch (°C)</label>
+          <label style={styles.label}>{t("settings.killSwitch")}</label>
           <input
             type="number"
             style={styles.input}
@@ -312,10 +314,10 @@ export default function SettingsPanel() {
             }
             disabled={loading}
           />
-          <p style={styles.helperText}>Emergency: all fans to 100% if any sensor exceeds this</p>
+          <p style={styles.helperText}>{t("settings.killSwitchHelper")}</p>
         </div>
         <div style={styles.settingGroup}>
-          <label style={styles.label}>Curve Change Cooldown (seconds)</label>
+          <label style={styles.label}>{t("settings.changeCooldown")}</label>
           <input
             type="number"
             style={styles.input}
@@ -327,13 +329,13 @@ export default function SettingsPanel() {
             }
             disabled={loading}
           />
-          <p style={styles.helperText}>Minimum time between profile/curve changes</p>
+          <p style={styles.helperText}>{t("settings.changeCooldownHelper")}</p>
         </div>
       </div>
 
       <div style={{...styles.section, ...styles.sectionCard}}>
         <div style={styles.cardAccentBar} />
-        <h2 style={styles.sectionTitle}>General</h2>
+        <h2 style={styles.sectionTitle}>{t("settings.general")}</h2>
         <div style={styles.checkboxGroup}>
           <input
             type="checkbox"
@@ -343,7 +345,7 @@ export default function SettingsPanel() {
             disabled={loading}
           />
           <label htmlFor="telemetry" style={styles.checkboxLabel}>
-            Send telemetry (helps improve AI recommendations)
+            {t("settings.telemetryLabel")}
           </label>
         </div>
       </div>
@@ -356,7 +358,7 @@ export default function SettingsPanel() {
         onClick={handleSave}
         disabled={saving || loading}
       >
-        {saving ? "Saving..." : "Save Settings"}
+        {saving ? t("settings.saving") : t("settings.saveButton")}
       </button>
     </div>
   );

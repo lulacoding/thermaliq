@@ -25,11 +25,20 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
-        .invoke_handler(tauri::generate_handler![send_notification])
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .invoke_handler(tauri::generate_handler![send_notification, check_for_updates])
         .setup(|app| {
             let state = Arc::new(Mutex::new(TrayState::default()));
             setup_tray(app, Arc::clone(&state))?;
             start_daemon_poller(app.handle().clone(), state);
+
+            // Check for updates on app start (non-blocking)
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(2)).await; // Wait for UI to be ready
+                let _ = check_for_updates_internal(&app_handle).await;
+            });
+
             Ok(())
         })
         .run(tauri::generate_context!())
@@ -283,4 +292,23 @@ fn toggle_agent(token: String) {
             }
         }
     });
+}
+
+// ── Auto-updater ──────────────────────────────────────────────────────────────
+
+#[tauri::command]
+async fn check_for_updates(app: tauri::AppHandle) -> Result<bool, String> {
+    check_for_updates_internal(&app).await
+}
+
+async fn check_for_updates_internal(app: &tauri::AppHandle) -> Result<bool, String> {
+    if let Ok(update) = app.updater().check().await {
+        if update.is_update_available() {
+            tracing::info!("Update available: {}", update.latest_version());
+            // The updater plugin automatically shows a dialog if configured with "dialog": true
+            let _ = update.download_and_install().await;
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }

@@ -184,6 +184,8 @@ pub fn start_agent_loop(
                             fan_id: fan.id.clone(),
                             duty_percent: 100,
                             dc_mode: false,
+                            start_percent: None,
+                            stop_percent: None,
                         })
                         .await;
                 }

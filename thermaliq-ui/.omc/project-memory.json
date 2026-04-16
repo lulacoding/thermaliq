@@ -116,6 +116,24 @@
   },
   "hotPaths": [
     {
+      "path": "src/components/CurveEditor.tsx",
+      "accessCount": 23,
+      "lastAccessed": 1776306838866,
+      "type": "file"
+    },
+    {
+      "path": "src/components/SettingsPanel.tsx",
+      "accessCount": 20,
+      "lastAccessed": 1776292218365,
+      "type": "file"
+    },
+    {
+      "path": "src/components/CalibrationWizard.tsx",
+      "accessCount": 15,
+      "lastAccessed": 1776292187646,
+      "type": "file"
+    },
+    {
       "path": "src/App.tsx",
       "accessCount": 14,
       "lastAccessed": 1776259992880,
@@ -134,27 +152,15 @@
       "type": "file"
     },
     {
-      "path": "src/components/SettingsPanel.tsx",
-      "accessCount": 12,
-      "lastAccessed": 1776260590012,
-      "type": "file"
-    },
-    {
-      "path": "src/components/CurveEditor.tsx",
-      "accessCount": 11,
-      "lastAccessed": 1776258620394,
+      "path": "src/components/ProfileManager.tsx",
+      "accessCount": 9,
+      "lastAccessed": 1776292160844,
       "type": "file"
     },
     {
       "path": "src/components/HardwareDetect.tsx",
       "accessCount": 7,
       "lastAccessed": 1776255829186,
-      "type": "file"
-    },
-    {
-      "path": "src/components/CalibrationWizard.tsx",
-      "accessCount": 7,
-      "lastAccessed": 1776259237127,
       "type": "file"
     },
     {
@@ -170,6 +176,12 @@
       "type": "file"
     },
     {
+      "path": "src/locales/en.json",
+      "accessCount": 5,
+      "lastAccessed": 1776292394906,
+      "type": "file"
+    },
+    {
       "path": "src/hooks/useNotifications.ts",
       "accessCount": 4,
       "lastAccessed": 1776262137799,
@@ -179,12 +191,6 @@
       "path": "src/hooks/useDaemon.ts",
       "accessCount": 4,
       "lastAccessed": 1776262148593,
-      "type": "file"
-    },
-    {
-      "path": "src/components/ProfileManager.tsx",
-      "accessCount": 3,
-      "lastAccessed": 1776255841170,
       "type": "file"
     },
     {
