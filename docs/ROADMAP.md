@@ -1,13 +1,20 @@
 # ThermalIQ — Complete Product Roadmap
 
-Last updated: 2026-04-15 | Status: UI design complete; Windows HAL next
+Last updated: 2026-04-16 | Status: Phase 2 Platform Hardening complete; Windows HAL in progress
 
 ---
 
-## Current Focus: Phase 1 — Windows HAL
+## Current Focus: Phase 2 — Platform Hardening `[COMPLETE]` | Phase 1 — Windows HAL `[IN PROGRESS]`
 
-**UI Status:** ✓ COMPLETE — Stitch "Hard-State Command Center" design system fully applied to all 6 UI components (Dashboard, SettingsPanel, CurveEditor, CalibrationWizard, HardwareDetect, ProfileManager, AgentPanel).
+**Week 4 Platform Hardening:** ✓ COMPLETE — All 6 tasks done:
+1. ✅ Agent pause/resume routes (`/api/agent/paused`, `/api/agent/running`)
+2. ✅ HWiNFO64 status banner in HardwareDetect UI
+3. ✅ SetFanDuty extended with `start_percent`/`stop_percent` DC mode
+4. ✅ Custom sensor evaluation (TimeAverage, Mix, File, Offset)
+5. ✅ macOS SMJobBless plists (Info.plist, launchd config)
+6. ✅ Full i18n migration (5 components, 100+ translation keys)
 
+**Phase 1 Windows HAL:** In progress
 **Immediate next task:** Build `thermaliq-hal/src/windows.rs` with HWiNFO64 shared memory reader + NVML GPU fan control.
 
 **Windows HAL decision:** HWiNFO64 shared memory (`Global\HWiNFO_SENS_SM2`) is the chosen primary backend.
@@ -41,7 +48,7 @@ Last updated: 2026-04-15 | Status: UI design complete; Windows HAL next
 
 ---
 
-## Phase 1 — Windows `[CURRENT]`
+## Phase 1 — Windows `[IN PROGRESS]`
 
 **Goal:** Full Windows support. Thermals readable, fans controllable, native `.exe` ships.
 
@@ -100,7 +107,7 @@ Last updated: 2026-04-15 | Status: UI design complete; Windows HAL next
 
 ---
 
-## Phase 2 — Platform Hardening `[v0.3]`
+## Phase 2 — Platform Hardening `[COMPLETE]`
 
 **Goal:** All three platforms fully functional. macOS fan writes. Linux GPU coverage.
 
