@@ -1277,27 +1277,30 @@ mod tests {
     mod mock_hwinfo {
         use super::*;
 
-        /// Return a byte buffer containing a valid HwinfoHeader.
-        fn valid_header_bytes() -> Vec<u8> {
-            let hdr_size = std::mem::size_of::<HwinfoHeader>();
-            let mut buf = vec![0u8; hdr_size];
-            buf[0..4].copy_from_slice(&HWINFO_SIGNATURE.to_le_bytes());
-            buf[4..8].copy_from_slice(&2u32.to_le_bytes()); // version = 2
-            buf[8..12].copy_from_slice(&0u32.to_le_bytes()); // revision = 0
-            buf[12..20].copy_from_slice(&1000i64.to_le_bytes()); // poll_time_ms non-zero
-            buf[20..24].copy_from_slice(&(hdr_size as u32).to_le_bytes()); // sensor_section_offset
-            buf[24..28].copy_from_slice(&264u32.to_le_bytes()); // sensor_element_size
-            buf[28..32].copy_from_slice(&0u32.to_le_bytes()); // sensor_element_count
-            buf[32..36].copy_from_slice(&(hdr_size as u32).to_le_bytes()); // reading_section_offset
-            buf[36..40].copy_from_slice(&296u32.to_le_bytes()); // reading_element_size
-            buf[40..44].copy_from_slice(&0u32.to_le_bytes()); // reading_element_count
-            buf
+        /// Build a valid HwinfoHeader via struct literal.
+        /// Constructing via the struct itself (rather than hardcoded byte
+        /// offsets) is robust to ABI padding — the `i64` after three `u32`s
+        /// introduces 4 bytes of alignment padding on MSVC x86_64, which
+        /// invalidated an earlier byte-offset implementation on Windows CI.
+        fn valid_header() -> HwinfoHeader {
+            let hdr_size = std::mem::size_of::<HwinfoHeader>() as u32;
+            HwinfoHeader {
+                signature: HWINFO_SIGNATURE,
+                version: 2,
+                revision: 0,
+                poll_time_ms: 1000,
+                sensor_section_offset: hdr_size,
+                sensor_element_size: 264,
+                sensor_element_count: 0,
+                reading_section_offset: hdr_size,
+                reading_element_size: 296,
+                reading_element_count: 0,
+            }
         }
 
         #[test]
         fn valid_header_passes_all_checks() {
-            let buf = valid_header_bytes();
-            let h = unsafe { &*(buf.as_ptr() as *const HwinfoHeader) };
+            let h = valid_header();
             assert_eq!(h.signature, HWINFO_SIGNATURE);
             assert!(h.version >= HWINFO_MIN_VERSION && h.version <= HWINFO_MAX_VERSION);
             assert!(h.revision <= HWINFO_MAX_REVISION);
@@ -1310,57 +1313,64 @@ mod tests {
 
         #[test]
         fn bad_signature_detected() {
-            let mut buf = valid_header_bytes();
-            buf[0..4].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
-            let h = unsafe { &*(buf.as_ptr() as *const HwinfoHeader) };
+            let h = HwinfoHeader {
+                signature: 0xDEAD_BEEF,
+                ..valid_header()
+            };
             assert_ne!(h.signature, HWINFO_SIGNATURE);
         }
 
         #[test]
         fn version_zero_is_unsupported() {
-            let mut buf = valid_header_bytes();
-            buf[4..8].copy_from_slice(&0u32.to_le_bytes());
-            let h = unsafe { &*(buf.as_ptr() as *const HwinfoHeader) };
+            let h = HwinfoHeader {
+                version: 0,
+                ..valid_header()
+            };
             assert!(h.version < HWINFO_MIN_VERSION);
         }
 
         #[test]
         fn version_too_high_is_unsupported() {
-            let mut buf = valid_header_bytes();
-            buf[4..8].copy_from_slice(&99u32.to_le_bytes());
-            let h = unsafe { &*(buf.as_ptr() as *const HwinfoHeader) };
+            let h = HwinfoHeader {
+                version: 99,
+                ..valid_header()
+            };
             assert!(h.version > HWINFO_MAX_VERSION);
         }
 
         #[test]
         fn revision_too_high_is_rejected() {
-            let mut buf = valid_header_bytes();
-            buf[8..12].copy_from_slice(&100u32.to_le_bytes());
-            let h = unsafe { &*(buf.as_ptr() as *const HwinfoHeader) };
+            let h = HwinfoHeader {
+                revision: 100,
+                ..valid_header()
+            };
             assert!(h.revision > HWINFO_MAX_REVISION);
         }
 
         #[test]
         fn stale_poll_time_detected() {
-            let mut buf = valid_header_bytes();
-            buf[12..20].copy_from_slice(&0i64.to_le_bytes());
-            let h = unsafe { &*(buf.as_ptr() as *const HwinfoHeader) };
+            let h = HwinfoHeader {
+                poll_time_ms: 0,
+                ..valid_header()
+            };
             assert_eq!(h.poll_time_ms, 0);
         }
 
         #[test]
         fn element_size_zero_is_invalid() {
-            let mut buf = valid_header_bytes();
-            buf[24..28].copy_from_slice(&0u32.to_le_bytes());
-            let h = unsafe { &*(buf.as_ptr() as *const HwinfoHeader) };
+            let h = HwinfoHeader {
+                sensor_element_size: 0,
+                ..valid_header()
+            };
             assert!(h.sensor_element_size < HWINFO_MIN_ELEMENT_SIZE);
         }
 
         #[test]
         fn element_count_overflow_detected() {
-            let mut buf = valid_header_bytes();
-            buf[40..44].copy_from_slice(&99_999u32.to_le_bytes());
-            let h = unsafe { &*(buf.as_ptr() as *const HwinfoHeader) };
+            let h = HwinfoHeader {
+                reading_element_count: 99_999,
+                ..valid_header()
+            };
             assert!(h.reading_element_count > HWINFO_MAX_ELEMENT_COUNT);
         }
 
