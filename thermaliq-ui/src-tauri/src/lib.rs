@@ -6,6 +6,7 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Manager,
 };
+use tauri_plugin_notification::NotificationExt;
 
 const API_BASE: &str = "http://127.0.0.1:7272";
 const TRAY_ID: &str = "thermaliq-tray";
@@ -26,8 +27,20 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .invoke_handler(tauri::generate_handler![send_notification, check_for_updates])
+        .invoke_handler(tauri::generate_handler![
+            send_notification,
+            check_for_updates
+        ])
         .setup(|app| {
+            // On Windows, request notification permission on first launch.
+            // This is a no-op on macOS/Linux where permission is implicit.
+            #[cfg(target_os = "windows")]
+            {
+                if let Err(e) = app.notification().request_permission() {
+                    tracing::warn!(error = %e, "Failed to request notification permission");
+                }
+            }
+
             let state = Arc::new(Mutex::new(TrayState::default()));
             setup_tray(app, Arc::clone(&state))?;
             start_daemon_poller(app.handle().clone(), state);
@@ -45,18 +58,29 @@ pub fn run() {
         .expect("error while running ThermalIQ application");
 }
 
+/// Send a native OS toast notification via the Tauri notification plugin.
+/// On Windows this produces a proper Action Center toast (WinRT).
+/// On macOS/Linux the plugin handles the platform-native path.
 #[tauri::command]
-fn send_notification(title: String, body: String) {
+fn send_notification(app: AppHandle, title: String, body: String) {
     tracing::info!(title = %title, body = %body, "Sending notification");
-    // Notification is sent via Tauri's native Windows toast API on Windows
-    // On other platforms, it falls back gracefully
+    if let Err(e) = app
+        .notification()
+        .builder()
+        .title(&title)
+        .body(&body)
+        .show()
+    {
+        tracing::warn!(error = %e, "Failed to send notification");
+    }
 }
 
 // ── Tray setup ────────────────────────────────────────────────────────────────
 
 fn setup_tray(app: &mut tauri::App, state: Arc<Mutex<TrayState>>) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "Show ThermalIQ", true, None::<&str>)?;
-    let agent_toggle = MenuItem::with_id(app, "agent_toggle", "⏸ Pause AI Agent", true, None::<&str>)?;
+    let agent_toggle =
+        MenuItem::with_id(app, "agent_toggle", "⏸ Pause AI Agent", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &agent_toggle, &sep, &quit])?;
@@ -64,9 +88,11 @@ fn setup_tray(app: &mut tauri::App, state: Arc<Mutex<TrayState>>) -> tauri::Resu
     let state_clone = Arc::clone(&state);
 
     let _tray = TrayIconBuilder::with_id(TRAY_ID)
-        .icon(app.default_window_icon().cloned().unwrap_or_else(|| {
-            tauri::image::Image::new(&[0, 0, 0, 255], 1, 1)
-        }))
+        .icon(
+            app.default_window_icon()
+                .cloned()
+                .unwrap_or_else(|| tauri::image::Image::new(&[0, 0, 0, 255], 1, 1)),
+        )
         .tooltip("ThermalIQ")
         .menu(&menu)
         .on_menu_event(move |app, event| {
@@ -150,7 +176,11 @@ fn read_api_token() -> String {
 
 fn fetch_daemon_state(token: &str) -> (Vec<String>, String, String) {
     if token.is_empty() {
-        return (Vec::new(), String::new(), "Daemon not connected".to_string());
+        return (
+            Vec::new(),
+            String::new(),
+            "Daemon not connected".to_string(),
+        );
     }
 
     // Fetch profile list
@@ -198,7 +228,9 @@ fn rebuild_tray_menu(
     agent_status: &str,
     token: &str,
 ) {
-    let Some(tray) = app.tray_by_id(TRAY_ID) else { return };
+    let Some(tray) = app.tray_by_id(TRAY_ID) else {
+        return;
+    };
 
     // Update tooltip
     let _ = tray.set_tooltip(Some(&format!("ThermalIQ — {agent_status}")));
@@ -215,7 +247,8 @@ fn rebuild_tray_menu(
         )?;
         let sep1 = PredefinedMenuItem::separator(app)?;
 
-        let mut items: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = vec![&show, &sep1, &status_item];
+        let mut items: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> =
+            vec![&show, &sep1, &status_item];
 
         // Profile items — only show if daemon is online and has profiles
         let profile_items: Vec<MenuItem<tauri::Wry>>;
@@ -264,7 +297,9 @@ fn apply_profile(profile_name: String, token: String) {
             .call();
         match result {
             Ok(_) => tracing::info!(profile = %profile_name, "tray: profile applied"),
-            Err(e) => tracing::warn!(profile = %profile_name, error = %e, "tray: profile apply failed"),
+            Err(e) => {
+                tracing::warn!(profile = %profile_name, error = %e, "tray: profile apply failed")
+            }
         }
     });
 }
@@ -280,7 +315,11 @@ fn toggle_agent(token: String) {
 
         if let Some(status) = status_result {
             let current_state = status["state"].as_str().unwrap_or("unknown");
-            let new_state = if current_state == "running" { "paused" } else { "running" };
+            let new_state = if current_state == "running" {
+                "paused"
+            } else {
+                "running"
+            };
 
             // POST to toggle agent state
             let result = ureq::post(&format!("{API_BASE}/api/agent/{new_state}"))
