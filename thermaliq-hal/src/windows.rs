@@ -299,6 +299,10 @@ struct HwinfoMapping {
 // SAFETY: The view pointer is valid for the lifetime of the mapping and we
 // only ever read it from within spawn_blocking (single OS thread at a time).
 unsafe impl Send for HwinfoMapping {}
+// SAFETY: All access is serialized through `Mutex<Option<HwinfoMapping>>` in
+// `WindowsHardwareLayer`, so concurrent reads of `view` never occur. Required
+// for `HardwareLayer: Send + Sync` trait bound.
+unsafe impl Sync for HwinfoMapping {}
 
 impl HwinfoMapping {
     fn open() -> std::result::Result<Self, HwinfoError> {
@@ -706,12 +710,10 @@ fn nvml_fans() -> Vec<FanReading> {
         };
         let num_fans = device.num_fans().unwrap_or(1);
         for fan_idx in 0..num_fans {
-            let rpm = device
-                .fan_speed(fan_idx)
-                // NVML returns 0-100 for fan_speed but rpm is separate
-                .map(|_| 0u32)
-                .unwrap_or(0);
+            // NVML's `fan_speed` returns 0-100 (duty %), not RPM. The library
+            // does not expose fan RPM directly on Windows; leave as 0.
             let duty = device.fan_speed(fan_idx).unwrap_or(0) as u8;
+            let rpm = 0u32;
             fans.push(FanReading {
                 id: format!("nvml_gpu{gpu_idx}_fan{fan_idx}"),
                 label: format!(
@@ -737,7 +739,7 @@ fn nvml_set_fan(fan_id: &str, duty_percent: u8) -> Result<()> {
         .next()
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| anyhow!("invalid nvml fan id: {fan_id}"))?;
-    let _fan_idx: u32 = parts
+    let fan_idx: u32 = parts
         .next()
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| anyhow!("invalid nvml fan id: {fan_id}"))?;
@@ -782,9 +784,10 @@ fn nvml_set_fan(fan_id: &str, duty_percent: u8) -> Result<()> {
             bail!("nvmlDeviceGetHandleByIndex failed for GPU {gpu_idx}");
         }
 
-        // Set fan speed: policy=1 (manual), speed=0-100
+        // Set fan speed: policy=1 (manual), speed=0-100. `fan_idx` targets the
+        // specific fan on multi-fan cards (e.g. RTX 4090 has 3).
         let speed = (duty_percent as u32).clamp(0, 100);
-        let ret = fan_set(device, 0, 1, speed);
+        let ret = fan_set(device, fan_idx, 1, speed);
         shutdown();
 
         if ret != NVML_OK {
@@ -824,8 +827,21 @@ type AdlContextHandle = *mut std::ffi::c_void;
 
 /// ADL_MAIN_MALLOC_CALLBACK — ADL allocates strings/buffers through this.
 /// Using Rust's global allocator is safe on Windows MSVC (both use the CRT heap).
+///
+/// KNOWN LEAK: `ADL2_Main_Control_Create` accepts only a malloc callback, not
+/// a free callback. ADL-internal string allocations (driver names, etc.) made
+/// via this function are never freed by us. Since `adl_fans`/`adl_set_fan` are
+/// called at most every few seconds and each call yields only a handful of
+/// small (< 1 KB) allocations, the steady-state leak is negligible. A proper
+/// fix would require tracking allocations in a static `HashMap` keyed by
+/// pointer — deferred as out-of-scope for v1.0.
 unsafe extern "C" fn adl_alloc(size: i32) -> *mut std::ffi::c_void {
-    let layout = alloc::Layout::from_size_align_unchecked(size as usize, 8);
+    if size <= 0 {
+        return std::ptr::null_mut();
+    }
+    let Ok(layout) = alloc::Layout::from_size_align(size as usize, 8) else {
+        return std::ptr::null_mut();
+    };
     alloc::alloc(layout) as *mut std::ffi::c_void
 }
 
@@ -950,8 +966,11 @@ fn adl_fans() -> Vec<FanReading> {
             }
         }
 
-        alloc::dealloc(info_ptr as *mut u8, layout);
+        // Destroy the ADL context BEFORE freeing the adapter info buffer:
+        // `destroy` may dereference adapter pointers registered during
+        // `get_info`; freeing the buffer first would be a use-after-free.
         destroy(ctx);
+        alloc::dealloc(info_ptr as *mut u8, layout);
         fans
     }
 }
