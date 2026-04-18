@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"cd thermaliq-ui && npm run build 2>&1 | tail -20\"}",
+  "error": "Exit code 1\n(eval):cd:1: no such file or directory: thermaliq-ui",
+  "timestamp": "2026-04-15T14:01:55.436Z",
+  "retry_count": 1
+}

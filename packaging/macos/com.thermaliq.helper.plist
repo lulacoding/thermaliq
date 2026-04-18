@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.thermaliq.helper</string>
+	<key>MachServices</key>
+	<dict>
+		<key>com.thermaliq.helper</key>
+		<true/>
+	</dict>
+	<key>Program</key>
+	<string>/Library/PrivilegedHelperTools/com.thermaliq.helper</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>/var/log/thermaliq-helper.log</string>
+	<key>StandardErrorPath</key>
+	<string>/var/log/thermaliq-helper.log</string>
+	<key>TimeOut</key>
+	<integer>120</integer>
+	<key>LimitLoadToSessionType</key>
+	<string>System</string>
+</dict>
+</plist>

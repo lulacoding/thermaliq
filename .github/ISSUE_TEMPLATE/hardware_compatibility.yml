@@ -1,0 +1,142 @@
+name: Hardware Compatibility Report
+description: Report issues with specific hardware configurations not working with ThermalIQ
+title: "[Hardware] "
+labels: ["hardware", "compatibility"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for helping us improve ThermalIQ hardware support! Please provide as much detail as possible about your system and the issue you're experiencing.
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Operating System
+      description: What OS are you running ThermalIQ on?
+      options:
+        - Windows 10
+        - Windows 11
+        - macOS (Intel)
+        - macOS (Apple Silicon)
+        - Linux (Ubuntu)
+        - Linux (Fedora)
+        - Linux (Arch)
+        - Linux (Other)
+    validations:
+      required: true
+
+  - type: textarea
+    id: cpu
+    attributes:
+      label: CPU Model
+      description: "What CPU do you have? (e.g., Intel Core i9-13900K, AMD Ryzen 7 7800X3D)"
+      placeholder: "Intel Core i9-13900K"
+    validations:
+      required: true
+
+  - type: textarea
+    id: gpu
+    attributes:
+      label: GPU(s)
+      description: "List all GPUs in your system (e.g., NVIDIA RTX 4090, AMD RX 7900 XTX, Intel Arc A770)"
+      placeholder: "NVIDIA RTX 4090"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: fan_controller
+    attributes:
+      label: Fan Controller Type
+      description: How are your fans controlled?
+      options:
+        - NVIDIA NVIDIA (via NVML)
+        - AMD RDNA (via hwmon or custom)
+        - Motherboard headers (via SMBus/EC)
+        - RGB/PWM controller (standalone)
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: motherboard
+    attributes:
+      label: Motherboard Model
+      description: "Motherboard/chassis model if applicable (e.g., ASUS ROG Maximus Z790, MSI MPG B650E)"
+      placeholder: "ASUS ROG Maximus Z790"
+
+  - type: input
+    id: thermaliq_version
+    attributes:
+      label: ThermalIQ Version
+      description: "What version of ThermalIQ are you running?"
+      placeholder: "1.0.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: issue_type
+    attributes:
+      label: Issue Type
+      description: What's not working?
+      options:
+        - Fan readings are incorrect
+        - Fan control not working (fans not responding)
+        - Sensor missing or not detected
+        - Temperature reading wrong
+        - App crashes on startup
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: hwinfo_vs_thermaliq
+    attributes:
+      label: HWiNFO64 vs ThermalIQ Comparison
+      description: |
+        What does HWiNFO64 show vs what does ThermalIQ show?
+        Please include:
+        - Fan names and current RPM/PWM values
+        - Temperature sensor names and readings
+        - Any status codes or warnings
+      placeholder: |
+        **HWiNFO64:**
+        - GPU Fan: 2500 RPM, 60% PWM
+        - CPU Fan: 2000 RPM, 50% PWM
+
+        **ThermalIQ:**
+        - GPU Fan: 0 RPM (not detected)
+        - CPU Fan: 2000 RPM, 50% PWM
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and Error Messages
+      description: |
+        Paste any relevant error messages, logs, or stack traces.
+        - On Linux: check `journalctl -u thermaliq` or `/tmp/thermaliq.log`
+        - On Windows: check `%APPDATA%\thermaliq\logs\`
+        - On macOS: check `~/Library/Logs/ThermalIQ/`
+      render: shell
+
+  - type: textarea
+    id: steps_to_reproduce
+    attributes:
+      label: Steps to Reproduce
+      description: "How can we reproduce this issue?"
+      placeholder: |
+        1. Launch ThermalIQ
+        2. Go to Hardware Detection tab
+        3. Observe that fans are not listed
+        4. Expected: All fans should be detected
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Verification
+      options:
+        - label: I have checked that my hardware is on the [supported list](https://github.com/lulacoding/thermaliq/blob/main/docs/HARDWARE.md)
+          required: false
+        - label: I have tried restarting the daemon (`thermaliq restart`)
+          required: false
+        - label: I have attached relevant logs or HWiNFO exports
+          required: false

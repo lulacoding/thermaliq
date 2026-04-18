@@ -108,6 +108,34 @@ Switch the active fan control profile. Change takes effect immediately on the ne
 
 ---
 
+### Battery
+
+#### `GET /api/battery/status`
+Returns battery state profile configuration. Requires authentication.
+
+```json
+{
+  "configured": true,
+  "on_battery_profile": "silent",
+  "plugged_in_profile": "balanced"
+}
+```
+
+**Response fields:**
+- `configured` (boolean) — `true` if battery profiles are configured in `thermaliq.toml`, `false` otherwise
+- `on_battery_profile` (string | null) — Profile name to activate when on battery power, or null if not configured
+- `plugged_in_profile` (string | null) — Profile name to activate when plugged into AC power, or null if not configured
+
+**Notes:**
+- Battery state detection is automatic and platform-specific:
+  - **macOS**: Uses `pmset` command to detect AC adapter connection
+  - **Linux**: Reads `/sys/class/power_supply/AC/online`
+  - **Windows**: Uses `GetSystemPowerStatus` Windows API
+- Profile switching happens automatically when battery state changes (no manual action required)
+- The daemon broadcasts battery state changes via WebSocket `/ws/agent` as events
+
+---
+
 ### AI Agent
 
 #### `GET /api/agent/status`

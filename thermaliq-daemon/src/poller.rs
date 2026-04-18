@@ -168,6 +168,8 @@ pub fn start_poll_loop(state: AppState, interval_ms: u64) -> tokio::task::JoinHa
                                 fan_id: control.fan.clone(),
                                 duty_percent: ramped_duty,
                                 dc_mode,
+                                start_percent: None,
+                                stop_percent: None,
                             })
                             .await;
                     }
@@ -443,5 +445,132 @@ fn compute_duty_for_curve(curve: &ProfileCurve, temp: f32, profile: &Profile) ->
                 + t.clamp(0.0, 1.0) * (*base_max_pwm as f32 - *base_min_pwm as f32))
                 .round() as u8
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_custom_sensor_time_average_fallback() {
+        let hw = vec![SensorReading {
+            id: "cpu_pkg".to_string(),
+            label: "CPU Package".to_string(),
+            temp_celsius: 50.0,
+        }];
+
+        let sensors = vec![CustomSensor::TimeAverage {
+            id: "cpu_avg_60s".to_string(),
+            source: "cpu_pkg".to_string(),
+            time_s: 60,
+        }];
+
+        let result = evaluate_custom_sensors(&sensors, &hw, None);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, "cpu_avg_60s");
+        assert_eq!(result[0].temp_celsius, 50.0); // Falls back to live reading
+    }
+
+    #[test]
+    fn test_custom_sensor_offset() {
+        let hw = vec![SensorReading {
+            id: "gpu_junction".to_string(),
+            label: "GPU Junction".to_string(),
+            temp_celsius: 60.0,
+        }];
+
+        let sensors = vec![CustomSensor::Offset {
+            id: "gpu_derating".to_string(),
+            source: "gpu_junction".to_string(),
+            offset: -5.0,
+        }];
+
+        let result = evaluate_custom_sensors(&sensors, &hw, None);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, "gpu_derating");
+        assert_eq!(result[0].temp_celsius, 55.0);
+    }
+
+    #[test]
+    fn test_custom_sensor_mix_average() {
+        let hw = vec![
+            SensorReading {
+                id: "cpu_pkg".to_string(),
+                label: "CPU Package".to_string(),
+                temp_celsius: 50.0,
+            },
+            SensorReading {
+                id: "gpu_junction".to_string(),
+                label: "GPU Junction".to_string(),
+                temp_celsius: 60.0,
+            },
+        ];
+
+        let sensors = vec![CustomSensor::Mix {
+            id: "cpu_gpu_avg".to_string(),
+            function: MixFunction::Average,
+            sources: vec!["cpu_pkg".to_string(), "gpu_junction".to_string()],
+        }];
+
+        let result = evaluate_custom_sensors(&sensors, &hw, None);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, "cpu_gpu_avg");
+        assert_eq!(result[0].temp_celsius, 55.0);
+    }
+
+    #[test]
+    fn test_custom_sensor_mix_max() {
+        let hw = vec![
+            SensorReading {
+                id: "cpu_pkg".to_string(),
+                label: "CPU Package".to_string(),
+                temp_celsius: 50.0,
+            },
+            SensorReading {
+                id: "gpu_junction".to_string(),
+                label: "GPU Junction".to_string(),
+                temp_celsius: 70.0,
+            },
+        ];
+
+        let sensors = vec![CustomSensor::Mix {
+            id: "hottest".to_string(),
+            function: MixFunction::Max,
+            sources: vec!["cpu_pkg".to_string(), "gpu_junction".to_string()],
+        }];
+
+        let result = evaluate_custom_sensors(&sensors, &hw, None);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].temp_celsius, 70.0);
+    }
+
+    #[test]
+    fn test_custom_sensor_chained_reference() {
+        let hw = vec![SensorReading {
+            id: "gpu_junction".to_string(),
+            label: "GPU Junction".to_string(),
+            temp_celsius: 60.0,
+        }];
+
+        let sensors = vec![
+            CustomSensor::Offset {
+                id: "gpu_adj".to_string(),
+                source: "gpu_junction".to_string(),
+                offset: 5.0,
+            },
+            CustomSensor::Mix {
+                id: "gpu_combined".to_string(),
+                function: MixFunction::Average,
+                sources: vec!["gpu_junction".to_string(), "gpu_adj".to_string()],
+            },
+        ];
+
+        let result = evaluate_custom_sensors(&sensors, &hw, None);
+        assert_eq!(result.len(), 2);
+        // gpu_adj = 60 + 5 = 65
+        assert_eq!(result[0].temp_celsius, 65.0);
+        // gpu_combined = avg(60, 65) = 62.5
+        assert_eq!(result[1].temp_celsius, 62.5);
     }
 }

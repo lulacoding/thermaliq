@@ -1,351 +1,272 @@
-import { useEffect, useState, useCallback } from "react";
-import { Bot, CheckCircle, XCircle, RefreshCw } from "lucide-react";
-import { useAgent, type AgentMode } from "../hooks/useAgent";
-import { useToken } from "../hooks/useToken";
-
-const BASE = "http://127.0.0.1:7272";
+import { useState, useEffect } from "react";
+import { Zap } from "lucide-react";
+import { useTranslation } from "react-i18next";
 
 interface Intervention {
   id: string;
   description: string;
+  proposed_at: number;
   proposed_action: string;
-  proposed_at: string;
 }
 
-function modeBadgeClass(mode: AgentMode | null): string {
-  if (mode === "autonomous") return "badge badge-red";
-  if (mode === "approval") return "badge badge-yellow";
-  return "badge badge-gray";
+interface AgentStatusData {
+  mode: "Passive" | "Approval" | "Autonomous";
+  pending_count: number;
 }
 
-function modeLabel(mode: AgentMode | null): string {
-  if (!mode) return "Unknown";
-  return mode.charAt(0).toUpperCase() + mode.slice(1);
-}
+const API_BASE = "http://127.0.0.1:7272";
 
 export default function AgentPanel() {
-  const { mode, pendingCount, events } = useAgent();
-  const { token } = useToken();
+  const { t } = useTranslation();
+  const [agentStatus, setAgentStatus] = useState<"idle" | "active" | "error">("active");
+  const [agentMode, setAgentMode] = useState<"Passive" | "Approval" | "Autonomous">("Approval");
+  const [decisionCount, setDecisionCount] = useState(0);
+  const [lastAction, setLastAction] = useState(t("agent.waitingForIntervention"));
+  const [error, setError] = useState<string | null>(null);
 
-  const [interventions, setInterventions] = useState<Intervention[]>([]);
-  const [loadingInterventions, setLoadingInterventions] = useState(false);
-  const [actionError, setActionError] = useState<string | null>(null);
-  const [settingMode, setSettingMode] = useState(false);
+  // Fetch agent status and recent interventions on mount
+  useEffect(() => {
+    const fetchAgentData = async () => {
+      try {
+        setError(null);
 
-  const authHeaders = useCallback((): HeadersInit => ({
-    "Content-Type": "application/json",
-    ...(token ? { Authorization: `Bearer ${token}` } : {}),
-  }), [token]);
+        // Fetch agent status (mode and pending count)
+        const statusRes = await fetch(`${API_BASE}/api/agent/status`);
+        if (!statusRes.ok) throw new Error("Failed to fetch agent status");
+        const statusData = (await statusRes.json()) as AgentStatusData;
+        setAgentMode(statusData.mode);
 
-  const fetchInterventions = useCallback(async () => {
-    setLoadingInterventions(true);
-    try {
-      const res = await fetch(`${BASE}/api/agent/interventions`);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = (await res.json()) as { interventions: Intervention[] };
-      setInterventions(data.interventions ?? []);
-    } catch (err) {
-      setActionError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setLoadingInterventions(false);
-    }
+        // Fetch recent interventions
+        const interventionsRes = await fetch(`${API_BASE}/api/agent/interventions`);
+        if (!interventionsRes.ok) throw new Error("Failed to fetch interventions");
+        const interventionsData = (await interventionsRes.json()) as {
+          interventions: Intervention[];
+        };
+
+        // Count total interventions made (approximation via pending count + interface history)
+        setDecisionCount(interventionsData.interventions.length);
+
+        // Extract last action from most recent intervention
+        if (interventionsData.interventions.length > 0) {
+          const latest = interventionsData.interventions[0];
+          const timeDiff = Math.floor((Date.now() - latest.proposed_at) / 1000);
+          const timeStr =
+            timeDiff < 60
+              ? `${timeDiff}s ago`
+              : timeDiff < 3600
+              ? `${Math.floor(timeDiff / 60)}m ago`
+              : `${Math.floor(timeDiff / 3600)}h ago`;
+          setLastAction(`${latest.description} • ${timeStr}`);
+        }
+      } catch (err) {
+        console.error("Failed to fetch agent data:", err);
+        setError(err instanceof Error ? err.message : "Failed to load agent data");
+        setAgentStatus("error");
+      }
+    };
+
+    fetchAgentData();
   }, []);
 
-  useEffect(() => {
-    void fetchInterventions();
-  }, [fetchInterventions, pendingCount]);
-
-  const setMode = useCallback(async (m: AgentMode) => {
-    if (!token) { setActionError("No API token loaded"); return; }
-    setSettingMode(true);
-    setActionError(null);
-    try {
-      const res = await fetch(`${BASE}/api/agent/mode`, {
-        method: "POST",
-        headers: authHeaders(),
-        body: JSON.stringify({ mode: m }),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    } catch (err) {
-      setActionError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setSettingMode(false);
-    }
-  }, [token, authHeaders]);
-
-  const handleIntervention = useCallback(async (id: string, action: "approve" | "reject") => {
-    if (!token) { setActionError("No API token loaded"); return; }
-    setActionError(null);
-    try {
-      const res = await fetch(`${BASE}/api/agent/interventions/${id}/${action}`, {
-        method: "POST",
-        headers: authHeaders(),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      await fetchInterventions();
-    } catch (err) {
-      setActionError(err instanceof Error ? err.message : String(err));
-    }
-  }, [token, authHeaders, fetchInterventions]);
-
-  const MODES: AgentMode[] = ["passive", "approval", "autonomous"];
-
   return (
-    <div style={styles.root}>
+    <div style={styles.container}>
       <div style={styles.header}>
-        <h1 style={styles.title}>Agent</h1>
-        <span className={modeBadgeClass(mode)}>
-          <Bot size={10} />
-          {modeLabel(mode)}
-        </span>
+        <h1 style={styles.title}>{t("agent.title")}</h1>
+        <p style={styles.subtitle}>{t("agent.subtitle")}</p>
       </div>
 
-      {actionError && (
-        <div style={styles.errorBanner} className="error-text">
-          {actionError}
-        </div>
-      )}
-
-      {/* Mode switcher */}
-      <section style={styles.section}>
-        <div className="section-title">Agent Mode</div>
-        <div className="card" style={styles.modeCard}>
-          <p style={styles.modeDescription}>
-            Control how autonomously the agent applies thermal interventions.
-          </p>
-          <div style={styles.modeButtons}>
-            {MODES.map((m) => (
-              <button
-                key={m}
-                onClick={() => void setMode(m)}
-                disabled={settingMode || mode === m}
-                className={mode === m ? "btn-primary" : "btn-ghost"}
-                style={styles.modeBtn}
-              >
-                {m.charAt(0).toUpperCase() + m.slice(1)}
-              </button>
-            ))}
-          </div>
-          <div style={styles.modeHints}>
-            <span style={styles.hint}><strong>Passive</strong> — monitor only</span>
-            <span style={styles.hint}><strong>Approval</strong> — propose changes, require sign-off</span>
-            <span style={styles.hint}><strong>Autonomous</strong> — act immediately</span>
-          </div>
-        </div>
-      </section>
-
-      {/* Pending interventions */}
-      {mode === "approval" && (
-        <section style={styles.section}>
-          <div style={styles.sectionRow}>
-            <div className="section-title" style={{ marginBottom: 0 }}>
-              Pending Interventions
-              {pendingCount > 0 && (
-                <span className="badge badge-yellow" style={{ marginLeft: 8 }}>
-                  {pendingCount}
-                </span>
-              )}
-            </div>
-            <button
-              className="btn-ghost"
-              onClick={() => void fetchInterventions()}
-              disabled={loadingInterventions}
-              style={{ padding: "3px 8px" }}
-            >
-              <RefreshCw size={12} />
-            </button>
-          </div>
-
-          <div style={styles.interventionList}>
-            {loadingInterventions && (
-              <p style={styles.loadingText} className="loading-pulse">Loading…</p>
-            )}
-            {!loadingInterventions && interventions.length === 0 && (
-              <div className="card" style={styles.emptyCard}>
-                <p style={styles.emptyText}>No pending interventions.</p>
-              </div>
-            )}
-            {interventions.map((iv) => (
-              <div key={iv.id} className="card" style={styles.interventionCard}>
-                <p style={styles.ivDescription}>{iv.description}</p>
-                <p style={styles.ivAction} className="mono">{iv.proposed_action}</p>
-                <div style={styles.ivMeta}>
-                  <span style={styles.ivTime}>
-                    {new Date(Number(iv.proposed_at) * 1000).toLocaleTimeString()}
-                  </span>
-                  <div style={styles.ivActions}>
-                    <button
-                      className="btn-success"
-                      onClick={() => void handleIntervention(iv.id, "approve")}
-                    >
-                      <CheckCircle size={12} style={{ marginRight: 4 }} />
-                      Approve
-                    </button>
-                    <button
-                      className="btn-danger"
-                      onClick={() => void handleIntervention(iv.id, "reject")}
-                    >
-                      <XCircle size={12} style={{ marginRight: 4 }} />
-                      Reject
-                    </button>
-                  </div>
-                </div>
-              </div>
-            ))}
-          </div>
-        </section>
-      )}
-
-      {/* Event log */}
-      <section style={styles.section}>
-        <div className="section-title">Event Log</div>
-        <div className="card" style={styles.logCard}>
-          {events.length === 0 && (
-            <p style={styles.emptyText}>Waiting for agent events…</p>
-          )}
-          {events.map((ev) => (
-            <div key={ev.ts} style={styles.logEntry}>
-              <span style={styles.logTime} className="mono">
-                {new Date(ev.ts).toLocaleTimeString()}
+      {/* Agent Status */}
+      <div style={{...styles.section, ...styles.sectionCard}}>
+        <div style={styles.cardAccentBar} />
+        <h2 style={styles.sectionTitle}>{t("agent.status")}</h2>
+        {error ? (
+          <p style={{color: "var(--red)", fontSize: 13}}>{error}</p>
+        ) : (
+          <div style={styles.statusContent}>
+            <div style={styles.statusIndicator}>
+              <div style={{...styles.statusDot, ...styles[`status${agentStatus}`]}} />
+              <span style={styles.statusText}>
+                {agentStatus === "active" && t("agent.statusActive")}
+                {agentStatus === "idle" && t("agent.statusIdle")}
+                {agentStatus === "error" && t("agent.statusError")}
               </span>
-              <span style={styles.logRaw} className="mono">{ev.raw}</span>
             </div>
-          ))}
+            <p style={styles.statusDetail}>
+              {agentStatus === "active" && t("agent.statusDetailActive")}
+              {agentStatus === "idle" && t("agent.statusDetailIdle")}
+              {agentStatus === "error" && t("agent.statusDetailError")}
+            </p>
+          </div>
+        )}
+      </div>
+
+      {/* Recent Actions */}
+      <div style={{...styles.section, ...styles.sectionCard}}>
+        <div style={styles.cardAccentBar} />
+        <h2 style={styles.sectionTitle}>{t("agent.recentActions")}</h2>
+        <div style={styles.actionList}>
+          <div style={styles.actionItem}>
+            <Zap size={14} color="var(--accent)" style={{ marginRight: 8 }} />
+            <span style={styles.actionText}>{lastAction}</span>
+          </div>
+          <div style={styles.actionMeta}>
+            <span className="mono">{decisionCount} {t("agent.decisionsThisSession")}</span>
+          </div>
         </div>
-      </section>
+      </div>
+
+      {/* Controls */}
+      <div style={{...styles.section, ...styles.sectionCard}}>
+        <div style={styles.cardAccentBar} />
+        <h2 style={styles.sectionTitle}>{t("agent.controls")}</h2>
+        <div style={styles.controlGroup}>
+          <button style={styles.button}>{t("agent.pauseAgent")}</button>
+          <button style={{...styles.button, background: "var(--secondary)"}}>{t("agent.viewLogs")}</button>
+        </div>
+      </div>
+
+      {/* Trust Level Info */}
+      <div style={{...styles.section, ...styles.sectionCard}}>
+        <div style={{...styles.cardAccentBar, background: 'var(--secondary)'}} />
+        <h2 style={styles.sectionTitle}>{t("agent.trustLevel")}</h2>
+        <p style={styles.trustText}>
+          {t("agent.mode")}: <span style={{color: 'var(--accent)', fontWeight: 600}}>{agentMode}</span>
+        </p>
+        <p style={styles.trustDescription}>
+          {t("settings.guardrails")}
+        </p>
+      </div>
     </div>
   );
 }
 
 const styles: Record<string, React.CSSProperties> = {
-  root: {
-    padding: 24,
+  container: {
+    padding: "24px",
+    overflow: "auto",
     height: "100%",
-    overflowY: "auto",
   },
   header: {
-    display: "flex",
-    alignItems: "center",
-    gap: 12,
-    marginBottom: 24,
+    marginBottom: 32,
   },
   title: {
-    fontSize: 20,
+    fontSize: 28,
     fontWeight: 700,
     color: "var(--text-primary)",
-    flex: 1,
+    margin: 0,
+    marginBottom: 4,
   },
-  errorBanner: {
-    background: "var(--red-dim)",
-    border: "1px solid rgba(239,68,68,0.3)",
-    borderRadius: "var(--radius-sm)",
-    padding: "8px 12px",
-    marginBottom: 16,
-    fontSize: 12,
+  subtitle: {
+    fontSize: 13,
+    color: "var(--text-secondary)",
+    margin: 0,
   },
   section: {
-    marginBottom: 28,
+    marginBottom: 32,
   },
-  sectionRow: {
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-    marginBottom: 12,
+  sectionCard: {
+    background: "var(--bg-card)",
+    border: "1px solid var(--border)",
+    borderRadius: "var(--radius)",
+    padding: 12,
+    position: "relative",
+    overflow: "hidden",
   },
-  modeCard: {
-    display: "flex",
-    flexDirection: "column",
-    gap: 14,
+  cardAccentBar: {
+    position: "absolute",
+    bottom: 0,
+    left: 0,
+    right: 0,
+    height: 4,
+    background: "var(--accent)",
   },
-  modeDescription: {
-    color: "var(--text-secondary)",
-    fontSize: 13,
-  },
-  modeButtons: {
-    display: "flex",
-    gap: 8,
-  },
-  modeBtn: {
-    minWidth: 100,
-  },
-  modeHints: {
-    display: "flex",
-    flexDirection: "column",
-    gap: 4,
-  },
-  hint: {
-    fontSize: 12,
+  sectionTitle: {
+    fontSize: 11,
+    fontWeight: 600,
+    letterSpacing: "0.08em",
+    textTransform: "uppercase",
     color: "var(--text-muted)",
+    margin: "0 0 16px 0",
   },
-  interventionList: {
+  statusContent: {
     display: "flex",
     flexDirection: "column",
-    gap: 10,
-    marginTop: 12,
+    gap: 12,
   },
-  interventionCard: {
-    display: "flex",
-    flexDirection: "column",
-    gap: 8,
-  },
-  ivDescription: {
-    color: "var(--text-primary)",
-    fontSize: 13,
-  },
-  ivAction: {
-    color: "var(--accent)",
-    fontSize: 12,
-    background: "var(--accent-dim)",
-    padding: "4px 8px",
-    borderRadius: "var(--radius-sm)",
-  },
-  ivMeta: {
+  statusIndicator: {
     display: "flex",
     alignItems: "center",
-    justifyContent: "space-between",
+    gap: 8,
   },
-  ivTime: {
+  statusDot: {
+    width: 8,
+    height: 8,
+    borderRadius: "50%",
+    animation: "pulse 1.5s ease-in-out infinite",
+  },
+  statusactive: {
+    background: "var(--accent)",
+  },
+  statusidle: {
+    background: "var(--text-muted)",
+  },
+  statuserror: {
+    background: "var(--red)",
+  },
+  statusText: {
+    fontSize: 13,
+    fontWeight: 600,
+    color: "var(--text-primary)",
+  },
+  statusDetail: {
+    fontSize: 12,
+    color: "var(--text-secondary)",
+    margin: 0,
+  },
+  actionList: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 12,
+  },
+  actionItem: {
+    display: "flex",
+    alignItems: "center",
+    fontSize: 13,
+    color: "var(--text-primary)",
+  },
+  actionText: {
+    flex: 1,
+  },
+  actionMeta: {
     fontSize: 11,
     color: "var(--text-muted)",
     fontFamily: "var(--font-mono)",
   },
-  ivActions: {
+  controlGroup: {
     display: "flex",
     gap: 8,
   },
-  logCard: {
-    maxHeight: 240,
-    overflowY: "auto",
-    display: "flex",
-    flexDirection: "column",
-    gap: 4,
+  button: {
+    flex: 1,
+    padding: "8px 16px",
+    background: "var(--accent)",
+    color: "#fff",
+    border: "none",
+    borderRadius: "var(--radius-sm)",
+    fontWeight: 600,
+    fontSize: 13,
+    cursor: "pointer",
+    transition: "background 0.15s",
   },
-  logEntry: {
-    display: "flex",
-    gap: 10,
-    alignItems: "flex-start",
-    borderBottom: "1px solid var(--border)",
-    paddingBottom: 4,
+  trustText: {
+    fontSize: 13,
+    color: "var(--text-primary)",
+    margin: "0 0 8px 0",
   },
-  logTime: {
-    fontSize: 11,
-    color: "var(--text-muted)",
-    flexShrink: 0,
-  },
-  logRaw: {
-    fontSize: 11,
+  trustDescription: {
+    fontSize: 12,
     color: "var(--text-secondary)",
-    wordBreak: "break-all",
-  },
-  loadingText: {
-    color: "var(--text-muted)",
-    fontSize: 12,
-  },
-  emptyCard: {
-    padding: 12,
-  },
-  emptyText: {
-    color: "var(--text-muted)",
-    fontSize: 12,
+    margin: 0,
+    lineHeight: 1.5,
   },
 };

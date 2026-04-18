@@ -566,10 +566,28 @@ impl HardwareLayer for LinuxHardwareLayer {
                         // Fall through to traditional PWM below.
                     } else {
                         let card_clone = card.clone();
+                        let start_pct = cmd.start_percent;
+                        let stop_pct = cmd.stop_percent;
                         return tokio::task::spawn_blocking(move || {
                             write_rdna3_fan_curve(&fan_curve, duty)?;
                             // Disable zero-RPM when duty > 0 so fan spins immediately.
                             set_rdna3_zero_rpm(&card_clone, duty == 0);
+                            // Write start_percent if provided (kernel 6.7+).
+                            if let Some(start) = start_pct {
+                                let start_path =
+                                    card_clone.join("device/gpu_od/fan_ctrl/fan_start_speed");
+                                if start_path.exists() {
+                                    let _ = fs::write(&start_path, format!("{}\n", start));
+                                }
+                            }
+                            // Write stop_percent if provided (zero-RPM stop temperature, kernel 6.13+).
+                            if let Some(stop) = stop_pct {
+                                let stop_path = card_clone
+                                    .join("device/gpu_od/fan_ctrl/fan_zero_rpm_stop_temperature");
+                                if stop_path.exists() {
+                                    let _ = fs::write(&stop_path, format!("{}\n", stop));
+                                }
+                            }
                             Ok(())
                         })
                         .await?;

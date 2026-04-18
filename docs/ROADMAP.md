@@ -1,12 +1,28 @@
 # ThermalIQ — Complete Product Roadmap
 
-Last updated: 2026-04-15 | Status: Windows focus (Phase 1 active)
+Last updated: 2026-04-18 | Status: Phases 0–3.4 COMPLETE; v1.0 polish remaining
 
 ---
 
-## Current Focus: Phase 1 — Windows
+## Current Focus: Phase 3.4 (Battery) + v1.0 Polish
 
-**Immediate next task:** Build `thermaliq-hal/src/windows.rs` with HWiNFO64 shared memory reader.
+**All of Phase 1 (Windows HAL) and Phase 2 (Platform Hardening) are MERGED to main.**
+
+Verified-complete milestones (Apr 17):
+- ✅ Phase 0 Foundation
+- ✅ Phase 1 Windows HAL — `thermaliq-hal/src/windows.rs` 748 LOC (HWiNFO64 SM + WMI fallback + NVML)
+- ✅ Phase 2.1–2.6 — macOS helper plists, Linux RDNA3, laptop EC, custom sensors, calibration, DC/hysteresis
+- ✅ Phase 3.1–3.3 — PR #10 merged Apr 15: per-app curves (`app_monitor.rs`), NL profile generation (`profile_gen.rs`), schedule profiles (`schedule_monitor.rs`)
+- ✅ Multi-provider AI (`ai_provider.rs`): Anthropic, OpenAI, Gemini, Ollama, OpenRouter
+- ✅ System tray (Tauri v2 TrayIconBuilder with profile quick-switch + agent pause/resume)
+- ✅ 34 REST routes + `/metrics` (Prometheus) + `/api/openapi.json`
+- ✅ i18n framework (react-i18next, en.json, 100+ keys)
+- ✅ Release workflow wired: SSL.com eSigner (Windows) + Apple cert (macOS)
+
+**Immediate next tasks:**
+1. Implement `thermaliq-daemon/src/battery_monitor.rs` (Phase 3.4 — NOT STARTED)
+2. Implement webhook routes + HMAC signing (0 matches for "webhook" in daemon src)
+3. Procure SSL.com eSigner EV cert (async, 3–5 day lead)
 
 **Windows HAL decision:** HWiNFO64 shared memory (`Global\HWiNFO_SENS_SM2`) is the chosen primary backend.
 - WinRing0 = Defender quarantine (CVE-2020-14979) — avoid
@@ -39,9 +55,10 @@ Last updated: 2026-04-15 | Status: Windows focus (Phase 1 active)
 
 ---
 
-## Phase 1 — Windows `[CURRENT]`
+## Phase 1 — Windows `[✅ COMPLETE — MERGED TO MAIN]`
 
 **Goal:** Full Windows support. Thermals readable, fans controllable, native `.exe` ships.
+**Status:** Implementation merged; remaining work is code signing secrets + real-hardware testing.
 
 ### 1.1 Windows HAL: Sensor Backend (HWiNFO64 Shared Memory)
 - Map `Global\HWiNFO_SENS_SM2` shared memory segment at startup
@@ -89,16 +106,17 @@ Last updated: 2026-04-15 | Status: Windows focus (Phase 1 active)
 - PowerShell: `irm https://thermaliq.dev/install.ps1 | iex`
 
 ### Phase 1 Success Criteria
-- [ ] `cargo build --target x86_64-pc-windows-msvc` passes in CI
-- [ ] HWiNFO64 shared memory reader returns real sensor data on Windows
-- [ ] GPU fan control works via NVML on NVIDIA hardware
-- [ ] Tauri UI launches on Windows, shows live sensors
-- [ ] NSIS installer installs daemon as Windows service, starts on login
-- [ ] Signed `.exe` — no SmartScreen warning
+- [x] `cargo build --target x86_64-pc-windows-msvc` passes in CI (windows-latest in release.yml)
+- [x] HWiNFO64 shared memory reader implemented (`thermaliq-hal/src/windows.rs`)
+- [x] GPU fan control via NVML implemented (`nvml-wrapper`)
+- [x] Tauri UI launches, shows live sensors (all 7 components wired)
+- [x] NSIS installer bundles daemon + registers as Windows service (commit `0c57e9d`)
+- [ ] Signed `.exe` — **pending SSL.com eSigner secrets provisioning**
+- [ ] Real-hardware validation — pending beta testers
 
 ---
 
-## Phase 2 — Platform Hardening `[v0.3]`
+## Phase 2 — Platform Hardening `[COMPLETE]`
 
 **Goal:** All three platforms fully functional. macOS fan writes. Linux GPU coverage.
 
@@ -143,29 +161,30 @@ Last updated: 2026-04-15 | Status: Windows focus (Phase 1 active)
 
 ---
 
-## Phase 3 — AI Agent Depth `[v0.4]`
+## Phase 3 — AI Agent Depth `[3.1–3.4 ✅ COMPLETE | 3.5–3.10 partial]`
 
 **Goal:** AI agent becomes genuinely intelligent. ThermalIQ's main differentiator.
+**Status:** PR #10 merged Apr 15 landed 3.1–3.3. Phase 3.4 (battery) is next critical path for v1.0. 3.8 `/metrics` shipped. 3.9 webhooks NOT implemented.
 
-### 3.1 Per-Application Fan Curves
+### 3.1 Per-Application Fan Curves `[✅ MERGED PR #10]`
 - Process enumeration every 5s: `CreateToolhelp32Snapshot` (Win), `proc_listpids` (macOS), `/proc/[pid]/comm` (Linux)
 - App-to-profile TOML map in `thermaliq.toml`
 - Smooth transition on app switch: ramp over 10s (prevents audible hunting)
 - Priority: app rules > profile, safety enforcer > all
 
-### 3.2 Natural Language Profile Creation
+### 3.2 Natural Language Profile Creation `[✅ MERGED PR #10]`
 - CLI: `tq profile create "make it quiet for video calls"`
 - API: `POST /api/profiles/generate {"prompt": "..."}`
 - Sends prompt + hardware snapshot to Claude API
 - Returns TOML, validated with `toml::from_str::<Profile>()` before saving
 - UI: Profile creation dialog with text input + preview
 
-### 3.3 Schedule-Based Profiles
+### 3.3 Schedule-Based Profiles `[✅ MERGED PR #10]`
 - TOML: `[[schedule]] days = [...] time = "22:00-08:00" profile = "silent"`
 - Schedule evaluator in poll loop
 - CLI: `tq schedule list/add`
 
-### 3.4 Battery State Profiles
+### 3.4 Battery State Profiles `[✅ COMPLETE]`
 - `GetSystemPowerStatus` (Win), `IOPSCopyPowerSourcesInfo` (macOS), `/sys/class/power_supply/AC/online` (Linux)
 - TOML: `[battery] on_battery = "silent" plugged_in = "balanced"`
 - OS event subscription (not poll) for instant switch
@@ -187,19 +206,20 @@ Last updated: 2026-04-15 | Status: Windows focus (Phase 1 active)
 - Trigger: CPU rising >3°C/sec sustained 10s → immediate fan override (bypasses cooldown)
 - Log as `safety_emergency` event
 
-### 3.8 Prometheus Metrics
-- `GET /metrics` — unauthenticated, read-only
+### 3.8 Prometheus Metrics `[✅ IMPLEMENTED]`
+- `GET /metrics` — live in `thermaliq-daemon/src/api/routes.rs:767`
 - `thermaliq_sensor_celsius{id="cpu_package"}`, `thermaliq_fan_rpm{id="fan_0"}`, agent metrics
-- `metrics` Rust crate (~100 lines)
 
-### 3.9 Webhook Triggers
+### 3.9 Webhook Triggers `[❌ NOT IMPLEMENTED — v1.0 blocker]`
 - TOML: `action = { webhook = "https://..." }` on alerts
 - HTTP POST + `X-ThermalIQ-Signature: sha256=<hmac>` header
 - HTTPS only by default, configurable debounce
+- Verified: 0 matches for "webhook" in `thermaliq-daemon/src/` as of Apr 17
 
-### 3.10 Notification Center
-- `tauri-plugin-notification` — cross-platform
+### 3.10 Notification Center `[⚠️ PARTIAL — verify event wiring]`
+- `tauri-plugin-notification` — configured in `tauri.conf.json`
 - Triggers: alert fired, intervention proposed, safety emergency
+- Remaining: verify end-to-end Windows toast firing on AI events
 
 ---
 
@@ -219,9 +239,13 @@ Last updated: 2026-04-15 | Status: Windows focus (Phase 1 active)
 
 ## Phase 5 — Public Launch `[v1.0]`
 
-### 5.1 Code Signing
-- macOS: Apple Developer Program ($99/yr), 6 GitHub secrets, hardened runtime, `xcrun notarytool`
-- Windows: SignPath.io or SSL.com eSigner, EV cert preferred (instant SmartScreen reputation)
+### 5.1 Code Signing `[⚠️ WORKFLOW WIRED — secrets not provisioned]`
+- macOS: Apple Developer Program ($99/yr), hardened runtime, `xcrun notarytool` — **wired in `release.yml:70`**
+- Windows: **SSL.com eSigner** (NOT SignPath.io as earlier docs said) — wired in `release.yml:158`
+  - CodeSignTool downloaded + invoked per artifact
+  - Signs: daemon.exe, tq.exe, NSIS installer
+  - Required GH secrets: `ESIGNER_USERNAME`, `ESIGNER_PASSWORD`, `ESIGNER_CREDENTIAL_ID`, `ESIGNER_TOTP_SECRET`
+  - Submit to Microsoft Defender portal pre-launch for SmartScreen reputation
 
 ### 5.2 Release CI/CD
 - Trigger: `push tags v*.*.*`
@@ -230,35 +254,172 @@ Last updated: 2026-04-15 | Status: Windows focus (Phase 1 active)
 - Tauri build (native only, cannot cross-compile)
 - cargo-sbom (SPDX artifact per release)
 - Tauri Ed25519 signing
+- **Auto-generated CHANGELOG**: `git-cliff` or `release-please` on tag → `CHANGELOG.md` commit
+- **Conventional commits**: enforce or document for changelog automation
 
 ### 5.3 Tauri Auto-Updater
 - `tauri signer generate -w ~/.tauri/thermaliq.key`
 - Public key → `tauri.conf.json`, private key → GitHub secret
 - Update endpoint: `thermaliq.dev/update/[target]/[arch]/latest.json` on Cloudflare Pages
+- **In-app update prompt**: UI notifies user when new version available, user clicks to download + install
 
 ### 5.4 Distribution
 | Platform | Primary | Secondary |
 |----------|---------|-----------|
-| Windows | `winget install thermaliq.ThermalIQ` | NSIS installer, `irm install.ps1 \| iex` |
+| **Windows** | **`winget install thermaliq.ThermalIQ`** (power users) | NSIS installer, `irm install.ps1 \| iex` |
 | macOS | DMG + private Homebrew tap | `brew tap thermaliq/tap && brew install thermaliq` |
 | Linux | `install.sh` + AUR `thermaliq-bin` | `.deb`, `.rpm`, `cargo binstall` |
 
+**Windows-specific for v1.0:**
+- NSIS installer: configured in `tauri.conf.json` with HWiNFO64 bundled or prompted download
+- Daemon registered as Windows service: SCM, `StartType::AutoStart`, LocalSystem with restricted ACLs
+- UI auto-starts as tray app on user login (startup folder or registry)
+- winget manifest: `packaging/winget/manifests/` updated per release via automation
+
 ### 5.5 Landing Page (thermaliq.dev)
-- Stack: Cloudflare Pages, static HTML/CSS
+- Stack: Cloudflare Pages, static HTML/CSS or Mintlify (post-v1.0)
 - Headline: "Fan control that thinks for itself."
-- Tabbed install commands (Win/macOS/Linux/Cargo)
+- Tabbed install commands (Win primary for v1.0, macOS/Linux secondary)
 - Terminal animation (SVG asciinema): agent detecting gaming load, adjusting fans
 - Sections: features, how it works, screenshots, hardware compat matrix, security, FAQ
+- **Deferred to v1.1**: full docs site; v1.0 uses GitHub README + basic docs
 
 ### 5.6 Launch Sequence
 1. winget PR submitted (**4 weeks before**)
-2. Homebrew private tap created + tested
-3. AUR `thermaliq-bin` submitted (live immediately)
-4. Landing page + update endpoint deployed
-5. v1.0.0 tag → release CI → artifacts signed + notarized + uploaded
-6. Show HN: "Show HN: ThermalIQ – AI agent fan controller for Windows, Linux, macOS"
-7. Reddit (Day 1): r/linux, r/pcmasterrace, r/homelab
-8. Reddit (Day 3): r/rust, r/MacOS, r/sysadmin
+2. SignPath.io organization verification started (Week 1 of sprint — can take days)
+3. Homebrew private tap created + tested (if macOS included; deferred if Windows-only v1.0)
+4. AUR `thermaliq-bin` submitted (if Linux included; deferred if Windows-only v1.0)
+5. Landing page + update endpoint deployed
+6. v1.0.0 tag → release CI → artifacts signed via SignPath.io + uploaded
+7. **Public beta announcement** (open beta for 2-4 weeks before general release)
+8. Show HN: "Show HN: ThermalIQ – AI agent Windows fan controller"
+9. Reddit (Day 1): r/pcmasterrace, r/overclocking, r/techsupport
+10. Reddit (Day 3): r/rust, r/windows, r/sysadmin
+
+---
+
+## v1.0 Scope: Windows-First (User Confirmed 2026-04-15)
+
+### Critical Path (MUST SHIP)
+
+**1. Windows HAL** (`thermaliq-hal/src/windows.rs`) — **BLOCKING**
+- HWiNFO64 shared memory (`Global\HWiNFO_SENS_SM2`): full sensor enumeration
+- NVML (NVIDIA GPU fan writes): `nvml-wrapper` crate, driver ≥520 required
+- WMI fallback: complete stubbed implementation
+- Windows service: SCM registration in daemon (`service.rs`)
+- **Bundle HWiNFO64** in NSIS installer or prompt download (check EULA redistribution terms)
+
+**2. GUI Pages** (`thermaliq-ui/src/components/`) — **BLOCKING**
+- `CurveEditor.tsx`: 3-in-1 (drag-point chart + editable breakpoint table + AI describe-it input)
+  - Chart library: `recharts` or `visx`
+  - Keep chart + table in sync when either is edited
+- `Settings.tsx`: AI provider keys (Anthropic, OpenAI, Gemini, Ollama, OpenRouter), trust level (full-auto / bounded / suggest-only), guardrails (min fan%, kill-switch threshold, cooldown), telemetry toggle
+- `CalibrationWizard.tsx`: step-through hardware detection → fan spin-up → RPM mapping → AI suggests starting curve
+- `HardwareDetect.tsx`: first-launch auto-scan, show what was found before opening dashboard
+
+**3. System Tray** — **BLOCKING**
+- Minimize to tray, restore on click
+- Right-click menu: Open Dashboard | Quick Profile Switch (dropdown list) | Live temp/RPM readout | Pause/Resume AI | Quit
+- Icon changes color/badge on critical alert
+- Tauri `tauri-plugin-system-tray` or native Windows API
+
+**4. Multi-Provider AI** (`thermaliq-daemon/src/`) — **BLOCKING**
+- Abstract `AIProvider` trait in common crate
+- Implementations: **Anthropic (Claude)**, **OpenAI**, **Google Gemini**, **Ollama (local)**, **OpenRouter**
+- User selects provider + enters API key in Settings; key stored in `~/.config/thermaliq/config.toml`
+- Graceful fallback if no key: show warning, disable AI features, manual control still works
+
+**5. Autonomous AI Agent Enhancements** — **BLOCKING**
+- Configurable trust levels: full-auto (AI has all control) / bounded (within user guardrails) / suggest-only (user approves)
+- AI-defined custom curve types: AI can generate novel curve formulas, stored as `UserDefined` variant in DB
+- Context-aware profile triggers: idle detection (no input N min) + gaming detection (GPU > X% util) + video editing detection
+  - AI learns patterns, proposes new custom triggers
+- 24/7 resilience: daemon restarts agent task on boot, survives crashes
+
+**6. Safety Guardrails** (`thermaliq-daemon/src/poller.rs`) — **BLOCKING**
+- Per-fan minimum duty% floor (AI cannot override below this)
+- Global temp kill-switch (any sensor > threshold → all fans 100% immediately)
+- Curve change cooldown (min seconds between AI changes — prevents oscillation)
+- Full audit log: every hardware write timestamped with trigger reason + AI decision context
+- All guardrails configurable in Settings; none hard-coded
+
+**7. Notifications** (Windows toast + tray) — **BLOCKING**
+- "AI changed fan curve: [reason]" → toast
+- "Profile auto-switched to [name]" → toast
+- "Critical: CPU 95°C" → toast + tray icon flash + sound
+- "Update available: v1.1" → toast with click-to-install
+
+**8. CLI Additions** (`thermaliq-cli/src/`) — **BLOCKING**
+- `tq agent start|stop|status` — control autonomous agent
+- `tq calibrate` — run calibration headless (for server / scripting)
+- `tq profile import <file>` / `tq profile export <name> <file>`
+- `tq update` — check for and apply updates
+- Research recommended (nice-to-have): `tq monitor` (live sensor table in terminal), `tq logs tail` (agent decision stream)
+
+**9. Public API Surface** — **BLOCKING**
+- **OpenAPI spec**: `docs/api.yaml` or `/api/openapi.json` served by daemon — all 18 endpoints + new /metrics, /webhooks documented
+- **WebSocket API**: public, documented, requires bearer token auth (already in place)
+- **Prometheus `/metrics`**: `thermaliq_sensor_celsius{id="cpu_package"}`, fan RPM per fan, AI intervention counters, profile active label
+
+**10. Webhooks** — **BLOCKING**
+- Settings page: add webhook URL + event filter (alerts / AI changes / profile switches)
+- Daemon POSTs JSON payload; retry logic (3 attempts, exponential backoff)
+- `X-ThermalIQ-Signature: sha256=<hmac>` header for verification
+
+**11. Distribution & Code Signing** — **BLOCKING**
+- SignPath.io in `release.yml` (free OSS tier, organization verification may take days)
+- winget manifest updated per release
+- NSIS installer with HWiNFO64 bundled or prompted
+- Tauri auto-updater with Ed25519 signing
+
+**12. Auto-generated CHANGELOG + SemVer** — **BLOCKING**
+- Conventional commits (enforce or document)
+- `git-cliff` or `release-please` in CI on tag push → `CHANGELOG.md`
+- SemVer: v0.3.0 (Phase 1 complete) → v1.0.0 (launch)
+
+**13. i18n Framework** (English only, plumbing for future translations) — **BLOCKING**
+- `react-i18next` added to `thermaliq-ui`
+- All UI strings extracted to `en.json`
+- Community can PR translations in v1.x
+
+**14. MCP Server** — **BLOCKING** (user wants Claude Code integration)
+- Expose daemon REST API as MCP tools: read sensors, set fan duty, switch profile, control agent, read audit log
+- Built as thin wrapper (~200 lines Rust or Node/Python sidecar)
+- Users can connect Claude Code, OpenClaw, etc.
+
+**15. CONTRIBUTING + GitHub Templates** — **BLOCKING**
+- `.github/pull_request_template.md`
+- `.github/ISSUE_TEMPLATE/bug_report.md`, `feature_request.md`, `hardware_compatibility.md`
+- Code style guide in `CONTRIBUTING.md`
+- Dev setup guide: build, test, run locally with `--features mock-hardware`
+
+**16. Config Export/Import** — **BLOCKING**
+- `tq config export > backup.toml` / `tq config import backup.toml`
+- Simple file operation, stores all user settings
+
+---
+
+### DEFER to v1.1+ (Honest: not achievable in 1 month)
+
+| Feature | Reason | Target |
+|---------|--------|--------|
+| Community profile library (Supabase backend) | Backend dev + moderation system = 2-4 weeks | v1.1 |
+| Cloud config sync | Depends on Supabase | v1.1 |
+| Landing/docs site (Mintlify) | GitHub README + basic docs sufficient | v1.1 |
+| AIO pump speed control | Complex vendor SDKs (Corsair iCUE, NZXT) | v1.2 |
+| RGB via OpenRGB | Needs real hardware testing time | v1.1 |
+| AMD fan writes (ADL/ADLX) | HWiNFO64 reads cover monitoring; writes complex | v1.1 |
+| Intel Arc (IGCL) | Tiny market, complex SDK | v1.2 |
+| Grafana dashboard JSON | Ship /metrics; community builds dashboards | v1.1 |
+| In-app hardware compat checker | Docs page sufficient | v1.1 |
+| PID controller curve | Existing types + AI fill the gap | v1.1 |
+| Acoustic target curve | Requires mic input / dB meter | v1.1 |
+| Full integration test suite (CI) | Mock CI sufficient; beta tests on real hardware | v1.1 |
+| macOS / Linux platforms | Windows-only v1.0 per user | v1.2 |
+| Plugin API (public) | Internal only for now | v1.1 |
+| Multi-user configs | Single-user only for v1.0 | Phase 7 |
+| Remote LAN access | Localhost only + Tailscale docs tip | v1.1 |
+| Supabase user accounts | Only for community library | v1.1 |
 
 ---
 

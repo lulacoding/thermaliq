@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback } from "react";
 import { Layers, CheckCircle } from "lucide-react";
 import { useToken } from "../hooks/useToken";
+import { useTranslation } from "react-i18next";
 
 const BASE = "http://127.0.0.1:7272";
 
@@ -13,6 +14,7 @@ const PROFILE_DESCRIPTIONS: Record<string, string> = {
 };
 
 export default function ProfileManager() {
+  const { t } = useTranslation();
   const { token } = useToken();
 
   const [profiles, setProfiles] = useState<string[]>([]);
@@ -72,14 +74,14 @@ export default function ProfileManager() {
   return (
     <div style={styles.root}>
       <div style={styles.header}>
-        <h1 style={styles.title}>Profiles</h1>
+        <h1 style={styles.title}>{t("profiles.title")}</h1>
         <button
           className="btn-ghost"
           onClick={() => void fetchProfiles()}
           disabled={loading}
           style={{ fontSize: 12 }}
         >
-          Refresh
+          {t("profiles.refresh")}
         </button>
       </div>
 
@@ -91,7 +93,7 @@ export default function ProfileManager() {
 
       {loading && (
         <p style={styles.loadingText} className="loading-pulse">
-          Loading profiles…
+          {t("profiles.loading")}
         </p>
       )}
 
@@ -110,6 +112,7 @@ export default function ProfileManager() {
                   ...(isActive ? styles.profileCardActive : {}),
                 }}
               >
+                <div style={styles.profileCardAccentBar} />
                 <div style={styles.profileTop}>
                   <div style={styles.profileIconWrap}>
                     <Layers
@@ -120,12 +123,12 @@ export default function ProfileManager() {
                   {isActive && (
                     <span className="badge badge-blue">
                       <CheckCircle size={9} />
-                      Active
+                      {t("profiles.active")}
                     </span>
                   )}
                   {isApplying && (
                     <span className="badge badge-gray loading-pulse">
-                      Applying…
+                      {t("profiles.applying")}
                     </span>
                   )}
                 </div>
@@ -144,9 +147,9 @@ export default function ProfileManager() {
       {!token && !loading && (
         <div style={styles.tokenWarning}>
           <p style={styles.tokenWarningText}>
-            API token not found at{" "}
+            {t("profiles.tokenMissing")}{" "}
             <span className="mono">~/.config/thermaliq/api.token</span>.
-            Profile switching is disabled.
+            {t("profiles.switchingDisabled")}
           </p>
         </div>
       )}
@@ -199,6 +202,16 @@ const styles: Record<string, React.CSSProperties> = {
     textAlign: "left",
     cursor: "pointer",
     transition: "border-color 0.15s, background 0.15s",
+    position: "relative",
+    overflow: "hidden",
+  },
+  profileCardAccentBar: {
+    position: "absolute",
+    bottom: 0,
+    left: 0,
+    right: 0,
+    height: 4,
+    background: "var(--accent)",
   },
   profileCardActive: {
     borderColor: "var(--accent)",

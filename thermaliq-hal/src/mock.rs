@@ -113,6 +113,8 @@ mod tests {
             fan_id: "cpu_fan".into(),
             duty_percent: 75,
             dc_mode: false,
+            start_percent: None,
+            stop_percent: None,
         })
         .await
         .unwrap();
@@ -129,6 +131,8 @@ mod tests {
                 fan_id: "nonexistent".into(),
                 duty_percent: 50,
                 dc_mode: false,
+                start_percent: None,
+                stop_percent: None,
             })
             .await;
         assert!(result.is_err());

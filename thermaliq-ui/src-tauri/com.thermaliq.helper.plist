@@ -4,10 +4,13 @@
 <dict>
     <key>Label</key>
     <string>com.thermaliq.helper</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/Library/PrivilegedHelperTools/com.thermaliq.helper</string>
-    </array>
+    <key>MachServices</key>
+    <dict>
+        <key>com.thermaliq.helper</key>
+        <true/>
+    </dict>
+    <key>Program</key>
+    <string>/Library/PrivilegedHelperTools/com.thermaliq.helper</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>

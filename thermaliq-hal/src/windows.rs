@@ -331,20 +331,73 @@ fn nvml_set_fan(fan_id: &str, duty_percent: u8) -> Result<()> {
         .next()
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| anyhow!("invalid nvml fan id: {fan_id}"))?;
-    let fan_idx: u32 = parts
+    let _fan_idx: u32 = parts
         .next()
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| anyhow!("invalid nvml fan id: {fan_id}"))?;
 
-    // nvml-wrapper 0.10 does not yet expose nvmlDeviceSetFanSpeed_v2 in its safe
-    // API. Fan speed writes will be available in a future crate release.
-    // Track: https://github.com/Cldfire/nvml-wrapper/issues
-    let _ = (gpu_idx, fan_idx, duty_percent);
-    bail!(
-        "NVML GPU fan writes are not yet available in nvml-wrapper 0.10. \
-         Upgrade the crate when nvmlDeviceSetFanSpeed_v2 is wrapped."
-    )
+    // Direct FFI to nvidia-ml.dll for fan speed control.
+    // NVIDIA NVML library exports:
+    // - nvmlInit_v2 / nvmlShutdown
+    // - nvmlDeviceGetHandleByIndex
+    // - nvmlDeviceSetFanSpeed_v2(device, fan_index, policy, speed)
+    //   where policy=0 (default), speed=0-100
+    //
+    // Note: Requires NVIDIA driver 520+ and admin privileges.
+
+    let lib = unsafe { libloading::Library::new("nvidia-ml.dll") }
+        .context("nvidia-ml.dll not found — NVIDIA driver (520+) required")?;
+
+    unsafe {
+        // Load NVML functions
+        let init: libloading::Symbol<unsafe extern "C" fn() -> i32> =
+            lib.get(b"nvmlInit_v2\0").context("nvmlInit_v2 not found")?;
+
+        let shutdown: libloading::Symbol<unsafe extern "C" fn() -> i32> = lib
+            .get(b"nvmlShutdown\0")
+            .context("nvmlShutdown not found")?;
+
+        let device_get: libloading::Symbol<unsafe extern "C" fn(u32, *mut nvml_device_t) -> i32> =
+            lib.get(b"nvmlDeviceGetHandleByIndex_v2\0")
+                .or_else(|_| lib.get(b"nvmlDeviceGetHandleByIndex\0"))
+                .context("nvmlDeviceGetHandleByIndex not found")?;
+
+        let fan_set: libloading::Symbol<unsafe extern "C" fn(nvml_device_t, u32, u32, u32) -> i32> =
+            lib.get(b"nvmlDeviceSetFanSpeed_v2\0")
+                .context("nvmlDeviceSetFanSpeed_v2 not found — driver 520+ required")?;
+
+        if init() != NVML_OK {
+            bail!("nvmlInit_v2 failed");
+        }
+
+        let mut device: nvml_device_t = std::ptr::null_mut();
+        if device_get(gpu_idx, &mut device) != NVML_OK {
+            shutdown();
+            bail!("nvmlDeviceGetHandleByIndex failed for GPU {gpu_idx}");
+        }
+
+        // Set fan speed: policy=1 (manual), speed=0-100
+        let speed = (duty_percent as u32).clamp(0, 100);
+        let ret = fan_set(device, 0, 1, speed);
+        shutdown();
+
+        if ret != NVML_OK {
+            bail!("nvmlDeviceSetFanSpeed_v2 failed (error {ret}). Check that driver is 520+.");
+        }
+    }
+
+    tracing::info!(
+        fan = fan_id,
+        duty = duty_percent,
+        "Windows: NVIDIA NVML fan speed set"
+    );
+    Ok(())
 }
+
+// NVML type definitions for FFI
+#[allow(non_camel_case_types)]
+type nvml_device_t = *mut std::ffi::c_void;
+const NVML_OK: i32 = 0;
 
 // ── AMD ADL fan control ───────────────────────────────────────────────────────
 //

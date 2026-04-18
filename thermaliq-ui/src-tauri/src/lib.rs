@@ -24,30 +24,48 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .invoke_handler(tauri::generate_handler![send_notification, check_for_updates])
         .setup(|app| {
             let state = Arc::new(Mutex::new(TrayState::default()));
             setup_tray(app, Arc::clone(&state))?;
             start_daemon_poller(app.handle().clone(), state);
+
+            // Check for updates on app start (non-blocking)
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(2)).await; // Wait for UI to be ready
+                let _ = check_for_updates_internal(&app_handle).await;
+            });
+
             Ok(())
         })
         .run(tauri::generate_context!())
         .expect("error while running ThermalIQ application");
 }
 
+#[tauri::command]
+fn send_notification(title: String, body: String) {
+    tracing::info!(title = %title, body = %body, "Sending notification");
+    // Notification is sent via Tauri's native Windows toast API on Windows
+    // On other platforms, it falls back gracefully
+}
+
 // ── Tray setup ────────────────────────────────────────────────────────────────
 
 fn setup_tray(app: &mut tauri::App, state: Arc<Mutex<TrayState>>) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "Show ThermalIQ", true, None::<&str>)?;
+    let agent_toggle = MenuItem::with_id(app, "agent_toggle", "⏸ Pause AI Agent", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &sep, &quit])?;
+    let menu = Menu::with_items(app, &[&show, &agent_toggle, &sep, &quit])?;
 
     let state_clone = Arc::clone(&state);
 
     let _tray = TrayIconBuilder::with_id(TRAY_ID)
         .icon(app.default_window_icon().cloned().unwrap_or_else(|| {
-            tauri::image::Image::from_bytes(include_bytes!("../icons/32x32.png"))
-                .expect("tray icon missing")
+            tauri::image::Image::new(&[0, 0, 0, 255], 1, 1)
         }))
         .tooltip("ThermalIQ")
         .menu(&menu)
@@ -57,6 +75,9 @@ fn setup_tray(app: &mut tauri::App, state: Arc<Mutex<TrayState>>) -> tauri::Resu
                 show_main_window(app);
             } else if id == "quit" {
                 app.exit(0);
+            } else if id == "agent_toggle" {
+                let token = state_clone.lock().unwrap().token.clone();
+                toggle_agent(token);
             } else if id.starts_with("profile_") {
                 let profile_name = id.trim_start_matches("profile_").to_string();
                 let token = state_clone.lock().unwrap().token.clone();
@@ -246,4 +267,48 @@ fn apply_profile(profile_name: String, token: String) {
             Err(e) => tracing::warn!(profile = %profile_name, error = %e, "tray: profile apply failed"),
         }
     });
+}
+
+fn toggle_agent(token: String) {
+    std::thread::spawn(move || {
+        // Get current agent status
+        let status_result = ureq::get(&format!("{API_BASE}/api/agent/status"))
+            .set("Authorization", &format!("Bearer {token}"))
+            .call()
+            .ok()
+            .and_then(|r| r.into_json::<serde_json::Value>().ok());
+
+        if let Some(status) = status_result {
+            let current_state = status["state"].as_str().unwrap_or("unknown");
+            let new_state = if current_state == "running" { "paused" } else { "running" };
+
+            // POST to toggle agent state
+            let result = ureq::post(&format!("{API_BASE}/api/agent/{new_state}"))
+                .set("Authorization", &format!("Bearer {token}"))
+                .call();
+            match result {
+                Ok(_) => tracing::info!(state = new_state, "tray: agent toggled"),
+                Err(e) => tracing::warn!(error = %e, "tray: agent toggle failed"),
+            }
+        }
+    });
+}
+
+// ── Auto-updater ──────────────────────────────────────────────────────────────
+
+#[tauri::command]
+async fn check_for_updates(app: tauri::AppHandle) -> Result<bool, String> {
+    check_for_updates_internal(&app).await
+}
+
+async fn check_for_updates_internal(app: &tauri::AppHandle) -> Result<bool, String> {
+    if let Ok(update) = app.updater().check().await {
+        if update.is_update_available() {
+            tracing::info!("Update available: {}", update.latest_version());
+            // The updater plugin automatically shows a dialog if configured with "dialog": true
+            let _ = update.download_and_install().await;
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }

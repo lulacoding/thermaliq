@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Enables core and notification permissions","local":true,"windows":["main"],"permissions":["core:webview:allow-internal-toggle-devtools","notification:default"]}}

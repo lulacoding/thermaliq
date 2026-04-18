@@ -26,7 +26,7 @@ windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_System_Memory",
 ] }
-nvml-wrapper = "0.10"
+nvml-wrapper = "0.12"
 widestring = "1"
 libloading = "0.8"
 wmi = "0.18"
