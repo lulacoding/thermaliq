@@ -39,23 +39,6 @@ export function recordCheck(): void {
   localStorage.setItem(THROTTLE_KEY, String(Date.now()));
 }
 
-/**
- * Compare two semver strings.
- * Returns true when `candidate` is strictly greater than `current`.
- */
-export function isNewerVersion(current: string, candidate: string): boolean {
-  const parse = (v: string) =>
-    v
-      .replace(/^v/, "")
-      .split(".")
-      .map((n) => parseInt(n, 10) || 0);
-  const [cMaj, cMin, cPat] = parse(current);
-  const [nMaj, nMin, nPat] = parse(candidate);
-  if (nMaj !== cMaj) return nMaj > cMaj;
-  if (nMin !== cMin) return nMin > cMin;
-  return nPat > cPat;
-}
-
 function classifyError(e: unknown): UpdaterError {
   const msg = String(e).toLowerCase();
   if (

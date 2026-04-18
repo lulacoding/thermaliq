@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { shouldCheck, recordCheck, isNewerVersion, THROTTLE_KEY } from "./useUpdater";
+import { describe, it, expect, beforeEach } from "vitest";
+import { shouldCheck, recordCheck, THROTTLE_KEY } from "./useUpdater";
 
 // ── shouldCheck / recordCheck ─────────────────────────────────────────────────
 
@@ -50,44 +50,6 @@ describe("recordCheck", () => {
   });
 });
 
-// ── isNewerVersion ────────────────────────────────────────────────────────────
-
-describe("isNewerVersion", () => {
-  it("returns true when candidate has higher major", () => {
-    expect(isNewerVersion("1.0.0", "2.0.0")).toBe(true);
-  });
-
-  it("returns true when candidate has higher minor", () => {
-    expect(isNewerVersion("1.0.0", "1.1.0")).toBe(true);
-  });
-
-  it("returns true when candidate has higher patch", () => {
-    expect(isNewerVersion("1.0.0", "1.0.1")).toBe(true);
-  });
-
-  it("returns false for identical versions", () => {
-    expect(isNewerVersion("1.2.3", "1.2.3")).toBe(false);
-  });
-
-  it("returns false when candidate is older (major)", () => {
-    expect(isNewerVersion("2.0.0", "1.9.9")).toBe(false);
-  });
-
-  it("returns false when candidate is older (minor)", () => {
-    expect(isNewerVersion("1.5.0", "1.4.9")).toBe(false);
-  });
-
-  it("returns false when candidate is older (patch)", () => {
-    expect(isNewerVersion("1.0.5", "1.0.4")).toBe(false);
-  });
-
-  it("handles v-prefixed strings", () => {
-    expect(isNewerVersion("v1.0.0", "v1.0.1")).toBe(true);
-    expect(isNewerVersion("v1.0.1", "v1.0.0")).toBe(false);
-  });
-
-  it("handles two-part versions gracefully", () => {
-    expect(isNewerVersion("1.0", "1.1")).toBe(true);
-    expect(isNewerVersion("2.0", "1.9")).toBe(false);
-  });
-});
+// Semver comparison is delegated to the Tauri updater plugin (Rust side),
+// which performs the canonical check against the signed `latest.json`.
+// No client-side re-implementation is needed.
