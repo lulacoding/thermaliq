@@ -333,19 +333,38 @@ EOF
       - name: Generate latest.json update manifest
         # Gated on TAURI_SIGNING_PRIVATE_KEY so unsigned dev/fork runs are no-ops.
         # Format: https://tauri.app/plugin/updater/#update-server
+        # Built with `jq` to avoid heredoc indentation + shell injection pitfalls,
+        # then validated with `jq -e .` so malformed JSON fails the job loudly.
         if: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
+          set -euo pipefail
+
           VERSION=${{ github.ref_name }}
           VERSION=${VERSION#v}
           PUBDATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-          # Collect platform artifacts produced by tauri-action
-          collect_sig() {
-            local pattern="$1"
-            find artifacts -name "$pattern" -type f 2>/dev/null | head -1
+          # Debug: list all artifacts produced by tauri-action so sig-pattern
+          # mismatches can be diagnosed from CI logs.
+          echo "== artifacts tree =="
+          find artifacts -type f | sort
+
+          # Read the first .sig file matching a glob and return its contents.
+          # Fails the job if no match is found (signature verification would
+          # fail silently otherwise, bricking the updater).
+          read_sig() {
+            local label="$1"
+            local pattern="$2"
+            local file
+            file=$(find artifacts -type f -name "$pattern" 2>/dev/null | head -1)
+            if [ -z "$file" ]; then
+              echo "ERROR: no signature file matched '$pattern' for $label" >&2
+              echo "       Check tauri-action bundle target names." >&2
+              exit 1
+            fi
+            cat "$file"
           }
 
           WIN_URL="https://github.com/lulacoding/thermaliq/releases/download/v${VERSION}/ThermalIQ_${VERSION}_x64-setup.exe"
@@ -353,37 +372,47 @@ EOF
           MAC_X64_URL="https://github.com/lulacoding/thermaliq/releases/download/v${VERSION}/ThermalIQ_${VERSION}_x64.dmg"
           LIN_URL="https://github.com/lulacoding/thermaliq/releases/download/v${VERSION}/thermaliq_${VERSION}_amd64.AppImage"
 
-          WIN_SIG=$(cat "$(collect_sig "*.nsis.zip.sig")" 2>/dev/null || echo "")
-          MAC_ARM_SIG=$(cat "$(collect_sig "*aarch64.dmg.sig")" 2>/dev/null || echo "")
-          MAC_X64_SIG=$(cat "$(collect_sig "*x64.dmg.sig")" 2>/dev/null || echo "")
-          LIN_SIG=$(cat "$(collect_sig "*.AppImage.tar.gz.sig")" 2>/dev/null || echo "")
+          # tauri-action emits signatures next to each bundle:
+          #   *.nsis.zip.sig     — windows NSIS updater bundle
+          #   *.app.tar.gz.sig   — macOS updater bundle (per-arch)
+          #   *.AppImage.tar.gz.sig — linux AppImage updater bundle
+          WIN_SIG=$(read_sig "windows-x86_64" "*-setup.nsis.zip.sig")
+          MAC_ARM_SIG=$(read_sig "darwin-aarch64" "*aarch64.app.tar.gz.sig")
+          MAC_X64_SIG=$(read_sig "darwin-x86_64" "*x64.app.tar.gz.sig")
+          LIN_SIG=$(read_sig "linux-x86_64" "*amd64.AppImage.tar.gz.sig")
 
-          cat > latest.json <<JSON
-          {
-            "version": "${VERSION}",
-            "notes": "See https://github.com/lulacoding/thermaliq/releases/tag/v${VERSION}",
-            "pub_date": "${PUBDATE}",
-            "platforms": {
-              "windows-x86_64": {
-                "signature": "${WIN_SIG}",
-                "url": "${WIN_URL}"
-              },
-              "darwin-aarch64": {
-                "signature": "${MAC_ARM_SIG}",
-                "url": "${MAC_ARM_URL}"
-              },
-              "darwin-x86_64": {
-                "signature": "${MAC_X64_SIG}",
-                "url": "${MAC_X64_URL}"
-              },
-              "linux-x86_64": {
-                "signature": "${LIN_SIG}",
-                "url": "${LIN_URL}"
-              }
-            }
+          # Build JSON via jq so values are properly escaped and no heredoc
+          # indentation can leak into the payload.
+          jq -n \
+            --arg version "$VERSION" \
+            --arg notes "See https://github.com/lulacoding/thermaliq/releases/tag/v${VERSION}" \
+            --arg pub_date "$PUBDATE" \
+            --arg win_url "$WIN_URL" --arg win_sig "$WIN_SIG" \
+            --arg mac_arm_url "$MAC_ARM_URL" --arg mac_arm_sig "$MAC_ARM_SIG" \
+            --arg mac_x64_url "$MAC_X64_URL" --arg mac_x64_sig "$MAC_X64_SIG" \
+            --arg lin_url "$LIN_URL" --arg lin_sig "$LIN_SIG" \
+            '{
+               version: $version,
+               notes: $notes,
+               pub_date: $pub_date,
+               platforms: {
+                 "windows-x86_64":  { signature: $win_sig,     url: $win_url     },
+                 "darwin-aarch64":  { signature: $mac_arm_sig, url: $mac_arm_url },
+                 "darwin-x86_64":   { signature: $mac_x64_sig, url: $mac_x64_url },
+                 "linux-x86_64":    { signature: $lin_sig,     url: $lin_url     }
+               }
+             }' > latest.json
+
+          # Validate: fail the job if the output is not well-formed JSON, or if
+          # any signature is empty (would bypass updater verification silently).
+          jq -e . latest.json > /dev/null
+          jq -e '.platforms | to_entries | all(.value.signature != "" and .value.url != "")' latest.json > /dev/null || {
+            echo "ERROR: latest.json has empty signature or url" >&2
+            cat latest.json >&2
+            exit 1
           }
-          JSON
           echo "Generated latest.json for v${VERSION}"
+          cat latest.json
 
       - name: Create draft release
         uses: softprops/action-gh-release@v2
