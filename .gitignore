@@ -1,6 +1,7 @@
 /target
 Cargo.lock
 *.token
+*.key
 
 # OMC runtime state (session-specific, not for version control)
 .omc/state/

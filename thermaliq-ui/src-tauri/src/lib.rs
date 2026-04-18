@@ -1,5 +1,5 @@
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
@@ -74,6 +74,30 @@ pub fn run() {
             let state = Arc::new(Mutex::new(TrayState::default()));
             setup_tray(app, Arc::clone(&state))?;
             start_daemon_poller(app.handle().clone(), state);
+
+            // Background update check: only if user hasn't opted out and 24h have elapsed.
+            if auto_update_check_enabled() && should_run_update_check() {
+                let app_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    // Brief delay so the UI is ready before any banner appears.
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    use tauri_plugin_updater::UpdaterExt;
+                    if let Ok(updater) = app_handle.updater() {
+                        match updater.check().await {
+                            Ok(Some(update)) => {
+                                tracing::info!(version = %update.version, "Background update check: update available");
+                                let _ = app_handle.emit("update-available", &update.version);
+                                // Store in PendingUpdate so install_update can consume it.
+                                if let Some(state) = app_handle.try_state::<PendingUpdate>() {
+                                    *state.0.lock().await = Some(update);
+                                }
+                            }
+                            Ok(None) => tracing::debug!("Background update check: already up to date"),
+                            Err(e) => tracing::warn!(error = %e, "Background update check failed"),
+                        }
+                    }
+                });
+            }
 
             Ok(())
         })
@@ -328,6 +352,63 @@ fn toggle_agent(token: String) {
             }
         }
     });
+}
+
+// ── Auto-updater helpers ──────────────────────────────────────────────────────
+
+/// Path to the file storing the unix timestamp of the last successful update check.
+fn last_check_path() -> std::path::PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("thermaliq")
+        .join("last_update_check")
+}
+
+/// Read `auto_update_check_enabled` from `~/.config/thermaliq/settings.toml`.
+/// Defaults to `true` if the file or key is absent.
+fn auto_update_check_enabled() -> bool {
+    let path = dirs::config_dir()
+        .unwrap_or_default()
+        .join("thermaliq")
+        .join("settings.toml");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return true;
+    };
+    // Simple key=value parse; full TOML parser not needed for one bool.
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("auto_update_check_enabled") {
+            let val = rest.trim_start_matches(|c: char| c == ' ' || c == '=').trim();
+            return val != "false";
+        }
+    }
+    true
+}
+
+/// Returns true if more than 24 hours have passed since the last stored check,
+/// and records the current time as the new last-check timestamp.
+fn should_run_update_check() -> bool {
+    let path = last_check_path();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let last: u64 = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+
+    if now.saturating_sub(last) < 86_400 {
+        return false;
+    }
+
+    // Update stored timestamp (best-effort).
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, now.to_string());
+    true
 }
 
 // ── Auto-updater ──────────────────────────────────────────────────────────────
