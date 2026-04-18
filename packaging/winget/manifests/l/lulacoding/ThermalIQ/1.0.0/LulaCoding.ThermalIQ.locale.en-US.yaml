@@ -1,0 +1,46 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.9.0.schema.json
+PackageIdentifier: LulaCoding.ThermalIQ
+PackageVersion: 1.0.0
+PackageLocale: en-US
+Publisher: LulaCoding
+PublisherUrl: https://github.com/lulacoding
+PublisherSupportUrl: https://github.com/lulacoding/thermaliq/issues
+PrivacyUrl: https://thermaliq.dev/privacy
+Author: LulaCoding
+PackageName: ThermalIQ
+PackageUrl: https://thermaliq.dev
+License: MIT
+LicenseUrl: https://github.com/lulacoding/thermaliq/blob/main/LICENSE
+Copyright: Copyright (c) LulaCoding
+CopyrightUrl: https://github.com/lulacoding/thermaliq/blob/main/LICENSE
+ShortDescription: AI-powered fan control for Windows, macOS, and Linux
+Description: |-
+  ThermalIQ is an open-source fan controller with a 24/7 AI agent that monitors
+  your hardware and adjusts fan speeds automatically. It reads sensor data via
+  HWiNFO64 on Windows and provides GPU fan control via NVML for NVIDIA cards.
+
+  Features:
+  - 10 fan curve types including AI, predictive, and learning modes
+  - Real-time sensor monitoring via HWiNFO64 shared memory
+  - NVIDIA GPU fan control via NVML
+  - REST API + WebSocket for live sensor data
+  - Tauri desktop UI with dashboard and alert center
+  - CLI tool (tq) for scripting and headless use
+Moniker: thermaliq
+Tags:
+  - fan-control
+  - hardware-monitor
+  - temperature
+  - cooling
+  - gpu
+  - cpu
+  - ai
+ReleaseNotes: |-
+  v1.0.0 — Windows launch release.
+  - HWiNFO64 shared memory sensor backend
+  - NVML GPU fan control (driver 520+ required)
+  - Windows service (auto-start on login)
+  - NSIS installer
+ReleaseNotesUrl: https://github.com/lulacoding/thermaliq/blob/main/CHANGELOG.md
+ManifestType: defaultLocale
+ManifestVersion: 1.9.0

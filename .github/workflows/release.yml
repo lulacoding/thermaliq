@@ -264,6 +264,7 @@ jobs:
           path: artifacts/
 
       - name: Generate winget manifest
+        if: "!contains(github.ref, '-')"
         env:
           REF_NAME: ${{ github.ref_name }}
         run: |
@@ -271,32 +272,34 @@ jobs:
           VERSION="${REF_NAME#v}"
 
           # Create new winget manifest directory
-          WINGET_DIR="packaging/winget/manifests/l/lulacoding/ThermalIQ/$VERSION"
+          WINGET_DIR="packaging/winget/manifests/l/LulaCoding/ThermalIQ/$VERSION"
           mkdir -p "$WINGET_DIR"
 
-          # Copy and update manifest files from 0.3.0 template
-          for file in packaging/winget/manifests/l/lulacoding/ThermalIQ/0.3.0/*; do
+          # Copy and update manifest files from 1.0.0 template
+          for file in packaging/winget/manifests/l/LulaCoding/ThermalIQ/1.0.0/*; do
             filename=$(basename "$file")
-            sed "s/0\.3\.0/$VERSION/g" "$file" > "$WINGET_DIR/$filename"
+            sed "s/1\.0\.0/$VERSION/g" "$file" > "$WINGET_DIR/$filename"
           done
 
-          # Find the NSIS installer in artifacts
+          # Find the NSIS installer in artifacts — hard-fail if missing
           NSIS_FILE=$(find artifacts -name "*_x64-setup.exe" -type f | head -1)
           if [ -z "$NSIS_FILE" ]; then
-            echo "Warning: NSIS installer not found, using placeholder SHA256"
-            SHA256="0000000000000000000000000000000000000000000000000000000000000000"
-          else
-            SHA256=$(sha256sum "$NSIS_FILE" | awk '{print $1}')
+            echo "ERROR: NSIS installer not found in artifacts. Cannot generate winget manifest with a real SHA256." >&2
+            echo "Ensure the Windows Tauri build succeeded and uploaded the *_x64-setup.exe artifact." >&2
+            exit 1
           fi
+          SHA256=$(sha256sum "$NSIS_FILE" | awk '{print $1}')
 
           # Update installer SHA256 and URL
           INSTALLER_YAML="$WINGET_DIR/LulaCoding.ThermalIQ.installer.yaml"
-          sed -i "s/InstallerSha256: .*/InstallerSha256: $SHA256/" "$INSTALLER_YAML"
-          sed -i "s|InstallerUrl: .*|InstallerUrl: https://github.com/lulacoding/thermaliq/releases/download/v$VERSION/ThermalIQ_${VERSION}_x64-setup.exe|" "$INSTALLER_YAML"
+          sed -i.bak "s/InstallerSha256: .*/InstallerSha256: $SHA256/" "$INSTALLER_YAML" && rm "$INSTALLER_YAML.bak"
+          sed -i.bak "s|InstallerUrl: .*|InstallerUrl: https://github.com/lulacoding/thermaliq/releases/download/v$VERSION/ThermalIQ_${VERSION}_x64-setup.exe|" "$INSTALLER_YAML" && rm "$INSTALLER_YAML.bak"
 
-          # Upload manifests as artifact for manual submission to winget-pkgs
+          # Package manifests as artifact for manual submission to winget-pkgs
+          # See packaging/winget/README.md for submission instructions
           tar czf "winget-manifests-$VERSION.tar.gz" -C packaging/winget/manifests l/
           echo "Winget manifests generated for version $VERSION"
+          echo "Submit via: wingetcreate submit (see packaging/winget/README.md)"
 
       - name: Read CHANGELOG for release body
         id: changelog
@@ -309,10 +312,13 @@ jobs:
 ## Installation
 
 **Windows**
+
+Download the NSIS installer below. After the winget manifest is submitted to winget-pkgs,
+you will be able to install via:
 ```powershell
-winget install thermaliq.ThermalIQ
+winget install LulaCoding.ThermalIQ
 ```
-Or download the NSIS installer below.
+See [packaging/winget/README.md](packaging/winget/README.md) for submission status.
 
 **macOS**
 ```bash
