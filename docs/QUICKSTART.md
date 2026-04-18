@@ -84,7 +84,9 @@ thermaliq-daemon
 # Logs to stderr. Set RUST_LOG=debug for verbose output.
 ```
 
-The daemon creates `~/.config/thermaliq/thermaliq.toml` and `~/.config/thermaliq/api.token` on first run.
+The daemon creates the config file and `api.token` on first run:
+- **macOS/Linux**: `~/.config/thermaliq/api.token`
+- **Windows**: `%APPDATA%\thermaliq\api.token`
 
 ---
 

@@ -128,6 +128,10 @@ api_base = "http://127.0.0.1:11434"
 model    = "llama3"
 ```
 
+> **Ollama via REST API (`POST /api/settings/ai-provider`):** When setting the provider dynamically, pass the Ollama base URL (e.g., `http://localhost:11434`) as the `api_key` field — there is no separate `api_base` field in the REST body. Example: `{"provider": "ollama", "api_key": "http://localhost:11434"}`.
+
+> **NOTE: Profile and curve generation currently requires `ANTHROPIC_API_KEY` environment variable set on the daemon, regardless of the configured AI provider.** The `POST /api/profiles/generate` and `POST /api/curves/ai-generate` endpoints call Anthropic directly. Multi-provider support for generation endpoints is tracked for post-v1.0.
+
 ### Disabling AI features
 
 If no API key is configured, or if you set `enabled = false`, the AI agent switches to passive mode and all AI-specific curve types fall back to a 60% fixed duty.

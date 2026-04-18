@@ -12,8 +12,14 @@ Authorization: Bearer <token>
 
 The token is a 32-byte random hex string generated on first run and stored at:
 - **macOS/Linux**: `~/.config/thermaliq/api.token` (mode 0600)
+- **Windows**: `%APPDATA%\thermaliq\api.token`
 
-CORS is restricted to `tauri://localhost` — the Tauri desktop app origin.
+CORS allowed origins:
+- `tauri://localhost` — production Tauri desktop app
+- `http://localhost:1420` — dev server (dev builds only)
+- `http://127.0.0.1:1420` — dev server alternate (dev builds only)
+
+> **Note:** The two `localhost` origins are dev-only and should ideally be stripped in release builds.
 
 ---
 
@@ -110,7 +116,9 @@ Switch the active fan control profile. Change takes effect immediately on the ne
 
 ### Battery
 
-#### `GET /api/battery/status`
+> **Coming in v1.0** — Battery state profile switching is implemented in the daemon (Phase 3.4) but the REST endpoint below is not yet wired up in this release. The automatic profile-switching logic (on-battery → silent, plugged-in → balanced) runs internally; the endpoint to query/configure it will be available in v1.0.
+
+#### `GET /api/battery/status` _(v1.0)_
 Returns battery state profile configuration. Requires authentication.
 
 ```json
@@ -212,6 +220,52 @@ All history endpoints support `?limit=N` (default 100, max determined by DB rete
   ]
 }
 ```
+
+---
+
+### Curves
+
+#### `POST /api/curves/save` — Auth required
+
+Save an edited fan curve to a named profile.
+
+> **Note:** This endpoint validates and logs the curve but does **not** currently persist it back to the profile TOML on disk. Curve edits are in-memory only until a full profile save is implemented (tracked for post-v1.0).
+
+**Request:**
+```json
+{
+  "profile": "balanced",
+  "fan_id": "cpu_fan",
+  "points": [
+    { "temp_celsius": 30, "duty_percent": 20 },
+    { "temp_celsius": 80, "duty_percent": 100 }
+  ]
+}
+```
+
+**Response:**
+```json
+{ "profile": "balanced", "fan_id": "cpu_fan", "points_count": 2, "status": "saved" }
+```
+
+---
+
+### Settings
+
+#### `POST /api/settings/ai-provider` — Auth required
+
+Set the active AI provider at runtime.
+
+**Request:**
+```json
+{ "provider": "anthropic", "api_key": "sk-ant-..." }
+```
+
+Supported `provider` values: `anthropic`, `openai`, `gemini`, `ollama`, `openrouter`.
+
+> **Ollama:** Pass the Ollama base URL as the `api_key` field (e.g., `"api_key": "http://localhost:11434"`). There is no separate `api_base` field in the REST body.
+
+> **NOTE:** Profile and curve generation (`POST /api/profiles/generate`, `POST /api/curves/ai-generate`) currently require `ANTHROPIC_API_KEY` set in the daemon environment, regardless of the configured provider. Multi-provider support for generation endpoints is tracked for post-v1.0.
 
 ---
 
