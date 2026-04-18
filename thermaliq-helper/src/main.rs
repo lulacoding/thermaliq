@@ -480,9 +480,8 @@ mod macos {
                     let fd = stream.as_raw_fd();
                     let mut peer_uid: libc::uid_t = libc::uid_t::MAX;
                     let mut peer_gid: libc::gid_t = 0;
-                    let cred_ok = unsafe {
-                        libc::getpeereid(fd, &mut peer_uid, &mut peer_gid)
-                    } == 0;
+                    let cred_ok =
+                        unsafe { libc::getpeereid(fd, &mut peer_uid, &mut peer_gid) } == 0;
                     if !cred_ok || peer_uid != allowed_uid {
                         tracing::warn!(
                             peer_uid,
