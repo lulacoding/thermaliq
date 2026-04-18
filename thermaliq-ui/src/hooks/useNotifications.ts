@@ -1,9 +1,17 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useCallback } from "react";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { mapEventToToast } from "../lib/notificationMapper";
 import type { NotificationSettings } from "./useNotificationSettings";
 
 const WS_AGENT_URL = "ws://127.0.0.1:7272/ws/agent";
+
+/** Per-type cooldown in milliseconds. */
+const COOLDOWN_MS: Record<string, number> = {
+  ai_decision: 30_000,
+  safety_emergency: 5_000,
+  profile_change: 10_000,
+  curve_changed: 30_000,
+};
 
 /** Shared permission state — checked once per app lifetime. */
 let permissionChecked = false;
@@ -53,13 +61,29 @@ async function dispatchToast(title: string, body: string): Promise<void> {
 export function useNotifications(settings?: NotificationSettings) {
   const wsRef = useRef<WebSocket | null>(null);
   const unmountedRef = useRef(false);
-  const connectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const backoffRef = useRef(500);
   // Keep a ref so the WS callback always sees the latest prefs without needing
   // to be recreated.
   const settingsRef = useRef<NotificationSettings | undefined>(settings);
   settingsRef.current = settings;
 
-  const connect = () => {
+  // Per-type last-fire timestamps for rate limiting.
+  const lastFireRef = useRef<Map<string, number>>(new Map());
+
+  const showNotification = useCallback(
+    async (category: string, title: string, body: string): Promise<void> => {
+      const cooldown = COOLDOWN_MS[category] ?? 10_000;
+      const now = Date.now();
+      const last = lastFireRef.current.get(category) ?? 0;
+      if (now - last < cooldown) return;
+      lastFireRef.current.set(category, now);
+      await dispatchToast(title, body);
+    },
+    []
+  );
+
+  const connect = useCallback(() => {
     if (unmountedRef.current) return;
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
 
@@ -67,7 +91,8 @@ export function useNotifications(settings?: NotificationSettings) {
     wsRef.current = ws;
 
     ws.onopen = () => {
-      if (unmountedRef.current) ws.close();
+      if (unmountedRef.current) { ws.close(); return; }
+      backoffRef.current = 500;
     };
 
     ws.onmessage = (event: MessageEvent<string>) => {
@@ -82,34 +107,36 @@ export function useNotifications(settings?: NotificationSettings) {
           if (!prefs.categories[toast.category]) return;
         }
 
-        dispatchToast(toast.title, toast.body);
+        showNotification(toast.category, toast.title, toast.body);
       } catch {
         // Malformed frame — ignore
       }
     };
 
     ws.onclose = () => {
-      if (!unmountedRef.current) {
-        connectTimeoutRef.current = setTimeout(connect, 5000);
-      }
+      if (unmountedRef.current) return;
+      const delay = backoffRef.current;
+      backoffRef.current = Math.min(backoffRef.current * 2, 30_000);
+      retryTimerRef.current = setTimeout(connect, delay);
     };
 
     ws.onerror = () => {
       // Let onclose handle reconnection
     };
-  };
+  }, [showNotification]);
 
   useEffect(() => {
     unmountedRef.current = false;
+    // Request permission before the first WS event fires.
+    ensurePermission();
     connect();
 
     return () => {
       unmountedRef.current = true;
       wsRef.current?.close();
-      if (connectTimeoutRef.current) {
-        clearTimeout(connectTimeoutRef.current);
+      if (retryTimerRef.current !== null) {
+        clearTimeout(retryTimerRef.current);
       }
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [connect]);
 }

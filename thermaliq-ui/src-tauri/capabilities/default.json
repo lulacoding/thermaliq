@@ -5,6 +5,9 @@
   "windows": ["main"],
   "permissions": [
     "core:webview:allow-internal-toggle-devtools",
-    "notification:default"
+    "notification:default",
+    "notification:allow-request-permission",
+    "notification:allow-is-permission-granted",
+    "notification:allow-send-notification"
   ]
 }

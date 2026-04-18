@@ -88,7 +88,7 @@ export default function App() {
         </nav>
 
         <div style={styles.sidebarFooter}>
-          <span style={styles.footerText}>v0.1.0</span>
+          <span style={styles.footerText}>v1.0.0</span>
         </div>
       </aside>
 
