@@ -98,23 +98,18 @@ async fn version() -> Json<Value> {
     Json(json!({ "version": env!("CARGO_PKG_VERSION") }))
 }
 
-async fn hwinfo_status(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
+async fn hwinfo_status(State(_state): State<AppState>) -> Result<Json<Value>, StatusCode> {
     #[cfg(target_os = "windows")]
     {
-        // Windows: check if HWiNFO64 shared memory mapping succeeded
-        let snap = state
+        let snap = _state
             .hal
             .snapshot()
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        // If we successfully got sensors, HWiNFO64 is likely available
-        // (or we fell back to WMI which also works)
-        let has_hwinfo = snap.sensors.iter().any(|s| s.label.contains("HWiNFO"));
         Ok(Json(json!({ "hwinfo_available": !snap.sensors.is_empty() })))
     }
     #[cfg(not(target_os = "windows"))]
     {
-        // macOS/Linux: HWiNFO64 is Windows-only
         Ok(Json(json!({ "hwinfo_available": false })))
     }
 }
