@@ -574,14 +574,16 @@ impl HardwareLayer for LinuxHardwareLayer {
                             set_rdna3_zero_rpm(&card_clone, duty == 0);
                             // Write start_percent if provided (kernel 6.7+).
                             if let Some(start) = start_pct {
-                                let start_path = card_clone.join("device/gpu_od/fan_ctrl/fan_start_speed");
+                                let start_path =
+                                    card_clone.join("device/gpu_od/fan_ctrl/fan_start_speed");
                                 if start_path.exists() {
                                     let _ = fs::write(&start_path, format!("{}\n", start));
                                 }
                             }
                             // Write stop_percent if provided (zero-RPM stop temperature, kernel 6.13+).
                             if let Some(stop) = stop_pct {
-                                let stop_path = card_clone.join("device/gpu_od/fan_ctrl/fan_zero_rpm_stop_temperature");
+                                let stop_path = card_clone
+                                    .join("device/gpu_od/fan_ctrl/fan_zero_rpm_stop_temperature");
                                 if stop_path.exists() {
                                     let _ = fs::write(&stop_path, format!("{}\n", stop));
                                 }

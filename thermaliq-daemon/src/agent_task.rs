@@ -241,32 +241,28 @@ pub fn start_agent_loop(
                         continue;
                     }
 
-                    let (reason, action) = enhance_intervention_with_ai(
-                        &state,
-                        cpu_temp,
-                        gpu_temp,
-                        &workload,
-                    )
-                    .await
-                    .unwrap_or_else(|| {
-                        // Fallback to hardcoded logic if AI is unavailable
-                        if cpu_temp > MAX_CPU_TEMP {
-                            (
-                                format!("CPU {:.1}°C exceeds safety threshold", cpu_temp),
-                                "switch_profile:performance".to_string(),
-                            )
-                        } else if workload == WorkloadKind::Stress {
-                            (
-                                format!("Stress workload detected, CPU {:.1}°C", cpu_temp),
-                                "switch_profile:performance".to_string(),
-                            )
-                        } else {
-                            (
-                                format!("Gaming workload, CPU {:.1}°C", cpu_temp),
-                                "switch_profile:balanced".to_string(),
-                            )
-                        }
-                    });
+                    let (reason, action) =
+                        enhance_intervention_with_ai(&state, cpu_temp, gpu_temp, &workload)
+                            .await
+                            .unwrap_or_else(|| {
+                                // Fallback to hardcoded logic if AI is unavailable
+                                if cpu_temp > MAX_CPU_TEMP {
+                                    (
+                                        format!("CPU {:.1}°C exceeds safety threshold", cpu_temp),
+                                        "switch_profile:performance".to_string(),
+                                    )
+                                } else if workload == WorkloadKind::Stress {
+                                    (
+                                        format!("Stress workload detected, CPU {:.1}°C", cpu_temp),
+                                        "switch_profile:performance".to_string(),
+                                    )
+                                } else {
+                                    (
+                                        format!("Gaming workload, CPU {:.1}°C", cpu_temp),
+                                        "switch_profile:balanced".to_string(),
+                                    )
+                                }
+                            });
 
                     let id = make_id();
                     let before_snapshot = serde_json::to_string(&serde_json::json!({
@@ -400,7 +396,9 @@ async fn enhance_intervention_with_ai(
         Example:\n\
         GPU thermal load detected; switching to balanced cooling\n\
         balanced",
-        cpu_temp, gpu_temp, workload.as_str()
+        cpu_temp,
+        gpu_temp,
+        workload.as_str()
     );
 
     // Call AI provider
@@ -417,11 +415,7 @@ async fn enhance_intervention_with_ai(
                     "silent" | "balanced" | "performance" | "quiet" | "cool" | "gaming"
                 ) {
                     let action = format!("switch_profile:{}", profile_rec);
-                    tracing::debug!(
-                        "[agent:ai] AI recommended: {} (action: {})",
-                        reason,
-                        action
-                    );
+                    tracing::debug!("[agent:ai] AI recommended: {} (action: {})", reason, action);
                     return Some((reason, action));
                 } else {
                     tracing::warn!(
@@ -430,10 +424,7 @@ async fn enhance_intervention_with_ai(
                     );
                 }
             } else {
-                tracing::warn!(
-                    "[agent:ai] Unexpected response format: {}",
-                    response
-                );
+                tracing::warn!("[agent:ai] Unexpected response format: {}", response);
             }
         }
         Err(e) => {

@@ -350,26 +350,21 @@ fn nvml_set_fan(fan_id: &str, duty_percent: u8) -> Result<()> {
 
     unsafe {
         // Load NVML functions
-        let init: libloading::Symbol<unsafe extern "C" fn() -> i32> = lib
-            .get(b"nvmlInit_v2\0")
-            .context("nvmlInit_v2 not found")?;
+        let init: libloading::Symbol<unsafe extern "C" fn() -> i32> =
+            lib.get(b"nvmlInit_v2\0").context("nvmlInit_v2 not found")?;
 
         let shutdown: libloading::Symbol<unsafe extern "C" fn() -> i32> = lib
             .get(b"nvmlShutdown\0")
             .context("nvmlShutdown not found")?;
 
-        let device_get: libloading::Symbol<
-            unsafe extern "C" fn(u32, *mut nvml_device_t) -> i32,
-        > = lib
-            .get(b"nvmlDeviceGetHandleByIndex_v2\0")
-            .or_else(|_| lib.get(b"nvmlDeviceGetHandleByIndex\0"))
-            .context("nvmlDeviceGetHandleByIndex not found")?;
+        let device_get: libloading::Symbol<unsafe extern "C" fn(u32, *mut nvml_device_t) -> i32> =
+            lib.get(b"nvmlDeviceGetHandleByIndex_v2\0")
+                .or_else(|_| lib.get(b"nvmlDeviceGetHandleByIndex\0"))
+                .context("nvmlDeviceGetHandleByIndex not found")?;
 
-        let fan_set: libloading::Symbol<
-            unsafe extern "C" fn(nvml_device_t, u32, u32, u32) -> i32,
-        > = lib
-            .get(b"nvmlDeviceSetFanSpeed_v2\0")
-            .context("nvmlDeviceSetFanSpeed_v2 not found — driver 520+ required")?;
+        let fan_set: libloading::Symbol<unsafe extern "C" fn(nvml_device_t, u32, u32, u32) -> i32> =
+            lib.get(b"nvmlDeviceSetFanSpeed_v2\0")
+                .context("nvmlDeviceSetFanSpeed_v2 not found — driver 520+ required")?;
 
         if init() != NVML_OK {
             bail!("nvmlInit_v2 failed");

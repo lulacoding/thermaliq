@@ -106,7 +106,9 @@ async fn hwinfo_status(State(_state): State<AppState>) -> Result<Json<Value>, St
             .snapshot()
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        Ok(Json(json!({ "hwinfo_available": !snap.sensors.is_empty() })))
+        Ok(Json(
+            json!({ "hwinfo_available": !snap.sensors.is_empty() }),
+        ))
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -284,7 +286,9 @@ async fn resume_agent(State(state): State<AppState>) -> Result<Json<Value>, Stat
     let _ = state
         .agent_event_tx
         .send(json!({ "type": "mode_changed", "mode": "approval" }).to_string());
-    Ok(Json(json!({ "agent_mode": "approval", "status": "running" })))
+    Ok(Json(
+        json!({ "agent_mode": "approval", "status": "running" }),
+    ))
 }
 
 async fn approve_intervention(
@@ -589,7 +593,11 @@ async fn ai_generate_curve(
         })?;
 
     // Extract the first curve definition from the profile
-    let sample_curve = gen.profile.curves.first().ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    let sample_curve = gen
+        .profile
+        .curves
+        .first()
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(json!({
         "prompt": prompt,
@@ -604,8 +612,9 @@ async fn ai_generate_curve(
 async fn get_settings(_state: State<AppState>) -> Result<Json<Value>, StatusCode> {
     // Return current settings from config
     let config = thermaliq_common::config::load_daemon_config(
-        &thermaliq_common::config::default_config_path()
-    ).unwrap_or_default();
+        &thermaliq_common::config::default_config_path(),
+    )
+    .unwrap_or_default();
 
     Ok(Json(json!({
         "api_port": config.api_port,
@@ -699,7 +708,9 @@ async fn set_trust_level(
     _state: State<AppState>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, StatusCode> {
-    let level = body["trust_level"].as_str().ok_or(StatusCode::BAD_REQUEST)?;
+    let level = body["trust_level"]
+        .as_str()
+        .ok_or(StatusCode::BAD_REQUEST)?;
 
     match level {
         "passive" | "approval" | "autonomous" => {
