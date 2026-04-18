@@ -1,5 +1,5 @@
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
-PackageIdentifier: thermaliq.ThermalIQ
+PackageIdentifier: LulaCoding.ThermalIQ
 PackageVersion: 0.3.0
 MinimumOSVersion: 10.0.19041.0
 InstallModes:
@@ -22,7 +22,6 @@ Installers:
     InstallerSha256: 0000000000000000000000000000000000000000000000000000000000000000
     Scope: machine
     InstallerLocale: en-US
-    ProductCode: '{thermaliq-product-code}'
     InstallLocationRequired: false
     ElevationRequirement: elevatesSelf
 ManifestType: installer

@@ -264,17 +264,18 @@ jobs:
           path: artifacts/
 
       - name: Generate winget manifest
+        env:
+          REF_NAME: ${{ github.ref_name }}
         run: |
           # Extract version from tag (strip 'v' prefix)
-          VERSION=${{ github.ref_name }}
-          VERSION=${VERSION#v}
+          VERSION="${REF_NAME#v}"
 
           # Create new winget manifest directory
-          WINGET_DIR="packaging/winget/manifests/t/thermaliq/ThermalIQ/$VERSION"
+          WINGET_DIR="packaging/winget/manifests/l/lulacoding/ThermalIQ/$VERSION"
           mkdir -p "$WINGET_DIR"
 
           # Copy and update manifest files from 0.3.0 template
-          for file in packaging/winget/manifests/t/thermaliq/ThermalIQ/0.3.0/*; do
+          for file in packaging/winget/manifests/l/lulacoding/ThermalIQ/0.3.0/*; do
             filename=$(basename "$file")
             sed "s/0\.3\.0/$VERSION/g" "$file" > "$WINGET_DIR/$filename"
           done
@@ -289,12 +290,12 @@ jobs:
           fi
 
           # Update installer SHA256 and URL
-          INSTALLER_YAML="$WINGET_DIR/thermaliq.ThermalIQ.installer.yaml"
+          INSTALLER_YAML="$WINGET_DIR/LulaCoding.ThermalIQ.installer.yaml"
           sed -i "s/InstallerSha256: .*/InstallerSha256: $SHA256/" "$INSTALLER_YAML"
           sed -i "s|InstallerUrl: .*|InstallerUrl: https://github.com/lulacoding/thermaliq/releases/download/v$VERSION/ThermalIQ_${VERSION}_x64-setup.exe|" "$INSTALLER_YAML"
 
           # Upload manifests as artifact for manual submission to winget-pkgs
-          tar czf winget-manifests-$VERSION.tar.gz -C packaging/winget/manifests t/
+          tar czf "winget-manifests-$VERSION.tar.gz" -C packaging/winget/manifests l/
           echo "Winget manifests generated for version $VERSION"
 
       - name: Read CHANGELOG for release body
