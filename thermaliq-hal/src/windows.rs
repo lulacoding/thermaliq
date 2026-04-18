@@ -400,6 +400,7 @@ fn nvml_set_fan(fan_id: &str, duty_percent: u8) -> Result<()> {
 }
 
 // NVML type definitions for FFI
+#[allow(non_camel_case_types)]
 type nvml_device_t = *mut std::ffi::c_void;
 const NVML_OK: i32 = 0;
 
