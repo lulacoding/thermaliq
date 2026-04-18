@@ -1,8 +1,8 @@
 blank_issues_enabled: false
 contact_links:
   - name: Ask a question
-    url: https://github.com/thermaliq/thermaliq/discussions
+    url: https://github.com/lulacoding/thermaliq/discussions
     about: Use GitHub Discussions for questions and general help
   - name: Security vulnerability
-    url: https://github.com/thermaliq/thermaliq/security/advisories/new
+    url: https://github.com/lulacoding/thermaliq/security/advisories/new
     about: Report security issues privately
