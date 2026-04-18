@@ -143,7 +143,29 @@
     "telemetryLabel": "Send telemetry (helps improve AI recommendations)",
     "saving": "Saving...",
     "saveButton": "Save Settings",
-    "error": "Error loading settings"
+    "error": "Error loading settings",
+    "notifications": "Notifications",
+    "notificationsEnabled": "Enable OS toast notifications",
+    "notificationsCategories": "Notify me about:",
+    "notifIntervention": "AI intervention approvals (click to open Agent panel)",
+    "notifProfileSwitch": "Profile switches (info, auto-dismiss)",
+    "notifAlert": "Thermal alerts and fan stalls (persistent until dismissed)"
+  },
+  "updater": {
+    "available": "ThermalIQ {{version}} is available",
+    "viewChangelog": "View changelog",
+    "installNow": "Install now",
+    "installing": "Installing…",
+    "later": "Later",
+    "checkForUpdates": "Check for updates",
+    "checking": "Checking…",
+    "upToDate": "You're on the latest version.",
+    "updatesTitle": "Updates",
+    "lastChecked": "Last checked: {{time}}",
+    "neverChecked": "Not yet checked",
+    "errorSignature": "Update signature invalid — download aborted for security. Please report this.",
+    "errorPermissions": "Insufficient permissions to install update. On Windows, re-run as administrator. On macOS, authenticate when prompted.",
+    "errorUnknown": "Update error: {{message}}"
   },
   "common": {
     "loading": "Loading...",

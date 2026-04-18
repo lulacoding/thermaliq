@@ -39,15 +39,14 @@
     "shell": {
       "open": true
     },
-    "notification": null,
+    "notification": {
+      "icon": "icons/icon.png"
+    },
     "updater": {
-      "active": true,
-      "pubkey": "dW1sVHEzV21SM1o5RjJyVzBXUENXczJqL3pFRjRxaE5kOFVUaEN2L0RGQkk9",
+      "pubkey": "$TAURI_SIGNING_PUBLIC_KEY",
       "endpoints": [
         "https://github.com/lulacoding/thermaliq/releases/latest/download/latest.json"
-      ],
-      "dialog": true,
-      "pubkey_format": "base64"
+      ]
     }
   }
 }

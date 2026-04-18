@@ -330,9 +330,66 @@ EOF
           echo "$BODY" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
+      - name: Generate latest.json update manifest
+        # Gated on TAURI_SIGNING_PRIVATE_KEY so unsigned dev/fork runs are no-ops.
+        # Format: https://tauri.app/plugin/updater/#update-server
+        if: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          VERSION=${{ github.ref_name }}
+          VERSION=${VERSION#v}
+          PUBDATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          # Collect platform artifacts produced by tauri-action
+          collect_sig() {
+            local pattern="$1"
+            find artifacts -name "$pattern" -type f 2>/dev/null | head -1
+          }
+
+          WIN_URL="https://github.com/lulacoding/thermaliq/releases/download/v${VERSION}/ThermalIQ_${VERSION}_x64-setup.exe"
+          MAC_ARM_URL="https://github.com/lulacoding/thermaliq/releases/download/v${VERSION}/ThermalIQ_${VERSION}_aarch64.dmg"
+          MAC_X64_URL="https://github.com/lulacoding/thermaliq/releases/download/v${VERSION}/ThermalIQ_${VERSION}_x64.dmg"
+          LIN_URL="https://github.com/lulacoding/thermaliq/releases/download/v${VERSION}/thermaliq_${VERSION}_amd64.AppImage"
+
+          WIN_SIG=$(cat "$(collect_sig "*.nsis.zip.sig")" 2>/dev/null || echo "")
+          MAC_ARM_SIG=$(cat "$(collect_sig "*aarch64.dmg.sig")" 2>/dev/null || echo "")
+          MAC_X64_SIG=$(cat "$(collect_sig "*x64.dmg.sig")" 2>/dev/null || echo "")
+          LIN_SIG=$(cat "$(collect_sig "*.AppImage.tar.gz.sig")" 2>/dev/null || echo "")
+
+          cat > latest.json <<JSON
+          {
+            "version": "${VERSION}",
+            "notes": "See https://github.com/lulacoding/thermaliq/releases/tag/v${VERSION}",
+            "pub_date": "${PUBDATE}",
+            "platforms": {
+              "windows-x86_64": {
+                "signature": "${WIN_SIG}",
+                "url": "${WIN_URL}"
+              },
+              "darwin-aarch64": {
+                "signature": "${MAC_ARM_SIG}",
+                "url": "${MAC_ARM_URL}"
+              },
+              "darwin-x86_64": {
+                "signature": "${MAC_X64_SIG}",
+                "url": "${MAC_X64_URL}"
+              },
+              "linux-x86_64": {
+                "signature": "${LIN_SIG}",
+                "url": "${LIN_URL}"
+              }
+            }
+          }
+          JSON
+          echo "Generated latest.json for v${VERSION}"
+
       - name: Create draft release
         uses: softprops/action-gh-release@v2
         with:
           draft: true
-          files: artifacts/**/*
+          files: |
+            artifacts/**/*
+            latest.json
           body: ${{ steps.changelog.outputs.body }}

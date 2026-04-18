@@ -19,6 +19,8 @@ import CalibrationWizard from "./components/CalibrationWizard";
 import HardwareDetect from "./components/HardwareDetect";
 import AgentPanel from "./components/AgentPanel";
 import { useNotifications } from "./hooks/useNotifications";
+import { useUpdater } from "./hooks/useUpdater";
+import UpdateBanner from "./components/UpdateBanner";
 import "./index.css";
 
 type View = "dashboard" | "profiles" | "curves" | "settings" | "calibrate" | "hardware" | "agent";
@@ -41,6 +43,7 @@ const NAV_ITEMS: NavItem[] = [
 export default function App() {
   const [activeView, setActiveView] = useState<View>("dashboard");
   useNotifications();
+  const { updateAvailable, installing, error, install, dismiss } = useUpdater();
 
   return (
     <div style={styles.root}>
@@ -89,6 +92,15 @@ export default function App() {
           <span style={styles.footerText}>v0.1.0</span>
         </div>
       </aside>
+
+      {/* Update banner — non-blocking, bottom-right */}
+      <UpdateBanner
+        updateAvailable={updateAvailable}
+        installing={installing}
+        error={error}
+        onInstall={install}
+        onDismiss={dismiss}
+      />
 
       {/* Main Content */}
       <main style={styles.main}>

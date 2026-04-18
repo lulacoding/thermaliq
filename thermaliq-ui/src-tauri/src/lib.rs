@@ -7,6 +7,36 @@ use tauri::{
     AppHandle, Manager,
 };
 
+/// Windows requires an AppUserModelID (AUMID) for toast notifications to be
+/// attributed to the correct application in Action Center.  We set it once at
+/// process startup before any notification can fire.
+#[cfg(target_os = "windows")]
+fn register_app_user_model_id() {
+    // The AUMID must match the one used in the NSIS installer shortcut.
+    // Format: <Publisher>.<ProductName>
+    let aumid: Vec<u16> = "ThermalIQ.ThermalIQ\0"
+        .encode_utf16()
+        .collect();
+
+    // SAFETY: SetCurrentProcessExplicitAppUserModelID is a well-defined Win32
+    // API; the pointer is valid for the duration of the call.
+    unsafe {
+        #[link(name = "shell32")]
+        extern "system" {
+            fn SetCurrentProcessExplicitAppUserModelID(app_id: *const u16) -> i32;
+        }
+        let hr = SetCurrentProcessExplicitAppUserModelID(aumid.as_ptr());
+        if hr != 0 {
+            tracing::warn!(hr = hr, "SetCurrentProcessExplicitAppUserModelID failed");
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn register_app_user_model_id() {
+    // No-op on macOS / Linux — notifications work without an AUMID there.
+}
+
 const API_BASE: &str = "http://127.0.0.1:7272";
 const TRAY_ID: &str = "thermaliq-tray";
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -21,23 +51,20 @@ struct TrayState {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Register AUMID before the event loop starts so Windows can attribute
+    // toast notifications to ThermalIQ in Action Center.
+    register_app_user_model_id();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .invoke_handler(tauri::generate_handler![send_notification, check_for_updates])
+        .invoke_handler(tauri::generate_handler![send_notification, check_update_info, install_update])
         .setup(|app| {
             let state = Arc::new(Mutex::new(TrayState::default()));
             setup_tray(app, Arc::clone(&state))?;
             start_daemon_poller(app.handle().clone(), state);
-
-            // Check for updates on app start (non-blocking)
-            let app_handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                tokio::time::sleep(Duration::from_secs(2)).await; // Wait for UI to be ready
-                let _ = check_for_updates_internal(&app_handle).await;
-            });
 
             Ok(())
         })
@@ -296,19 +323,67 @@ fn toggle_agent(token: String) {
 
 // ── Auto-updater ──────────────────────────────────────────────────────────────
 
-#[tauri::command]
-async fn check_for_updates(app: tauri::AppHandle) -> Result<bool, String> {
-    check_for_updates_internal(&app).await
+#[derive(serde::Serialize)]
+struct UpdateInfoResult {
+    available: bool,
+    version: String,
+    body: Option<String>,
 }
 
-async fn check_for_updates_internal(app: &tauri::AppHandle) -> Result<bool, String> {
-    if let Ok(update) = app.updater().check().await {
-        if update.is_update_available() {
-            tracing::info!("Update available: {}", update.latest_version());
-            // The updater plugin automatically shows a dialog if configured with "dialog": true
-            let _ = update.download_and_install().await;
-            return Ok(true);
+/// Check whether an update is available. Returns metadata but does NOT
+/// download or install — that requires explicit user consent via
+/// `install_update`.
+#[tauri::command]
+async fn check_update_info(app: tauri::AppHandle) -> Result<UpdateInfoResult, String> {
+    use tauri_plugin_updater::UpdaterExt;
+
+    // If no public key is configured the updater is a no-op in dev builds.
+    let updater = match app.updater() {
+        Ok(u) => u,
+        Err(_) => {
+            return Ok(UpdateInfoResult {
+                available: false,
+                version: String::new(),
+                body: None,
+            })
         }
+    };
+
+    match updater.check().await {
+        Ok(Some(update)) => {
+            tracing::info!(version = %update.version, "Update available");
+            Ok(UpdateInfoResult {
+                available: true,
+                version: update.version.clone(),
+                body: update.body.clone(),
+            })
+        }
+        Ok(None) => Ok(UpdateInfoResult {
+            available: false,
+            version: String::new(),
+            body: None,
+        }),
+        Err(e) => Err(e.to_string()),
     }
-    Ok(false)
+}
+
+/// Download and install the pending update, then restart. Only called after
+/// explicit user consent ("Install now").
+#[tauri::command]
+async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri_plugin_updater::UpdaterExt;
+
+    let updater = app.updater().map_err(|e| e.to_string())?;
+    let update = updater
+        .check()
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "No update available".to_string())?;
+
+    update
+        .download_and_install(|_chunk, _total| {}, || {})
+        .await
+        .map_err(|e| e.to_string())?;
+
+    app.restart();
 }
