@@ -32,6 +32,29 @@
     "windows": {
       "nsis": {
         "installerIcon": "icons/icon.ico"
+      },
+      "certificateThumbprint": null,
+      "digestAlgorithm": "sha256",
+      "timestampUrl": "http://timestamp.sectigo.com"
+    },
+    "macOS": {
+      "signingIdentity": null,
+      "providerShortName": null,
+      "entitlements": null,
+      "exceptionDomain": null,
+      "minimumSystemVersion": null,
+      "frameworks": [],
+      "dmg": {
+        "background": null,
+        "windowX": 180,
+        "windowY": 100,
+        "windowWidth": 600,
+        "windowHeight": 400,
+        "iconSize": 80,
+        "iconX": 180,
+        "iconY": 170,
+        "appsX": 480,
+        "appsY": 170
       }
     }
   },
