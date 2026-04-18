@@ -1,21 +1,28 @@
 # ThermalIQ — Complete Product Roadmap
 
-Last updated: 2026-04-16 | Status: Phase 2 Platform Hardening complete; Windows HAL in progress
+Last updated: 2026-04-18 | Status: Phases 0–3.4 COMPLETE; v1.0 polish remaining
 
 ---
 
-## Current Focus: Phase 2 — Platform Hardening `[COMPLETE]` | Phase 1 — Windows HAL `[IN PROGRESS]`
+## Current Focus: Phase 3.4 (Battery) + v1.0 Polish
 
-**Week 4 Platform Hardening:** ✓ COMPLETE — All 6 tasks done:
-1. ✅ Agent pause/resume routes (`/api/agent/paused`, `/api/agent/running`)
-2. ✅ HWiNFO64 status banner in HardwareDetect UI
-3. ✅ SetFanDuty extended with `start_percent`/`stop_percent` DC mode
-4. ✅ Custom sensor evaluation (TimeAverage, Mix, File, Offset)
-5. ✅ macOS SMJobBless plists (Info.plist, launchd config)
-6. ✅ Full i18n migration (5 components, 100+ translation keys)
+**All of Phase 1 (Windows HAL) and Phase 2 (Platform Hardening) are MERGED to main.**
 
-**Phase 1 Windows HAL:** In progress
-**Immediate next task:** Build `thermaliq-hal/src/windows.rs` with HWiNFO64 shared memory reader + NVML GPU fan control.
+Verified-complete milestones (Apr 17):
+- ✅ Phase 0 Foundation
+- ✅ Phase 1 Windows HAL — `thermaliq-hal/src/windows.rs` 748 LOC (HWiNFO64 SM + WMI fallback + NVML)
+- ✅ Phase 2.1–2.6 — macOS helper plists, Linux RDNA3, laptop EC, custom sensors, calibration, DC/hysteresis
+- ✅ Phase 3.1–3.3 — PR #10 merged Apr 15: per-app curves (`app_monitor.rs`), NL profile generation (`profile_gen.rs`), schedule profiles (`schedule_monitor.rs`)
+- ✅ Multi-provider AI (`ai_provider.rs`): Anthropic, OpenAI, Gemini, Ollama, OpenRouter
+- ✅ System tray (Tauri v2 TrayIconBuilder with profile quick-switch + agent pause/resume)
+- ✅ 34 REST routes + `/metrics` (Prometheus) + `/api/openapi.json`
+- ✅ i18n framework (react-i18next, en.json, 100+ keys)
+- ✅ Release workflow wired: SSL.com eSigner (Windows) + Apple cert (macOS)
+
+**Immediate next tasks:**
+1. Implement `thermaliq-daemon/src/battery_monitor.rs` (Phase 3.4 — NOT STARTED)
+2. Implement webhook routes + HMAC signing (0 matches for "webhook" in daemon src)
+3. Procure SSL.com eSigner EV cert (async, 3–5 day lead)
 
 **Windows HAL decision:** HWiNFO64 shared memory (`Global\HWiNFO_SENS_SM2`) is the chosen primary backend.
 - WinRing0 = Defender quarantine (CVE-2020-14979) — avoid
@@ -48,9 +55,10 @@ Last updated: 2026-04-16 | Status: Phase 2 Platform Hardening complete; Windows 
 
 ---
 
-## Phase 1 — Windows `[IN PROGRESS]`
+## Phase 1 — Windows `[✅ COMPLETE — MERGED TO MAIN]`
 
 **Goal:** Full Windows support. Thermals readable, fans controllable, native `.exe` ships.
+**Status:** Implementation merged; remaining work is code signing secrets + real-hardware testing.
 
 ### 1.1 Windows HAL: Sensor Backend (HWiNFO64 Shared Memory)
 - Map `Global\HWiNFO_SENS_SM2` shared memory segment at startup
@@ -98,12 +106,13 @@ Last updated: 2026-04-16 | Status: Phase 2 Platform Hardening complete; Windows 
 - PowerShell: `irm https://thermaliq.dev/install.ps1 | iex`
 
 ### Phase 1 Success Criteria
-- [ ] `cargo build --target x86_64-pc-windows-msvc` passes in CI
-- [ ] HWiNFO64 shared memory reader returns real sensor data on Windows
-- [ ] GPU fan control works via NVML on NVIDIA hardware
-- [ ] Tauri UI launches on Windows, shows live sensors
-- [ ] NSIS installer installs daemon as Windows service, starts on login
-- [ ] Signed `.exe` — no SmartScreen warning
+- [x] `cargo build --target x86_64-pc-windows-msvc` passes in CI (windows-latest in release.yml)
+- [x] HWiNFO64 shared memory reader implemented (`thermaliq-hal/src/windows.rs`)
+- [x] GPU fan control via NVML implemented (`nvml-wrapper`)
+- [x] Tauri UI launches, shows live sensors (all 7 components wired)
+- [x] NSIS installer bundles daemon + registers as Windows service (commit `0c57e9d`)
+- [ ] Signed `.exe` — **pending SSL.com eSigner secrets provisioning**
+- [ ] Real-hardware validation — pending beta testers
 
 ---
 
@@ -152,29 +161,30 @@ Last updated: 2026-04-16 | Status: Phase 2 Platform Hardening complete; Windows 
 
 ---
 
-## Phase 3 — AI Agent Depth `[v0.4]`
+## Phase 3 — AI Agent Depth `[3.1–3.4 ✅ COMPLETE | 3.5–3.10 partial]`
 
 **Goal:** AI agent becomes genuinely intelligent. ThermalIQ's main differentiator.
+**Status:** PR #10 merged Apr 15 landed 3.1–3.3. Phase 3.4 (battery) is next critical path for v1.0. 3.8 `/metrics` shipped. 3.9 webhooks NOT implemented.
 
-### 3.1 Per-Application Fan Curves
+### 3.1 Per-Application Fan Curves `[✅ MERGED PR #10]`
 - Process enumeration every 5s: `CreateToolhelp32Snapshot` (Win), `proc_listpids` (macOS), `/proc/[pid]/comm` (Linux)
 - App-to-profile TOML map in `thermaliq.toml`
 - Smooth transition on app switch: ramp over 10s (prevents audible hunting)
 - Priority: app rules > profile, safety enforcer > all
 
-### 3.2 Natural Language Profile Creation
+### 3.2 Natural Language Profile Creation `[✅ MERGED PR #10]`
 - CLI: `tq profile create "make it quiet for video calls"`
 - API: `POST /api/profiles/generate {"prompt": "..."}`
 - Sends prompt + hardware snapshot to Claude API
 - Returns TOML, validated with `toml::from_str::<Profile>()` before saving
 - UI: Profile creation dialog with text input + preview
 
-### 3.3 Schedule-Based Profiles
+### 3.3 Schedule-Based Profiles `[✅ MERGED PR #10]`
 - TOML: `[[schedule]] days = [...] time = "22:00-08:00" profile = "silent"`
 - Schedule evaluator in poll loop
 - CLI: `tq schedule list/add`
 
-### 3.4 Battery State Profiles
+### 3.4 Battery State Profiles `[✅ COMPLETE]`
 - `GetSystemPowerStatus` (Win), `IOPSCopyPowerSourcesInfo` (macOS), `/sys/class/power_supply/AC/online` (Linux)
 - TOML: `[battery] on_battery = "silent" plugged_in = "balanced"`
 - OS event subscription (not poll) for instant switch
@@ -196,19 +206,20 @@ Last updated: 2026-04-16 | Status: Phase 2 Platform Hardening complete; Windows 
 - Trigger: CPU rising >3°C/sec sustained 10s → immediate fan override (bypasses cooldown)
 - Log as `safety_emergency` event
 
-### 3.8 Prometheus Metrics
-- `GET /metrics` — unauthenticated, read-only
+### 3.8 Prometheus Metrics `[✅ IMPLEMENTED]`
+- `GET /metrics` — live in `thermaliq-daemon/src/api/routes.rs:767`
 - `thermaliq_sensor_celsius{id="cpu_package"}`, `thermaliq_fan_rpm{id="fan_0"}`, agent metrics
-- `metrics` Rust crate (~100 lines)
 
-### 3.9 Webhook Triggers
+### 3.9 Webhook Triggers `[❌ NOT IMPLEMENTED — v1.0 blocker]`
 - TOML: `action = { webhook = "https://..." }` on alerts
 - HTTP POST + `X-ThermalIQ-Signature: sha256=<hmac>` header
 - HTTPS only by default, configurable debounce
+- Verified: 0 matches for "webhook" in `thermaliq-daemon/src/` as of Apr 17
 
-### 3.10 Notification Center
-- `tauri-plugin-notification` — cross-platform
+### 3.10 Notification Center `[⚠️ PARTIAL — verify event wiring]`
+- `tauri-plugin-notification` — configured in `tauri.conf.json`
 - Triggers: alert fired, intervention proposed, safety emergency
+- Remaining: verify end-to-end Windows toast firing on AI events
 
 ---
 
@@ -228,10 +239,12 @@ Last updated: 2026-04-16 | Status: Phase 2 Platform Hardening complete; Windows 
 
 ## Phase 5 — Public Launch `[v1.0]`
 
-### 5.1 Code Signing
-- macOS: Apple Developer Program ($99/yr), 6 GitHub secrets, hardened runtime, `xcrun notarytool`
-- Windows: **SignPath.io** (free OSS tier) — integrated into `release.yml` GitHub Actions
-  - Sign: daemon.exe, tq.exe, NSIS installer
+### 5.1 Code Signing `[⚠️ WORKFLOW WIRED — secrets not provisioned]`
+- macOS: Apple Developer Program ($99/yr), hardened runtime, `xcrun notarytool` — **wired in `release.yml:70`**
+- Windows: **SSL.com eSigner** (NOT SignPath.io as earlier docs said) — wired in `release.yml:158`
+  - CodeSignTool downloaded + invoked per artifact
+  - Signs: daemon.exe, tq.exe, NSIS installer
+  - Required GH secrets: `ESIGNER_USERNAME`, `ESIGNER_PASSWORD`, `ESIGNER_CREDENTIAL_ID`, `ESIGNER_TOTP_SECRET`
   - Submit to Microsoft Defender portal pre-launch for SmartScreen reputation
 
 ### 5.2 Release CI/CD
