@@ -36,6 +36,8 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
+use std::alloc;
+use std::fmt;
 use std::sync::Mutex;
 use thermaliq_common::{FanReading, HardwareSnapshot, SensorReading, SetFanDuty};
 
@@ -53,13 +55,121 @@ use windows::{
     },
 };
 
+// ── Structured error types ────────────────────────────────────────────────────
+
+/// Errors produced when opening or validating the HWiNFO64 shared memory.
+#[derive(Debug)]
+pub enum HwinfoError {
+    /// The shared memory object does not exist — HWiNFO64 is not running.
+    NotRunning,
+    /// The process lacks permission to open the mapping (e.g. not Administrator).
+    PermissionDenied(String),
+    /// `MapViewOfFile` failed (low memory or handle recycled).
+    MapFailed(String),
+    /// The 4-byte signature at offset 0 does not match `"HWiS"`.
+    SignatureMismatch { found: u32 },
+    /// The header `version` field is outside the range we support (1–3).
+    UnsupportedVersion { version: u32 },
+    /// The header `revision` field is outside the range we support (0–9).
+    UnsupportedRevision { revision: u32 },
+    /// Section offset or element size would cause an out-of-bounds read.
+    LayoutInvalid { field: &'static str, value: u32 },
+    /// Stale data: `poll_time_ms` is zero — HWiNFO64 not yet polling.
+    StaleData,
+}
+
+impl fmt::Display for HwinfoError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HwinfoError::NotRunning => write!(
+                f,
+                "HWiNFO64 shared memory not found — is HWiNFO64 running in 'Sensors only' mode? \
+                 Download: https://www.hwinfo.com/download/"
+            ),
+            HwinfoError::PermissionDenied(msg) => write!(
+                f,
+                "HWiNFO64 shared memory access denied (try running as Administrator): {msg}"
+            ),
+            HwinfoError::MapFailed(msg) => write!(f, "HWiNFO64 MapViewOfFile failed: {msg}"),
+            HwinfoError::SignatureMismatch { found } => write!(
+                f,
+                "HWiNFO64 header signature mismatch: expected 0x{:08X} ('HWiS'), found 0x{found:08X}",
+                HWINFO_SIGNATURE
+            ),
+            HwinfoError::UnsupportedVersion { version } => write!(
+                f,
+                "HWiNFO64 header version {version} outside supported range \
+                 {HWINFO_MIN_VERSION}–{HWINFO_MAX_VERSION} — update ThermalIQ or HWiNFO64"
+            ),
+            HwinfoError::UnsupportedRevision { revision } => write!(
+                f,
+                "HWiNFO64 header revision {revision} outside supported range 0–{HWINFO_MAX_REVISION}"
+            ),
+            HwinfoError::LayoutInvalid { field, value } => write!(
+                f,
+                "HWiNFO64 header field '{field}' has invalid value {value} (memory layout corrupt?)"
+            ),
+            HwinfoError::StaleData => write!(
+                f,
+                "HWiNFO64 poll_time_ms is zero — sensors not yet polled or HWiNFO64 frozen"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for HwinfoError {}
+
+/// Errors produced by the WMI sensor fallback.
+#[derive(Debug)]
+pub enum WmiError {
+    /// `WMIConnection::with_namespace_path` failed (WMI service unavailable).
+    ConnectionFailed(String),
+    /// A WMI query executed but returned zero rows (class not present on this hardware).
+    NoSensorsFound { class: &'static str },
+    /// A WMI query failed with an error code.
+    QueryFailed { class: &'static str, detail: String },
+}
+
+impl fmt::Display for WmiError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WmiError::ConnectionFailed(msg) => write!(
+                f,
+                "WMI connection failed (install HWiNFO64 for full coverage): {msg}"
+            ),
+            WmiError::NoSensorsFound { class } => write!(
+                f,
+                "WMI class '{class}' returned no rows — this system may not expose \
+                 those sensors via ACPI/WMI"
+            ),
+            WmiError::QueryFailed { class, detail } => {
+                write!(f, "WMI query on '{class}' failed: {detail}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for WmiError {}
+
 // ── HWiNFO64 shared-memory layout ────────────────────────────────────────────
 //
 // Layout documented in the HWiNFO SDK (stable since ~2013).
 // https://www.hwinfo.com/forum/threads/hwinfo-sdk.86/
+//
+// Version/revision ranges accepted:
+//   version  1–3  (SDK defines v1=initial, v2=added poll_time, v3=extended)
+//   revision 0–9  (minor layout tweaks; field meanings unchanged)
 
 const HWINFO_SIGNATURE: u32 = 0x53695748; // b"HWiS" LE
 const HWINFO_SM_NAME: &str = "Global\\HWiNFO_SENS_SM2";
+const HWINFO_MIN_VERSION: u32 = 1;
+const HWINFO_MAX_VERSION: u32 = 3;
+const HWINFO_MAX_REVISION: u32 = 9;
+
+// Sanity bounds to catch obviously corrupt layout fields
+const HWINFO_MAX_ELEMENT_COUNT: u32 = 8192;
+const HWINFO_MIN_ELEMENT_SIZE: u32 = 4;
+const HWINFO_MAX_ELEMENT_SIZE: u32 = 4096;
 
 const READING_TYPE_TEMP: u32 = 1;
 const READING_TYPE_FAN: u32 = 3;
@@ -101,6 +211,84 @@ struct HwinfoReading {
     value_avg: f64,
 }
 
+// ── Label / sensor-ID helpers ─────────────────────────────────────────────────
+
+/// Convert a NUL-terminated byte slice from HWiNFO shared memory to a String.
+///
+/// Non-UTF-8 sequences (e.g. CP-1252 vendor labels with degree symbols) are
+/// replaced with U+FFFD rather than dropping the reading entirely.
+fn cstr_to_string(bytes: &[u8]) -> String {
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
+
+/// Sanitize a raw HWiNFO label into a form safe for use in a sensor/fan ID.
+///
+/// Rules applied (in order):
+/// 1. Replace any character outside `[A-Za-z0-9.-]` (including non-ASCII and
+///    vendor suffixes like `#`, `(`, `)`) with `_`.
+/// 2. Collapse consecutive `_` to a single `_`.
+/// 3. Strip leading/trailing `_`.
+/// 4. Truncate to 64 bytes.
+/// 5. Return `"unknown"` if the result is empty.
+fn sanitize_label_for_id(label: &str) -> String {
+    let sanitized: String = label
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+
+    // Collapse consecutive underscores
+    let mut result = String::with_capacity(sanitized.len());
+    let mut prev_under = false;
+    for c in sanitized.chars() {
+        if c == '_' {
+            if !prev_under {
+                result.push('_');
+            }
+            prev_under = true;
+        } else {
+            result.push(c);
+            prev_under = false;
+        }
+    }
+
+    let result = result.trim_matches('_').to_string();
+    let result = if result.len() > 64 {
+        result[..64].to_string()
+    } else {
+        result
+    };
+
+    if result.is_empty() {
+        "unknown".to_string()
+    } else {
+        result
+    }
+}
+
+/// Build a unique, stable sensor ID from HWiNFO reading fields.
+///
+/// Format: `hwinfo_{sensor_index}_{reading_id}_{sanitized_label}`
+fn hwinfo_sensor_id(sensor_index: u32, reading_id: u32, label: &str) -> String {
+    format!(
+        "hwinfo_{}_{}_{}",
+        sensor_index,
+        reading_id,
+        sanitize_label_for_id(label)
+    )
+}
+
+/// Build a unique, stable fan ID from HWiNFO reading fields.
+fn hwinfo_fan_id(reading_id: u32, label: &str) -> String {
+    format!("hwinfo_fan_{}_{}", reading_id, sanitize_label_for_id(label))
+}
+
 // ── Shared-memory handle wrapper ──────────────────────────────────────────────
 
 struct HwinfoMapping {
@@ -113,21 +301,26 @@ struct HwinfoMapping {
 unsafe impl Send for HwinfoMapping {}
 
 impl HwinfoMapping {
-    fn open() -> Result<Self> {
+    fn open() -> std::result::Result<Self, HwinfoError> {
         let name_wide: Vec<u16> = HWINFO_SM_NAME
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
 
         let handle = unsafe {
-            OpenFileMappingW(FILE_MAP_READ.0, false, PCWSTR(name_wide.as_ptr()))
-                .map_err(|e| anyhow!("OpenFileMappingW failed: {e}"))?
+            OpenFileMappingW(FILE_MAP_READ.0, false, PCWSTR(name_wide.as_ptr())).map_err(|e| {
+                let msg = e.to_string();
+                // ERROR_ACCESS_DENIED (5) or ERROR_PRIVILEGE_NOT_HELD (1314)
+                if msg.contains("(5)") || msg.contains("(1314)") || msg.contains("Access") {
+                    HwinfoError::PermissionDenied(msg)
+                } else {
+                    HwinfoError::NotRunning
+                }
+            })?
         };
 
         if handle == INVALID_HANDLE_VALUE || handle.is_invalid() {
-            return Err(anyhow!(
-                "HWiNFO64 shared memory not found — is HWiNFO64 running?"
-            ));
+            return Err(HwinfoError::NotRunning);
         }
 
         let view_mapped = unsafe { MapViewOfFile(handle, FILE_MAP_READ, 0, 0, 0) };
@@ -137,21 +330,71 @@ impl HwinfoMapping {
             unsafe {
                 let _ = CloseHandle(handle);
             }
-            return Err(anyhow!("MapViewOfFile failed"));
+            return Err(HwinfoError::MapFailed("MapViewOfFile returned null".into()));
         }
 
-        // Validate signature
+        // Validate all header fields before any further pointer arithmetic.
         let header = unsafe { &*(view_ptr as *const HwinfoHeader) };
-        if header.signature != HWINFO_SIGNATURE {
-            unsafe {
-                let _ = UnmapViewOfFile(view_mapped);
-                let _ = CloseHandle(handle);
-            }
-            return Err(anyhow!(
-                "HWiNFO64 shared memory signature mismatch: {:#010x}",
-                header.signature
-            ));
+
+        macro_rules! cleanup_err {
+            ($err:expr) => {{
+                unsafe {
+                    let _ = UnmapViewOfFile(view_mapped);
+                    let _ = CloseHandle(handle);
+                }
+                return Err($err);
+            }};
         }
+
+        if header.signature != HWINFO_SIGNATURE {
+            cleanup_err!(HwinfoError::SignatureMismatch {
+                found: header.signature,
+            });
+        }
+
+        if header.version < HWINFO_MIN_VERSION || header.version > HWINFO_MAX_VERSION {
+            cleanup_err!(HwinfoError::UnsupportedVersion {
+                version: header.version,
+            });
+        }
+
+        if header.revision > HWINFO_MAX_REVISION {
+            cleanup_err!(HwinfoError::UnsupportedRevision {
+                revision: header.revision,
+            });
+        }
+
+        // Validate element sizes to prevent out-of-bounds pointer arithmetic.
+        for (field, val) in [
+            ("sensor_element_size", header.sensor_element_size),
+            ("reading_element_size", header.reading_element_size),
+        ] {
+            if val < HWINFO_MIN_ELEMENT_SIZE || val > HWINFO_MAX_ELEMENT_SIZE {
+                cleanup_err!(HwinfoError::LayoutInvalid { field, value: val });
+            }
+        }
+
+        for (field, val) in [
+            ("sensor_element_count", header.sensor_element_count),
+            ("reading_element_count", header.reading_element_count),
+        ] {
+            if val > HWINFO_MAX_ELEMENT_COUNT {
+                cleanup_err!(HwinfoError::LayoutInvalid { field, value: val });
+            }
+        }
+
+        if header.poll_time_ms == 0 {
+            cleanup_err!(HwinfoError::StaleData);
+        }
+
+        tracing::debug!(
+            backend = "hwinfo",
+            version = header.version,
+            revision = header.revision,
+            sensors = header.sensor_element_count,
+            readings = header.reading_element_count,
+            "HWiNFO64 shared memory opened"
+        );
 
         Ok(Self {
             handle,
@@ -160,6 +403,9 @@ impl HwinfoMapping {
     }
 
     fn read_snapshot(&self) -> (Vec<SensorReading>, Vec<FanReading>) {
+        let span = tracing::debug_span!("hwinfo_read_snapshot", backend = "hwinfo");
+        let _enter = span.enter();
+
         let header = unsafe { &*(self.view as *const HwinfoHeader) };
         let mut sensors = Vec::new();
         let mut fans = Vec::new();
@@ -172,22 +418,35 @@ impl HwinfoMapping {
                     as *const HwinfoReading)
             };
 
-            let label = cstr_to_string(&reading.label_user);
+            // Prefer user-assigned label; fall back to original label if blank.
+            let label_user = cstr_to_string(&reading.label_user);
+            let label = if label_user.trim().is_empty() {
+                cstr_to_string(&reading.label_orig)
+            } else {
+                label_user
+            };
 
             match reading.reading_type {
                 READING_TYPE_TEMP => {
                     let temp = reading.value as f32;
                     if temp > -40.0 && temp < 150.0 {
                         sensors.push(SensorReading {
-                            id: format!("hwinfo_{}_{}", reading.sensor_index, reading.reading_id),
+                            id: hwinfo_sensor_id(reading.sensor_index, reading.reading_id, &label),
                             label,
                             temp_celsius: temp,
                         });
+                    } else {
+                        tracing::trace!(
+                            backend = "hwinfo",
+                            reading_id = reading.reading_id,
+                            temp,
+                            "temperature out of plausible range, skipped"
+                        );
                     }
                 }
                 READING_TYPE_FAN => {
                     fans.push(FanReading {
-                        id: format!("hwinfo_fan_{}", reading.reading_id),
+                        id: hwinfo_fan_id(reading.reading_id, &label),
                         label,
                         rpm: reading.value as u32,
                         // HWiNFO exposes RPM only, not duty cycle
@@ -197,6 +456,13 @@ impl HwinfoMapping {
                 _ => {}
             }
         }
+
+        tracing::debug!(
+            backend = "hwinfo",
+            sensor_count = sensors.len(),
+            fan_count = fans.len(),
+            "HWiNFO64 snapshot complete"
+        );
 
         (sensors, fans)
     }
@@ -213,68 +479,208 @@ impl Drop for HwinfoMapping {
     }
 }
 
-fn cstr_to_string(bytes: &[u8]) -> String {
-    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-    String::from_utf8_lossy(&bytes[..end]).into_owned()
-}
-
 // ── WMI fallback ──────────────────────────────────────────────────────────────
 //
-// Used when HWiNFO64 is not running. Coverage is limited — ACPI thermal zones
-// only, no ISA/SMBus sensors. Win32_Fan rarely returns useful data on consumer
-// hardware so fans are not queried here.
+// Used when HWiNFO64 is not running. Three WMI classes are queried:
+//
+//   ROOT\WMI   — MSAcpi_ThermalZoneTemperature (ACPI thermal zones, deci-Kelvin)
+//   ROOT\CIMV2 — Win32_TemperatureProbe (BIOS-reported temps, DMTF tenths °C)
+//   ROOT\CIMV2 — Win32_Fan (motherboard fan RPM via SMBIOS)
+//
+// "No rows returned" (NoSensorsFound) and "query error" (QueryFailed) are
+// deliberately distinct: the former is debug-level (normal on many boards),
+// the latter is warn-level (unexpected failure).
 
 fn wmi_snapshot() -> (Vec<SensorReading>, Vec<FanReading>) {
     use serde::Deserialize;
     use wmi::WMIConnection;
 
-    #[derive(Deserialize)]
-    #[serde(rename = "MSAcpi_ThermalZoneTemperature")]
-    struct ThermalZone {
-        #[serde(rename = "CurrentTemperature")]
-        current_temperature: u32, // deci-Kelvin: divide by 10, subtract 273.15
-        #[serde(rename = "InstanceName")]
-        instance_name: String,
-    }
+    let span = tracing::debug_span!("wmi_snapshot", backend = "wmi");
+    let _enter = span.enter();
 
-    let conn = match WMIConnection::with_namespace_path("ROOT\\WMI") {
+    // ── ROOT\WMI connection ───────────────────────────────────────────────────
+    let wmi_conn = match WMIConnection::with_namespace_path("ROOT\\WMI") {
         Ok(c) => c,
         Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "WMI connection failed — install HWiNFO64 from https://www.hwinfo.com/download/ for full sensor coverage"
-            );
+            let err = WmiError::ConnectionFailed(e.to_string());
+            tracing::warn!(backend = "wmi", error = %err, "WMI unavailable");
             return (Vec::new(), Vec::new());
         }
     };
 
-    let zones: Vec<ThermalZone> = match conn.query() {
-        Ok(z) => z,
-        Err(e) => {
-            tracing::warn!(error = %e, "WMI MSAcpi_ThermalZoneTemperature query failed");
-            return (Vec::new(), Vec::new());
-        }
-    };
+    // ── ROOT\CIMV2 connection (Win32_* classes) ───────────────────────────────
+    let cimv2_conn = WMIConnection::with_namespace_path("ROOT\\CIMV2").ok();
 
-    let sensors: Vec<SensorReading> = zones
-        .into_iter()
-        .enumerate()
-        .filter_map(|(i, z)| {
-            let temp = (z.current_temperature as f32 / 10.0) - 273.15;
-            if temp > -40.0 && temp < 150.0 {
-                Some(SensorReading {
-                    id: format!("wmi_thermal_{i}"),
-                    label: z.instance_name,
-                    temp_celsius: temp,
-                })
-            } else {
-                None
+    let mut all_sensors: Vec<SensorReading> = Vec::new();
+    let mut all_fans: Vec<FanReading> = Vec::new();
+
+    // ── 1. MSAcpi_ThermalZoneTemperature (deci-Kelvin) ────────────────────────
+    {
+        #[derive(Deserialize)]
+        #[serde(rename = "MSAcpi_ThermalZoneTemperature")]
+        struct ThermalZone {
+            #[serde(rename = "CurrentTemperature")]
+            current_temperature: u32, // deci-Kelvin: divide by 10, subtract 273.15
+            #[serde(rename = "InstanceName")]
+            instance_name: String,
+        }
+
+        match wmi_conn.query::<ThermalZone>() {
+            Ok(zones) if zones.is_empty() => {
+                let err = WmiError::NoSensorsFound {
+                    class: "MSAcpi_ThermalZoneTemperature",
+                };
+                tracing::debug!(backend = "wmi", "{err}");
             }
-        })
-        .collect();
+            Ok(zones) => {
+                let before = all_sensors.len();
+                for (i, z) in zones.into_iter().enumerate() {
+                    let temp = (z.current_temperature as f32 / 10.0) - 273.15;
+                    if temp > -40.0 && temp < 150.0 {
+                        all_sensors.push(SensorReading {
+                            id: format!("wmi_acpi_thermal_{i}"),
+                            label: z.instance_name,
+                            temp_celsius: temp,
+                        });
+                    }
+                }
+                tracing::debug!(
+                    backend = "wmi",
+                    count = all_sensors.len() - before,
+                    "MSAcpi_ThermalZoneTemperature enumerated"
+                );
+            }
+            Err(e) => {
+                let err = WmiError::QueryFailed {
+                    class: "MSAcpi_ThermalZoneTemperature",
+                    detail: e.to_string(),
+                };
+                tracing::warn!(backend = "wmi", error = %err);
+            }
+        }
+    }
 
-    tracing::debug!(count = sensors.len(), "WMI thermal zones enumerated");
-    (sensors, Vec::new())
+    // ── 2. Win32_TemperatureProbe (SMBIOS/BIOS temperatures) ─────────────────
+    if let Some(ref conn) = cimv2_conn {
+        #[derive(Deserialize)]
+        #[serde(rename = "Win32_TemperatureProbe")]
+        struct TemperatureProbe {
+            // DMTF spec: tenths of degree Celsius. Many BIOSes return whole
+            // degrees instead — handle both by range-checking /10 first.
+            #[serde(rename = "CurrentReading")]
+            current_reading: Option<i32>,
+            #[serde(rename = "Name")]
+            name: Option<String>,
+            #[serde(rename = "Description")]
+            description: Option<String>,
+        }
+
+        match conn.query::<TemperatureProbe>() {
+            Ok(probes) if probes.is_empty() => {
+                let err = WmiError::NoSensorsFound {
+                    class: "Win32_TemperatureProbe",
+                };
+                tracing::debug!(backend = "wmi", "{err}");
+            }
+            Ok(probes) => {
+                let before = all_sensors.len();
+                for (i, p) in probes.into_iter().enumerate() {
+                    let Some(raw) = p.current_reading else {
+                        continue;
+                    };
+                    // Try DMTF tenths-of-Celsius first; fall back to raw integer Celsius.
+                    let temp_tenths = raw as f32 / 10.0;
+                    let temp = if temp_tenths > -40.0 && temp_tenths < 150.0 {
+                        temp_tenths
+                    } else {
+                        raw as f32
+                    };
+                    if temp > -40.0 && temp < 150.0 {
+                        let label = p
+                            .name
+                            .or(p.description)
+                            .unwrap_or_else(|| format!("Temperature Probe {i}"));
+                        all_sensors.push(SensorReading {
+                            id: format!("wmi_probe_{i}"),
+                            label,
+                            temp_celsius: temp,
+                        });
+                    }
+                }
+                tracing::debug!(
+                    backend = "wmi",
+                    count = all_sensors.len() - before,
+                    "Win32_TemperatureProbe enumerated"
+                );
+            }
+            Err(e) => {
+                let err = WmiError::QueryFailed {
+                    class: "Win32_TemperatureProbe",
+                    detail: e.to_string(),
+                };
+                // Debug-level: absent on most consumer hardware, not actionable.
+                tracing::debug!(backend = "wmi", error = %err, "Win32_TemperatureProbe unavailable");
+            }
+        }
+    }
+
+    // ── 3. Win32_Fan (SMBIOS fan speeds) ─────────────────────────────────────
+    if let Some(ref conn) = cimv2_conn {
+        #[derive(Deserialize)]
+        #[serde(rename = "Win32_Fan")]
+        struct Win32Fan {
+            #[serde(rename = "DesiredSpeed")]
+            desired_speed: Option<u64>,
+            #[serde(rename = "Name")]
+            name: Option<String>,
+            #[serde(rename = "DeviceID")]
+            device_id: Option<String>,
+        }
+
+        match conn.query::<Win32Fan>() {
+            Ok(fans) if fans.is_empty() => {
+                let err = WmiError::NoSensorsFound { class: "Win32_Fan" };
+                tracing::debug!(backend = "wmi", "{err}");
+            }
+            Ok(fans) => {
+                for (i, fan) in fans.into_iter().enumerate() {
+                    let label = fan
+                        .name
+                        .or(fan.device_id)
+                        .unwrap_or_else(|| format!("Fan {i}"));
+                    let rpm = fan.desired_speed.unwrap_or(0) as u32;
+                    all_fans.push(FanReading {
+                        id: format!("wmi_fan_{i}"),
+                        label,
+                        rpm,
+                        duty_percent: 0,
+                    });
+                }
+                tracing::debug!(
+                    backend = "wmi",
+                    count = all_fans.len(),
+                    "Win32_Fan enumerated"
+                );
+            }
+            Err(e) => {
+                let err = WmiError::QueryFailed {
+                    class: "Win32_Fan",
+                    detail: e.to_string(),
+                };
+                tracing::debug!(backend = "wmi", error = %err, "Win32_Fan unavailable (normal on consumer hardware)");
+            }
+        }
+    }
+
+    if all_sensors.is_empty() && all_fans.is_empty() {
+        tracing::warn!(
+            backend = "wmi",
+            "WMI fallback found no sensors or fans — install HWiNFO64 from \
+             https://www.hwinfo.com/download/ for full coverage"
+        );
+    }
+
+    (all_sensors, all_fans)
 }
 
 // ── NVML GPU fans ─────────────────────────────────────────────────────────────
@@ -408,8 +814,6 @@ const NVML_OK: i32 = 0;
 // Deferred: ADLX COM vtable FFI requires the proprietary AMD ADLX SDK headers.
 //
 // Fan ID format: `adl_gpu{adapter_index}` (one fan per adapter index).
-
-use std::alloc;
 
 const ADL_OK: i32 = 0;
 const ADL_VENDOR_ID_AMD: i32 = 0x1002;
@@ -655,12 +1059,39 @@ impl HardwareLayer for WindowsHardwareLayer {
                     f.extend(adl_fans()); // AMD
                     (s, f, Some(m))
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "HWiNFO64 not available — falling back to WMI (reduced sensor coverage). \
-                         Install HWiNFO64 from https://www.hwinfo.com/download/ for full coverage."
-                    );
+                Err(ref e) => {
+                    // Emit appropriate log level based on error category.
+                    match e {
+                        HwinfoError::NotRunning => tracing::warn!(
+                            backend = "hwinfo",
+                            error = %e,
+                            "HWiNFO64 not running — falling back to WMI (reduced coverage). \
+                             Install HWiNFO64 from https://www.hwinfo.com/download/"
+                        ),
+                        HwinfoError::PermissionDenied(_) => tracing::warn!(
+                            backend = "hwinfo",
+                            error = %e,
+                            "HWiNFO64 permission denied — try running ThermalIQ as Administrator"
+                        ),
+                        HwinfoError::StaleData => tracing::warn!(
+                            backend = "hwinfo",
+                            error = %e,
+                            "HWiNFO64 not yet polling — falling back to WMI"
+                        ),
+                        HwinfoError::SignatureMismatch { .. }
+                        | HwinfoError::UnsupportedVersion { .. }
+                        | HwinfoError::UnsupportedRevision { .. }
+                        | HwinfoError::LayoutInvalid { .. } => tracing::error!(
+                            backend = "hwinfo",
+                            error = %e,
+                            "HWiNFO64 header validation failed — falling back to WMI"
+                        ),
+                        HwinfoError::MapFailed(_) => tracing::warn!(
+                            backend = "hwinfo",
+                            error = %e,
+                            "HWiNFO64 map failed — falling back to WMI"
+                        ),
+                    }
                     let (s, mut f) = wmi_snapshot();
                     f.extend(nvml_fans());
                     f.extend(adl_fans());
@@ -710,11 +1141,14 @@ impl HardwareLayer for WindowsHardwareLayer {
 mod tests {
     use super::*;
 
+    // ── constants ─────────────────────────────────────────────────────────────
+
     #[test]
     fn hwinfo_signature_magic() {
-        // HWiNFO SDK defines the signature as the 4-byte string "HWiS" in LE.
         assert_eq!(HWINFO_SIGNATURE, u32::from_le_bytes(*b"HWiS"));
     }
+
+    // ── cstr_to_string ────────────────────────────────────────────────────────
 
     #[test]
     fn cstr_to_string_nul_terminated() {
@@ -730,8 +1164,80 @@ mod tests {
     }
 
     #[test]
+    fn cstr_to_string_non_utf8_replaced() {
+        // 0xFF is invalid UTF-8 — should produce replacement char, not panic.
+        let buf = [b'A', 0xFF, b'B', 0x00];
+        let s = cstr_to_string(&buf);
+        assert!(s.contains('A'));
+        assert!(s.contains('B'));
+    }
+
+    // ── sanitize_label_for_id ─────────────────────────────────────────────────
+
+    #[test]
+    fn sanitize_label_simple_ascii() {
+        assert_eq!(sanitize_label_for_id("CPU Temp"), "CPU_Temp");
+    }
+
+    #[test]
+    fn sanitize_label_vendor_suffix() {
+        // Typical HP/Dell label with non-ID-safe characters
+        let result = sanitize_label_for_id("CPU Package Temp #1 (TJ Max)");
+        assert!(!result.contains('('));
+        assert!(!result.contains(')'));
+        assert!(!result.contains('#'));
+        assert!(!result.contains(' '));
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn sanitize_label_non_ascii() {
+        // Degree symbol (U+00B0) — common in vendor-provided labels
+        let label = "CPU Temp\u{00B0}C";
+        let result = sanitize_label_for_id(label);
+        assert!(!result.contains('\u{00B0}'));
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn sanitize_label_empty_falls_back() {
+        assert_eq!(sanitize_label_for_id(""), "unknown");
+        assert_eq!(sanitize_label_for_id("   "), "unknown");
+    }
+
+    #[test]
+    fn sanitize_label_collapses_underscores() {
+        assert_eq!(sanitize_label_for_id("A  B   C"), "A_B_C");
+    }
+
+    #[test]
+    fn sanitize_label_truncates_long() {
+        let long = "A".repeat(100);
+        assert!(sanitize_label_for_id(&long).len() <= 64);
+    }
+
+    // ── ID formation ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn hwinfo_sensor_id_format() {
+        assert_eq!(
+            hwinfo_sensor_id(2, 42, "CPU Package"),
+            "hwinfo_2_42_CPU_Package"
+        );
+    }
+
+    #[test]
+    fn hwinfo_fan_id_format() {
+        assert_eq!(
+            hwinfo_fan_id(7, "Chassis Fan 1"),
+            "hwinfo_fan_7_Chassis_Fan_1"
+        );
+    }
+
+    // ── nvml ID parse roundtrip ───────────────────────────────────────────────
+
+    #[test]
     fn nvml_fan_id_parse_roundtrip() {
-        // Smoke test that the ID format we emit is parseable by nvml_set_fan.
         let id = "nvml_gpu2_fan1";
         assert!(id.starts_with("nvml_gpu"));
         let rest = id.strip_prefix("nvml_gpu").unwrap();
@@ -740,5 +1246,133 @@ mod tests {
         let fan: u32 = p.next().unwrap().parse().unwrap();
         assert_eq!(gpu, 2);
         assert_eq!(fan, 1);
+    }
+
+    // ── Mock HWiNFO buffer tests ──────────────────────────────────────────────
+    //
+    // Construct raw byte buffers shaped like the HWiNFO shared memory and
+    // verify header validation logic without real hardware or Win32 APIs.
+    // Gated on mock-hardware so they never interfere with a live HWiNFO64.
+
+    #[cfg(feature = "mock-hardware")]
+    mod mock_hwinfo {
+        use super::*;
+
+        /// Return a byte buffer containing a valid HwinfoHeader.
+        fn valid_header_bytes() -> Vec<u8> {
+            let hdr_size = std::mem::size_of::<HwinfoHeader>();
+            let mut buf = vec![0u8; hdr_size];
+            buf[0..4].copy_from_slice(&HWINFO_SIGNATURE.to_le_bytes());
+            buf[4..8].copy_from_slice(&2u32.to_le_bytes()); // version = 2
+            buf[8..12].copy_from_slice(&0u32.to_le_bytes()); // revision = 0
+            buf[12..20].copy_from_slice(&1000i64.to_le_bytes()); // poll_time_ms non-zero
+            buf[20..24].copy_from_slice(&(hdr_size as u32).to_le_bytes()); // sensor_section_offset
+            buf[24..28].copy_from_slice(&264u32.to_le_bytes()); // sensor_element_size
+            buf[28..32].copy_from_slice(&0u32.to_le_bytes()); // sensor_element_count
+            buf[32..36].copy_from_slice(&(hdr_size as u32).to_le_bytes()); // reading_section_offset
+            buf[36..40].copy_from_slice(&296u32.to_le_bytes()); // reading_element_size
+            buf[40..44].copy_from_slice(&0u32.to_le_bytes()); // reading_element_count
+            buf
+        }
+
+        #[test]
+        fn valid_header_passes_all_checks() {
+            let buf = valid_header_bytes();
+            let h = unsafe { &*(buf.as_ptr() as *const HwinfoHeader) };
+            assert_eq!(h.signature, HWINFO_SIGNATURE);
+            assert!(h.version >= HWINFO_MIN_VERSION && h.version <= HWINFO_MAX_VERSION);
+            assert!(h.revision <= HWINFO_MAX_REVISION);
+            assert!(h.sensor_element_size >= HWINFO_MIN_ELEMENT_SIZE);
+            assert!(h.sensor_element_size <= HWINFO_MAX_ELEMENT_SIZE);
+            assert!(h.reading_element_size >= HWINFO_MIN_ELEMENT_SIZE);
+            assert!(h.reading_element_size <= HWINFO_MAX_ELEMENT_SIZE);
+            assert!(h.poll_time_ms != 0);
+        }
+
+        #[test]
+        fn bad_signature_detected() {
+            let mut buf = valid_header_bytes();
+            buf[0..4].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+            let h = unsafe { &*(buf.as_ptr() as *const HwinfoHeader) };
+            assert_ne!(h.signature, HWINFO_SIGNATURE);
+        }
+
+        #[test]
+        fn version_zero_is_unsupported() {
+            let mut buf = valid_header_bytes();
+            buf[4..8].copy_from_slice(&0u32.to_le_bytes());
+            let h = unsafe { &*(buf.as_ptr() as *const HwinfoHeader) };
+            assert!(h.version < HWINFO_MIN_VERSION);
+        }
+
+        #[test]
+        fn version_too_high_is_unsupported() {
+            let mut buf = valid_header_bytes();
+            buf[4..8].copy_from_slice(&99u32.to_le_bytes());
+            let h = unsafe { &*(buf.as_ptr() as *const HwinfoHeader) };
+            assert!(h.version > HWINFO_MAX_VERSION);
+        }
+
+        #[test]
+        fn revision_too_high_is_rejected() {
+            let mut buf = valid_header_bytes();
+            buf[8..12].copy_from_slice(&100u32.to_le_bytes());
+            let h = unsafe { &*(buf.as_ptr() as *const HwinfoHeader) };
+            assert!(h.revision > HWINFO_MAX_REVISION);
+        }
+
+        #[test]
+        fn stale_poll_time_detected() {
+            let mut buf = valid_header_bytes();
+            buf[12..20].copy_from_slice(&0i64.to_le_bytes());
+            let h = unsafe { &*(buf.as_ptr() as *const HwinfoHeader) };
+            assert_eq!(h.poll_time_ms, 0);
+        }
+
+        #[test]
+        fn element_size_zero_is_invalid() {
+            let mut buf = valid_header_bytes();
+            buf[24..28].copy_from_slice(&0u32.to_le_bytes());
+            let h = unsafe { &*(buf.as_ptr() as *const HwinfoHeader) };
+            assert!(h.sensor_element_size < HWINFO_MIN_ELEMENT_SIZE);
+        }
+
+        #[test]
+        fn element_count_overflow_detected() {
+            let mut buf = valid_header_bytes();
+            buf[40..44].copy_from_slice(&99_999u32.to_le_bytes());
+            let h = unsafe { &*(buf.as_ptr() as *const HwinfoHeader) };
+            assert!(h.reading_element_count > HWINFO_MAX_ELEMENT_COUNT);
+        }
+
+        #[test]
+        fn hwinfo_error_display_not_running() {
+            let e = HwinfoError::NotRunning;
+            let s = e.to_string();
+            assert!(s.contains("HWiNFO64"));
+            assert!(s.contains("hwinfo.com"));
+        }
+
+        #[test]
+        fn hwinfo_error_display_signature_mismatch() {
+            let e = HwinfoError::SignatureMismatch { found: 0xDEAD_BEEF };
+            let s = e.to_string();
+            assert!(s.contains("DEADBEEF"));
+            assert!(s.contains("HWiS"));
+        }
+
+        #[test]
+        fn hwinfo_error_display_version() {
+            let e = HwinfoError::UnsupportedVersion { version: 99 };
+            let s = e.to_string();
+            assert!(s.contains("99"));
+        }
+
+        #[test]
+        fn wmi_error_display_no_sensors() {
+            let e = WmiError::NoSensorsFound { class: "Win32_Fan" };
+            let s = e.to_string();
+            assert!(s.contains("Win32_Fan"));
+        }
     }
 }
