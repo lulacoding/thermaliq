@@ -6,6 +6,14 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Manager,
 };
+use tauri_plugin_updater::Update;
+
+/// Shared cache for the pending `Update` returned by `check_update_info`.
+/// `install_update` consumes it via `.take()` so the exact version shown in
+/// the banner is the one installed — preventing a TOCTOU where the server's
+/// `latest.json` could change between the check and the install.
+#[derive(Default)]
+struct PendingUpdate(tokio::sync::Mutex<Option<Update>>);
 
 /// Windows requires an AppUserModelID (AUMID) for toast notifications to be
 /// attributed to the correct application in Action Center.  We set it once at
@@ -60,6 +68,7 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .manage(PendingUpdate::default())
         .invoke_handler(tauri::generate_handler![send_notification, check_update_info, install_update])
         .setup(|app| {
             let state = Arc::new(Mutex::new(TrayState::default()));
@@ -333,52 +342,74 @@ struct UpdateInfoResult {
 /// Check whether an update is available. Returns metadata but does NOT
 /// download or install — that requires explicit user consent via
 /// `install_update`.
+///
+/// The resolved `Update` handle is cached in `PendingUpdate` state so that
+/// `install_update` can consume *exactly* that version, closing a TOCTOU
+/// gap where the server's `latest.json` could change between check and
+/// install.
 #[tauri::command]
-async fn check_update_info(app: tauri::AppHandle) -> Result<UpdateInfoResult, String> {
+async fn check_update_info(
+    app: tauri::AppHandle,
+    pending: tauri::State<'_, PendingUpdate>,
+) -> Result<UpdateInfoResult, String> {
     use tauri_plugin_updater::UpdaterExt;
 
     // If no public key is configured the updater is a no-op in dev builds.
     let updater = match app.updater() {
         Ok(u) => u,
         Err(_) => {
+            *pending.0.lock().await = None;
             return Ok(UpdateInfoResult {
                 available: false,
                 version: String::new(),
                 body: None,
-            })
+            });
         }
     };
 
     match updater.check().await {
         Ok(Some(update)) => {
             tracing::info!(version = %update.version, "Update available");
-            Ok(UpdateInfoResult {
+            let info = UpdateInfoResult {
                 available: true,
                 version: update.version.clone(),
                 body: update.body.clone(),
+            };
+            *pending.0.lock().await = Some(update);
+            Ok(info)
+        }
+        Ok(None) => {
+            *pending.0.lock().await = None;
+            Ok(UpdateInfoResult {
+                available: false,
+                version: String::new(),
+                body: None,
             })
         }
-        Ok(None) => Ok(UpdateInfoResult {
-            available: false,
-            version: String::new(),
-            body: None,
-        }),
-        Err(e) => Err(e.to_string()),
+        Err(e) => {
+            *pending.0.lock().await = None;
+            Err(e.to_string())
+        }
     }
 }
 
 /// Download and install the pending update, then restart. Only called after
 /// explicit user consent ("Install now").
+///
+/// Consumes the `Update` cached by the preceding `check_update_info` call
+/// rather than issuing a fresh `updater.check()`, so the installed version
+/// is guaranteed to match what the user saw in the banner.
 #[tauri::command]
-async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
-    use tauri_plugin_updater::UpdaterExt;
-
-    let updater = app.updater().map_err(|e| e.to_string())?;
-    let update = updater
-        .check()
+async fn install_update(
+    app: tauri::AppHandle,
+    pending: tauri::State<'_, PendingUpdate>,
+) -> Result<(), String> {
+    let update = pending
+        .0
+        .lock()
         .await
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "No update available".to_string())?;
+        .take()
+        .ok_or_else(|| "No pending update — call check_update_info first".to_string())?;
 
     update
         .download_and_install(|_chunk, _total| {}, || {})
