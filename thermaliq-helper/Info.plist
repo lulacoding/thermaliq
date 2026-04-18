@@ -14,15 +14,30 @@
 	<string>ThermalIQ Helper</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
+	<!--
+	    CFBundleShortVersionString and CFBundleVersion are patched by
+	    embed_helper.sh at bundle time to match thermaliq-helper's Cargo.toml
+	    version so the staleness check in privileged_helper.rs can compare
+	    installed vs bundled versions.
+	-->
 	<key>CFBundleShortVersionString</key>
-	<string>1.0</string>
+	<string>1.0.0</string>
 	<key>CFBundleVersion</key>
 	<string>1</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
+	<!--
+	    SMAuthorizedClients: designated requirement of the app(s) permitted to
+	    install this helper via SMJobBless.  Must match the DR embedded in the
+	    ThermalIQ.app bundle certificate.
+
+	    The APPLE_TEAM_ID placeholder is substituted by embed_helper.sh during
+	    a signed release build.  For ad-hoc / unsigned development builds the
+	    requirement is relaxed to "anchor apple generic" only.
+	-->
 	<key>SMAuthorizedClients</key>
 	<array>
-		<string>identifier "com.thermaliq.app" and anchor apple generic and certificate 1[field.1.2.1] /* exists */ and certificate leaf[field.1.2.1] /* exists */ and certificate leaf[subject.OU] = XXXXXXXXXX</string>
+		<string>anchor apple generic and identifier "com.thermaliq.app" and (certificate leaf[field.1.2.840.113635.100.6.1.9] /* exists */ or certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = "${APPLE_TEAM_ID}")</string>
 	</array>
 </dict>
 </plist>

@@ -19,6 +19,13 @@ fn main() {
 
 #[cfg(target_os = "macos")]
 fn main() -> anyhow::Result<()> {
+    // Support `--version` so the UI crate can detect staleness by comparing
+    // the installed binary version against the one embedded in the app bundle.
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("{}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     macos::run()
 }
 

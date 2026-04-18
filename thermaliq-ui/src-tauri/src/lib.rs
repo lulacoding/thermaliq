@@ -1,3 +1,5 @@
+mod privileged_helper;
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -26,7 +28,13 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .invoke_handler(tauri::generate_handler![send_notification, check_for_updates])
+        .invoke_handler(tauri::generate_handler![
+            send_notification,
+            check_for_updates,
+            privileged_helper::install_privileged_helper,
+            privileged_helper::uninstall_privileged_helper,
+            privileged_helper::helper_status,
+        ])
         .setup(|app| {
             let state = Arc::new(Mutex::new(TrayState::default()));
             setup_tray(app, Arc::clone(&state))?;
