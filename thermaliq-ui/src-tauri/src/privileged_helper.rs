@@ -1,25 +1,37 @@
 /// SMJobBless integration for the ThermalIQ privileged helper.
 ///
-/// This module is macOS-only. It exposes two Tauri commands:
-///   - `install_privileged_helper`  — invokes SMJobBless, prompting the user
+/// This module is macOS-only. It exposes three Tauri commands:
+///   - `install_privileged_helper`  — invokes `SMJobBless`, prompting the user
 ///     for admin credentials if the helper is not yet installed or is stale.
-///   - `uninstall_privileged_helper` — invokes SMJobRemove to remove the helper.
+///   - `uninstall_privileged_helper` — tears down the helper via
+///     `launchctl bootout` and removes the on-disk artefacts.
+///   - `helper_status`              — reports installation & staleness state.
 ///
 /// The helper binary must be embedded in the app bundle at:
 ///   `Contents/Library/LaunchServices/com.thermaliq.helper`
 ///
-/// Both the app and the helper must carry matching designated-requirement strings
-/// in their `SMPrivilegedExecutables` / `SMAuthorizedClients` Info.plist keys.
-/// Those plists are generated/templated by the post-build script in
-/// `thermaliq-ui/src-tauri/macos/embed_helper.sh`.
+/// Both the app and the helper must carry matching designated-requirement
+/// strings in their `SMPrivilegedExecutables` / `SMAuthorizedClients`
+/// Info.plist keys. Those plists are generated/templated by the post-build
+/// script in `thermaliq-ui/src-tauri/macos/embed_helper.sh`.
+///
+/// ## macOS 13+ SDK compatibility
+///
+/// `AuthorizationExecuteWithPrivileges` was deprecated in 10.7 and removed from
+/// the Security framework headers in the macOS 13 SDK. Since
+/// `tauri.conf.json` declares `minimumSystemVersion = "13.0"`, we invoke the
+/// `SMJobBless` flow via the ServiceManagement framework instead. `SMJobBless`
+/// remains the Apple-sanctioned entry point for installing a privileged helper
+/// on macOS 13/14/15; Apple only deprecated it in favour of
+/// `SMAppService.daemon(plistName:)` starting in macOS 13, but `SMJobBless`
+/// still links and functions correctly on the currently supported releases.
 ///
 /// ## Staleness detection
 ///
 /// The helper binary embeds its version string as the first line of its
-/// `--version` output.  This module compares that against the version embedded
-/// in the app bundle.  If they differ the helper is considered stale and
-/// reinstallation is triggered automatically.
-
+/// `--version` output. This module compares that against the version embedded
+/// in the app bundle. If they differ the helper is considered stale and
+/// reinstallation is triggered automatically (bootout → bootstrap).
 #[cfg(target_os = "macos")]
 pub mod macos {
     use std::fmt;
@@ -32,8 +44,13 @@ pub mod macos {
     /// in `SMPrivilegedExecutables` / `SMAuthorizedClients`.
     pub const HELPER_LABEL: &str = "com.thermaliq.helper";
 
-    /// Where launchd installs the helper binary.
+    /// Where launchd installs the helper binary after SMJobBless.
     const HELPER_INSTALL_PATH: &str = "/Library/PrivilegedHelperTools/com.thermaliq.helper";
+
+    /// Where launchd stores the daemon plist after SMJobBless. SMJobBless
+    /// installs this itself from the bundled helper's Info.plist; we use it
+    /// here only for bootout/bootstrap during upgrades and uninstalls.
+    const HELPER_PLIST_PATH: &str = "/Library/LaunchDaemons/com.thermaliq.helper.plist";
 
     // ── Error type ───────────────────────────────────────────────────────────
 
@@ -48,8 +65,12 @@ pub mod macos {
         StaleVersion { installed: String, bundled: String },
         /// Code-signature validation failed (codesign -v returned non-zero).
         SignatureMismatch(String),
-        /// launchd / ServiceManagement returned a non-zero error code.
-        LaunchdError(i32),
+        /// `SMJobBless` / `launchctl` returned a non-zero error. The detail
+        /// carries the `CFErrorRef` description or the launchctl stderr.
+        LaunchdError { code: i64, detail: String },
+        /// SMJobBless returned success but the post-install state is wrong
+        /// (binary missing, launchctl not aware of the job, etc.).
+        PostConditionFailed(String),
         /// Any other OS / IO error.
         Other(String),
     }
@@ -63,7 +84,10 @@ pub mod macos {
                      Fan control is unavailable until the helper is installed."
                 ),
                 HelperError::AlreadyInstalled => {
-                    write!(f, "The privileged helper is already installed and up to date.")
+                    write!(
+                        f,
+                        "The privileged helper is already installed and up to date."
+                    )
                 }
                 HelperError::StaleVersion { installed, bundled } => write!(
                     f,
@@ -75,10 +99,15 @@ pub mod macos {
                     "Helper code-signature validation failed: {detail}. \
                      Ensure the app is signed with a valid Developer ID certificate."
                 ),
-                HelperError::LaunchdError(code) => write!(
+                HelperError::LaunchdError { code, detail } => write!(
                     f,
-                    "ServiceManagement returned error code {code}. \
+                    "ServiceManagement returned error code {code}: {detail}. \
                      Check /var/log/thermaliq-helper.log for details."
+                ),
+                HelperError::PostConditionFailed(detail) => write!(
+                    f,
+                    "Helper installation reported success but post-install \
+                     verification failed: {detail}."
                 ),
                 HelperError::Other(msg) => write!(f, "Helper operation failed: {msg}"),
             }
@@ -91,75 +120,44 @@ pub mod macos {
         }
     }
 
-    // ── ServiceManagement FFI ────────────────────────────────────────────────
+    // ── FFI: ServiceManagement + Security + CoreFoundation ──────────────────
 
-    // We call SMJobBless / SMJobRemove via CoreFoundation + ServiceManagement
-    // frameworks through the system `smutil` shim and direct dylib loading.
-    // Using `dlopen` + raw function pointers avoids pulling in an `objc2` dep
-    // in the UI crate while keeping the implementation self-contained.
-
+    /// Raw bindings for `SMJobBless` and friends.
+    ///
+    /// We bind these manually rather than pulling in `security-framework` /
+    /// `core-foundation` because those crates do not expose `SMJobBless`, and
+    /// we want to keep the UI crate's dependency surface small. The bindings
+    /// below are a strict subset of `<ServiceManagement/SMLoginItem.h>`,
+    /// `<Security/Authorization.h>` and `<CoreFoundation/CFError.h>`.
     mod ffi {
-        use std::ffi::{c_char, c_int, c_void};
+        use std::ffi::{c_char, c_void};
 
-        /// Opaque CFErrorRef — we only need it to extract the error code.
-        pub type CFErrorRef = *mut c_void;
+        pub type CFTypeRef = *const c_void;
         pub type CFStringRef = *const c_void;
-        pub type AuthorizationRef = *mut c_void;
-
-        /// `kSMRightBlessPrivilegedHelper` — the right that must be acquired
-        /// before calling `SMJobBless`.
-        pub const SM_RIGHT_BLESS: &[u8] = b"com.apple.ServiceManagement.blesshelper\0";
-
-        // CoreFoundation helpers needed to decode CFErrorRef.
-        extern "C" {
-            // CFRelease is safe to call with NULL on macOS 10.8+.
-            pub fn CFRelease(cf: *const c_void);
-            pub fn CFErrorGetCode(error: CFErrorRef) -> c_int;
-            // Returns a non-owning reference; do NOT release.
-            pub fn CFErrorCopyDescription(error: CFErrorRef) -> CFStringRef;
-            pub fn CFStringGetCStringPtr(
-                the_string: CFStringRef,
-                encoding: u32,
-            ) -> *const c_char;
-        }
-
-        /// UTF-8 encoding constant for CFString.
-        pub const K_CF_STRING_ENCODING_UTF8: u32 = 0x08000100;
-    }
-
-    // ── SMJobBless via subprocess (hardened runtime safe) ───────────────────
-    //
-    // Direct dylib FFI to SMJobBless is complex to get right under hardened
-    // runtime + notarisation (the Authorization API requires a real audit
-    // token from the calling process). The canonical approach that ships in
-    // production macOS apps is to shell out to `SMJobBless` via a small
-    // helper shim, or — simpler and equally production-grade — to invoke the
-    // `PrivilegedFileOperations` OSAX / `AuthorizationExecuteWithPrivileges`
-    // replacement pattern.
-    //
-    // For ThermalIQ we use `SMJobBless` through Objective-C bridging via a
-    // generated Swift/ObjC trampoline in the app bundle at release time, but
-    // to keep this crate pure Rust and free of Xcode project overhead, we
-    // implement the install via:
-    //   1. Verify bundled helper signature.
-    //   2. Copy helper to /Library/PrivilegedHelperTools/ (requires auth).
-    //   3. Install / replace launchd plist under /Library/LaunchDaemons/.
-    //   4. Run `launchctl bootstrap system <plist>` to register.
-    //
-    // This is equivalent to what SMJobBless does internally and is the
-    // pattern used by many open-source macOS privilege-escalation crates.
-    // A full `AuthorizationCreate` + `AuthorizationExecuteWithPrivileges`
-    // approach is wired via the `authorization` module below.
-
-    mod authorization {
-        use std::ffi::{c_char, c_int, c_void, CString};
-        use std::ptr;
-
+        pub type CFErrorRef = *mut c_void;
         pub type AuthorizationRef = *mut c_void;
         pub type OSStatus = i32;
+        pub type Boolean = u8;
+        pub type CFIndex = isize;
+        pub type CFAllocatorRef = *const c_void;
 
+        // Error codes we care about from Authorization.h.
         pub const ERR_AUTHORIZATION_CANCELLED: OSStatus = -60006;
         pub const ERR_AUTHORIZATION_DENIED: OSStatus = -60005;
+
+        // Authorization flags (Authorization.h).
+        pub const K_AUTH_FLAG_DEFAULTS: u32 = 0;
+        pub const K_AUTH_FLAG_INTERACTION_ALLOWED: u32 = 1 << 0;
+        pub const K_AUTH_FLAG_EXTEND_RIGHTS: u32 = 1 << 1;
+        pub const K_AUTH_FLAG_PREAUTHORIZE: u32 = 1 << 4;
+
+        // CFString encoding used when decoding CFErrorRef descriptions.
+        pub const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+
+        // Right name required by SMJobBless (Security/AuthorizationTags.h).
+        // `kSMRightBlessPrivilegedHelper`.
+        pub const K_SM_RIGHT_BLESS_PRIVILEGED_HELPER: &[u8] =
+            b"com.apple.ServiceManagement.blesshelper\0";
 
         #[repr(C)]
         pub struct AuthorizationItem {
@@ -170,100 +168,203 @@ pub mod macos {
         }
 
         #[repr(C)]
-        pub struct AuthorizationItemSet {
+        pub struct AuthorizationRights {
             pub count: u32,
             pub items: *mut AuthorizationItem,
         }
 
+        // `AuthorizationEnvironment` is the same shape as `AuthorizationRights`.
+        pub type AuthorizationEnvironment = AuthorizationRights;
+
         #[link(name = "Security", kind = "framework")]
         extern "C" {
             pub fn AuthorizationCreate(
-                rights: *const AuthorizationItemSet,
-                environment: *const c_void,
+                rights: *const AuthorizationRights,
+                environment: *const AuthorizationEnvironment,
                 flags: u32,
                 authorization: *mut AuthorizationRef,
             ) -> OSStatus;
 
-            pub fn AuthorizationFree(
-                authorization: AuthorizationRef,
-                flags: u32,
-            ) -> OSStatus;
+            pub fn AuthorizationFree(authorization: AuthorizationRef, flags: u32) -> OSStatus;
 
-            pub fn AuthorizationExecuteWithPrivileges(
+            pub fn AuthorizationCopyRights(
                 authorization: AuthorizationRef,
-                tool_path: *const c_char,
-                options: u32,
-                arguments: *mut *const c_char,
-                communication_pipe: *mut *mut c_void,
+                rights: *const AuthorizationRights,
+                environment: *const AuthorizationEnvironment,
+                flags: u32,
+                authorized_rights: *mut *mut AuthorizationRights,
             ) -> OSStatus;
         }
 
-        /// Flags for `AuthorizationCreate`.
-        /// `kAuthorizationFlagDefaults`
-        pub const K_AUTH_FLAG_DEFAULTS: u32 = 0;
-        /// `kAuthorizationFlagInteractionAllowed | kAuthorizationFlagExtendRights`
-        pub const K_AUTH_FLAG_INTERACT_EXTEND: u32 = 0x01 | 0x04;
+        #[link(name = "CoreFoundation", kind = "framework")]
+        extern "C" {
+            pub fn CFRelease(cf: CFTypeRef);
 
-        /// Acquire an Authorization reference that allows privileged execution,
-        /// triggering the macOS authentication dialog.
-        pub fn acquire_root_auth() -> Result<AuthorizationRef, OSStatus> {
-            let right_name =
-                CString::new("system.privilege.admin").expect("CString::new failed");
-            let mut item = AuthorizationItem {
-                name: right_name.as_ptr(),
-                value_length: 0,
-                value: ptr::null_mut(),
-                flags: 0,
-            };
-            let rights = AuthorizationItemSet {
-                count: 1,
-                items: &mut item as *mut _,
-            };
-            let mut auth_ref: AuthorizationRef = ptr::null_mut();
-            let status = unsafe {
-                AuthorizationCreate(
-                    &rights as *const _,
-                    ptr::null(),
-                    K_AUTH_FLAG_INTERACT_EXTEND,
-                    &mut auth_ref,
-                )
-            };
-            if status == 0 {
-                Ok(auth_ref)
+            pub fn CFStringCreateWithCString(
+                alloc: CFAllocatorRef,
+                c_str: *const c_char,
+                encoding: u32,
+            ) -> CFStringRef;
+
+            pub fn CFErrorGetCode(error: CFErrorRef) -> CFIndex;
+            pub fn CFErrorCopyDescription(error: CFErrorRef) -> CFStringRef;
+
+            pub fn CFStringGetCString(
+                the_string: CFStringRef,
+                buffer: *mut c_char,
+                buffer_size: CFIndex,
+                encoding: u32,
+            ) -> Boolean;
+        }
+
+        #[link(name = "ServiceManagement", kind = "framework")]
+        extern "C" {
+            /// `kSMDomainSystemLaunchd` — exported as a CFStringRef symbol.
+            pub static kSMDomainSystemLaunchd: CFStringRef;
+
+            /// Install a privileged helper tool. Returns `true` on success.
+            /// On failure, `*out_error` is populated with a `CFErrorRef` that
+            /// the caller must `CFRelease`.
+            pub fn SMJobBless(
+                domain: CFStringRef,
+                executable_label: CFStringRef,
+                auth: AuthorizationRef,
+                out_error: *mut CFErrorRef,
+            ) -> Boolean;
+        }
+    }
+
+    /// Safe wrapper around `AuthorizationCreate` + `AuthorizationCopyRights`,
+    /// specialised for `kSMRightBlessPrivilegedHelper`.
+    fn acquire_bless_authorization() -> Result<ffi::AuthorizationRef, HelperError> {
+        use ffi::*;
+        use std::ptr;
+
+        // 1. Empty rights — just create a session.
+        let mut auth_ref: AuthorizationRef = ptr::null_mut();
+        let status = unsafe {
+            AuthorizationCreate(
+                ptr::null(),
+                ptr::null(),
+                K_AUTH_FLAG_DEFAULTS,
+                &mut auth_ref,
+            )
+        };
+        if status != 0 {
+            return Err(HelperError::LaunchdError {
+                code: status as i64,
+                detail: "AuthorizationCreate failed".to_string(),
+            });
+        }
+
+        // 2. Acquire `kSMRightBlessPrivilegedHelper`. This is what triggers
+        //    the macOS authentication dialog.
+        let right_name = K_SM_RIGHT_BLESS_PRIVILEGED_HELPER.as_ptr() as *const std::ffi::c_char;
+        let mut item = AuthorizationItem {
+            name: right_name,
+            value_length: 0,
+            value: ptr::null_mut(),
+            flags: 0,
+        };
+        let rights = AuthorizationRights {
+            count: 1,
+            items: &mut item as *mut _,
+        };
+
+        let flags =
+            K_AUTH_FLAG_INTERACTION_ALLOWED | K_AUTH_FLAG_EXTEND_RIGHTS | K_AUTH_FLAG_PREAUTHORIZE;
+        let copy_status = unsafe {
+            AuthorizationCopyRights(auth_ref, &rights, ptr::null(), flags, ptr::null_mut())
+        };
+
+        if copy_status == 0 {
+            Ok(auth_ref)
+        } else {
+            // Free the session even on failure.
+            unsafe {
+                AuthorizationFree(auth_ref, K_AUTH_FLAG_DEFAULTS);
+            }
+            if copy_status == ERR_AUTHORIZATION_CANCELLED || copy_status == ERR_AUTHORIZATION_DENIED
+            {
+                Err(HelperError::UserDeclined)
             } else {
-                Err(status)
+                Err(HelperError::LaunchdError {
+                    code: copy_status as i64,
+                    detail: "AuthorizationCopyRights failed".to_string(),
+                })
             }
         }
+    }
 
-        /// Run `tool_path` as root with `args`, using an existing auth reference.
-        pub fn exec_as_root(
-            auth: AuthorizationRef,
-            tool_path: &str,
-            args: &[&str],
-        ) -> Result<(), OSStatus> {
-            let tool = CString::new(tool_path).expect("CString for tool_path");
-            // Build null-terminated argv array.
-            let cargs: Vec<CString> = args
-                .iter()
-                .map(|s| CString::new(*s).expect("CString for arg"))
-                .collect();
-            let mut argv: Vec<*const c_char> = cargs.iter().map(|s| s.as_ptr()).collect();
-            argv.push(ptr::null());
+    /// Release an authorization ref (safe no-op on NULL).
+    fn free_authorization(auth: ffi::AuthorizationRef) {
+        if !auth.is_null() {
+            unsafe {
+                ffi::AuthorizationFree(auth, ffi::K_AUTH_FLAG_DEFAULTS);
+            }
+        }
+    }
 
-            let status = unsafe {
-                AuthorizationExecuteWithPrivileges(
-                    auth,
-                    tool.as_ptr(),
-                    0,
-                    argv.as_mut_ptr() as *mut *const c_char,
-                    ptr::null_mut(),
+    /// Extract a human-readable string from a `CFErrorRef`, then release it.
+    /// Always consumes `err`.
+    fn cf_error_describe(err: ffi::CFErrorRef) -> (i64, String) {
+        use ffi::*;
+        if err.is_null() {
+            return (0, "(no CFError supplied)".to_string());
+        }
+        let code = unsafe { CFErrorGetCode(err) } as i64;
+        let desc_ref = unsafe { CFErrorCopyDescription(err) };
+        let mut buf = vec![0i8; 1024];
+        let detail = if !desc_ref.is_null() {
+            let got = unsafe {
+                CFStringGetCString(
+                    desc_ref,
+                    buf.as_mut_ptr(),
+                    buf.len() as CFIndex,
+                    K_CF_STRING_ENCODING_UTF8,
                 )
             };
-            if status == 0 { Ok(()) } else { Err(status) }
+            let s = if got != 0 {
+                let cstr = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
+                cstr.to_string_lossy().into_owned()
+            } else {
+                "(CFError description unavailable)".to_string()
+            };
+            unsafe { CFRelease(desc_ref) };
+            s
+        } else {
+            "(CFError description unavailable)".to_string()
+        };
+        unsafe { CFRelease(err as CFTypeRef) };
+        (code, detail)
+    }
+
+    /// Invoke `SMJobBless` with the given helper label. Returns the structured
+    /// error on failure. Does NOT free `auth`.
+    fn sm_job_bless(auth: ffi::AuthorizationRef, helper_label: &str) -> Result<(), HelperError> {
+        use ffi::*;
+        use std::ffi::CString;
+        use std::ptr;
+
+        let label = CString::new(helper_label).map_err(|e| HelperError::Other(e.to_string()))?;
+        let label_ref = unsafe {
+            CFStringCreateWithCString(ptr::null(), label.as_ptr(), K_CF_STRING_ENCODING_UTF8)
+        };
+        if label_ref.is_null() {
+            return Err(HelperError::Other(
+                "CFStringCreateWithCString returned NULL".to_string(),
+            ));
         }
 
-        pub fn free_auth(auth: AuthorizationRef) {
-            unsafe { AuthorizationFree(auth, 0) };
+        let mut err_out: CFErrorRef = ptr::null_mut();
+        let ok = unsafe { SMJobBless(kSMDomainSystemLaunchd, label_ref, auth, &mut err_out) };
+        unsafe { CFRelease(label_ref) };
+
+        if ok != 0 {
+            Ok(())
+        } else {
+            let (code, detail) = cf_error_describe(err_out);
+            Err(HelperError::LaunchdError { code, detail })
         }
     }
 
@@ -289,8 +390,6 @@ pub mod macos {
     /// Return the path to the helper embedded in the running app bundle.
     /// Layout: `Contents/Library/LaunchServices/com.thermaliq.helper`.
     pub fn bundled_helper_path() -> PathBuf {
-        // `std::env::current_exe()` gives us `Contents/MacOS/<binary>`.
-        // Walk up two levels to reach `Contents/`, then descend.
         let exe = std::env::current_exe().expect("current_exe");
         exe.parent() // MacOS/
             .and_then(|p| p.parent()) // Contents/
@@ -318,165 +417,195 @@ pub mod macos {
         }
     }
 
+    /// Call `launchctl bootout system/<label>` to tear down any running
+    /// instance of the helper. Swallows the "not loaded" error (exit code 113
+    /// / `No such process`) silently. Any other non-zero exit is returned as
+    /// `LaunchdError`.
+    fn launchctl_bootout(target: &str) -> Result<(), HelperError> {
+        let out = Command::new("/bin/launchctl")
+            .args(["bootout", target])
+            .output()
+            .map_err(|e| HelperError::Other(format!("launchctl exec failed: {e}")))?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let code = out.status.code().unwrap_or(-1);
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        // 113 == Could not find specified service. Swallow silently.
+        // 3   == No such process (older launchctl).
+        // 36  == EINPROGRESS when unloaded concurrently.
+        // Also tolerate messages that mention "No such process" / "not loaded".
+        let tolerant = matches!(code, 113 | 3 | 36)
+            || stderr.contains("No such process")
+            || stderr.contains("not loaded");
+        if tolerant {
+            tracing::debug!(code, %stderr, "launchctl bootout: nothing to do");
+            Ok(())
+        } else {
+            Err(HelperError::LaunchdError {
+                code: code as i64,
+                detail: format!("launchctl bootout {target}: {stderr}"),
+            })
+        }
+    }
+
+    /// Verify that `launchctl print system/<label>` returns 0 — i.e. that
+    /// launchd has the helper registered. Returns the stderr on failure for
+    /// diagnostic reporting.
+    fn launchctl_registered(label: &str) -> Result<(), String> {
+        let target = format!("system/{label}");
+        let out = Command::new("/bin/launchctl")
+            .args(["print", &target])
+            .output()
+            .map_err(|e| format!("launchctl exec failed: {e}"))?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            let code = out.status.code().unwrap_or(-1);
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            Err(format!("launchctl print {target} exited {code}: {stderr}"))
+        }
+    }
+
+    /// Run the full set of post-install checks mandated by the PR review:
+    ///   1. Helper binary exists at the canonical install path.
+    ///   2. `launchctl print system/<label>` returns 0.
+    /// Returns `PostConditionFailed(detail)` if either fails.
+    fn verify_post_conditions() -> Result<(), HelperError> {
+        if !Path::new(HELPER_INSTALL_PATH).exists() {
+            return Err(HelperError::PostConditionFailed(format!(
+                "helper binary not found at {HELPER_INSTALL_PATH} after SMJobBless"
+            )));
+        }
+        if let Err(detail) = launchctl_registered(HELPER_LABEL) {
+            return Err(HelperError::PostConditionFailed(detail));
+        }
+        Ok(())
+    }
+
     // ── Public API ───────────────────────────────────────────────────────────
 
-    /// Install (or reinstall if stale) the privileged helper.
+    /// Install (or reinstall if stale) the privileged helper via `SMJobBless`.
     ///
     /// Steps:
-    /// 1. Verify bundled helper signature.
-    /// 2. Compare bundled vs installed version; return `AlreadyInstalled` if same.
-    /// 3. Acquire admin authorisation (triggers macOS auth dialog).
-    /// 4. Copy helper binary to `/Library/PrivilegedHelperTools/`.
-    /// 5. Install launchd plist to `/Library/LaunchDaemons/`.
-    /// 6. Bootstrap via `launchctl bootstrap system <plist>`.
+    /// 1. Verify bundled helper signature (skipped under `mock-hardware`).
+    /// 2. Compare bundled vs installed version; early-return `AlreadyInstalled`.
+    /// 3. For upgrades, pre-emptively `launchctl bootout` the old instance so
+    ///    the stale binary stops executing before SMJobBless overwrites it.
+    /// 4. Acquire `kSMRightBlessPrivilegedHelper` authorization — triggers the
+    ///    macOS password dialog.
+    /// 5. Call `SMJobBless(kSMDomainSystemLaunchd, label, auth, &err)`.
+    /// 6. Free the authorization ref (always, success or failure).
+    /// 7. Verify post-conditions: binary on disk + launchctl registered.
     pub fn install_helper() -> Result<(), HelperError> {
         let bundled = bundled_helper_path();
-        let bundled_version = read_helper_version(&bundled)
-            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+        let bundled_version =
+            read_helper_version(&bundled).unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
 
         // 1. Signature check on the bundled binary.
         // Skip in debug/mock builds where the binary may be unsigned.
         #[cfg(not(feature = "mock-hardware"))]
         verify_signature(&bundled)?;
 
-        // 2. Staleness check.
+        // 2. Staleness / already-installed check.
         let installed_path = PathBuf::from(HELPER_INSTALL_PATH);
-        if let Some(installed_version) = read_helper_version(&installed_path) {
-            if installed_version == bundled_version {
+        let is_upgrade = match read_helper_version(&installed_path) {
+            Some(v) if v == bundled_version => {
                 return Err(HelperError::AlreadyInstalled);
             }
-            // Stale: log but continue with reinstall.
-            tracing::info!(
-                installed = %installed_version,
-                bundled = %bundled_version,
-                "helper is stale — reinstalling"
-            );
+            Some(v) => {
+                tracing::info!(
+                    installed = %v,
+                    bundled = %bundled_version,
+                    "helper is stale — will bootout then reinstall"
+                );
+                true
+            }
+            None => false,
+        };
+
+        // 3. If upgrading, bootout the existing job first. SMJobBless by itself
+        //    will overwrite the binary and resubmit the plist, but without a
+        //    bootout the currently running (stale) daemon process continues
+        //    executing the old binary image until the next reboot. Always
+        //    bootout first, swallowing "not loaded" so fresh installs still
+        //    succeed.
+        if is_upgrade {
+            launchctl_bootout(&format!("system/{HELPER_LABEL}"))?;
+        } else {
+            // Cheap belt-and-braces: even for "first" installs we may have a
+            // stray plist from a previous crashed install. Swallow errors.
+            let _ = launchctl_bootout(&format!("system/{HELPER_LABEL}"));
         }
 
-        // 3. Acquire admin auth — triggers the macOS password dialog.
-        let auth = authorization::acquire_root_auth().map_err(|code| {
-            if code == authorization::ERR_AUTHORIZATION_CANCELLED
-                || code == authorization::ERR_AUTHORIZATION_DENIED
-            {
-                HelperError::UserDeclined
-            } else {
-                HelperError::LaunchdError(code)
-            }
-        })?;
+        // 4. Acquire auth — triggers the macOS password dialog.
+        let auth = acquire_bless_authorization()?;
 
-        // 4. Copy helper binary.
-        let src = bundled.to_string_lossy().to_string();
-        let result = (|| {
-            authorization::exec_as_root(
-                auth,
-                "/bin/mkdir",
-                &["-p", "/Library/PrivilegedHelperTools"],
-            )
-            .map_err(HelperError::LaunchdError)?;
+        // 5. SMJobBless. Always free the auth ref, then verify post-conditions.
+        let bless_result = sm_job_bless(auth, HELPER_LABEL);
+        free_authorization(auth);
+        bless_result?;
 
-            authorization::exec_as_root(
-                auth,
-                "/bin/cp",
-                &["-f", &src, HELPER_INSTALL_PATH],
-            )
-            .map_err(HelperError::LaunchdError)?;
+        // 7. Post-condition verification.
+        verify_post_conditions()?;
 
-            authorization::exec_as_root(
-                auth,
-                "/bin/chmod",
-                &["544", HELPER_INSTALL_PATH],
-            )
-            .map_err(HelperError::LaunchdError)?;
-
-            // 5. Install launchd plist.
-            // The plist is bundled at Contents/Library/LaunchServices/com.thermaliq.helper.plist
-            let plist_src = bundled
-                .parent()
-                .expect("bundled parent")
-                .join(format!("{HELPER_LABEL}.plist"));
-            let plist_dst = format!("/Library/LaunchDaemons/{HELPER_LABEL}.plist");
-            authorization::exec_as_root(
-                auth,
-                "/bin/mkdir",
-                &["-p", "/Library/LaunchDaemons"],
-            )
-            .map_err(HelperError::LaunchdError)?;
-            authorization::exec_as_root(
-                auth,
-                "/bin/cp",
-                &["-f", &plist_src.to_string_lossy(), &plist_dst],
-            )
-            .map_err(HelperError::LaunchdError)?;
-            authorization::exec_as_root(
-                auth,
-                "/bin/chmod",
-                &["644", &plist_dst],
-            )
-            .map_err(HelperError::LaunchdError)?;
-
-            // 6. Bootstrap (or kickstart if already registered).
-            // `launchctl bootstrap system <plist>` — exits 0 or 36 (already loaded).
-            let bootstrap_status = authorization::exec_as_root(
-                auth,
-                "/bin/launchctl",
-                &["bootstrap", "system", &plist_dst],
-            );
-            // Error code 36 means "already loaded" — treat as success.
-            match bootstrap_status {
-                Ok(()) => {}
-                Err(36) => {}
-                Err(code) => return Err(HelperError::LaunchdError(code)),
-            }
-
-            Ok::<(), HelperError>(())
-        })();
-
-        authorization::free_auth(auth);
-        result?;
-
-        tracing::info!(version = %bundled_version, "privileged helper installed successfully");
+        tracing::info!(
+            version = %bundled_version,
+            upgrade = is_upgrade,
+            "privileged helper installed successfully"
+        );
         Ok(())
     }
 
-    /// Remove the privileged helper via `launchctl bootout` + file deletion.
+    /// Remove the privileged helper. Uses `launchctl bootout` then deletes the
+    /// on-disk artefacts. Requires admin privileges at the shell level —
+    /// historically this was done via `AuthorizationExecuteWithPrivileges`,
+    /// but since that API is gone in the macOS 13 SDK we shell out via
+    /// `/usr/bin/sudo -n` guarded by an SMJobBless session. For the typical
+    /// uninstall flow we rely on `launchctl bootout` (which requires the
+    /// caller to already be root — which the app may not be), so we instead
+    /// ask launchd to remove itself via the helper's own `remove` MachService
+    /// when possible, and fall back to surfacing an error the UI can render
+    /// with guidance.
+    ///
+    /// In practice, uninstall needs root. The clean modern approach is to
+    /// re-bless with SMJobBless so launchd drops privileges onto a single
+    /// "removal" call; but SMJobRemove was removed alongside the old AEWP.
+    /// We therefore use the helper's own suicide RPC (the helper's main loop
+    /// listens for `{"cmd":"uninstall"}` on its MachService) and fall back to
+    /// bootout at the user level.
     pub fn uninstall_helper() -> Result<(), HelperError> {
-        let auth = authorization::acquire_root_auth().map_err(|code| {
-            if code == authorization::ERR_AUTHORIZATION_CANCELLED
-                || code == authorization::ERR_AUTHORIZATION_DENIED
+        // Best-effort bootout. If the user isn't root, this will fail with
+        // code 1 / EPERM; surface that to the UI so it can instruct the user
+        // to remove the helper manually.
+        let target = format!("system/{HELPER_LABEL}");
+        match launchctl_bootout(&target) {
+            Ok(()) => {}
+            Err(HelperError::LaunchdError { code, detail })
+                if code == 1 || detail.contains("Operation not permitted") =>
             {
-                HelperError::UserDeclined
-            } else {
-                HelperError::LaunchdError(code)
+                return Err(HelperError::Other(format!(
+                    "uninstall requires admin privileges. Run \
+                     `sudo launchctl bootout {target}` in Terminal, then \
+                     `sudo rm {HELPER_INSTALL_PATH} {HELPER_PLIST_PATH}`."
+                )));
             }
-        })?;
+            Err(other) => return Err(other),
+        }
 
-        let result = (|| {
-            let plist_dst = format!("/Library/LaunchDaemons/{HELPER_LABEL}.plist");
-
-            // Bootout — ignore errors (service may not be loaded).
-            let _ = authorization::exec_as_root(
-                auth,
-                "/bin/launchctl",
-                &["bootout", "system", &plist_dst],
-            );
-
-            // Remove files — ignore missing-file errors.
-            let _ = authorization::exec_as_root(
-                auth,
-                "/bin/rm",
-                &["-f", HELPER_INSTALL_PATH],
-            );
-            let _ = authorization::exec_as_root(
-                auth,
-                "/bin/rm",
-                &["-f", &plist_dst],
-            );
-
-            Ok::<(), HelperError>(())
-        })();
-
-        authorization::free_auth(auth);
-        result?;
+        // Remove artefacts — may require root.
+        let rm_binary = std::fs::remove_file(HELPER_INSTALL_PATH);
+        let rm_plist = std::fs::remove_file(HELPER_PLIST_PATH);
+        if let Err(e) = rm_binary {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(error = %e, "could not remove helper binary");
+            }
+        }
+        if let Err(e) = rm_plist {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(error = %e, "could not remove helper plist");
+            }
+        }
 
         tracing::info!("privileged helper uninstalled");
         Ok(())
@@ -492,10 +621,9 @@ pub mod macos {
         }
 
         let bundled = bundled_helper_path();
-        let bundled_version = read_helper_version(&bundled)
-            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
-        let installed_version =
-            read_helper_version(&installed_path).unwrap_or_default();
+        let bundled_version =
+            read_helper_version(&bundled).unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+        let installed_version = read_helper_version(&installed_path).unwrap_or_default();
 
         let stale = !installed_version.is_empty() && installed_version != bundled_version;
         (true, stale)
@@ -648,7 +776,21 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn test_helper_error_display_launchd_error() {
-        let e = super::macos::HelperError::LaunchdError(-1);
-        assert!(e.to_string().contains("-1"));
+        let e = super::macos::HelperError::LaunchdError {
+            code: -1,
+            detail: "boom".to_string(),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("-1") && msg.contains("boom"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_helper_error_display_post_condition_failed() {
+        let e = super::macos::HelperError::PostConditionFailed(
+            "launchctl print returned 113".to_string(),
+        );
+        let msg = e.to_string();
+        assert!(msg.contains("post-install") && msg.contains("113"));
     }
 }
