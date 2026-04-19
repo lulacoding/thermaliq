@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - 'v*.*.*'
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -30,15 +31,15 @@ jobs:
             artifact: thermaliq-windows-x86_64
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache@v4
         with:
           path: |
             ~/.cargo/registry/index/
@@ -75,6 +76,8 @@ jobs:
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
         run: |
           KEYCHAIN_PATH="$RUNNER_TEMP/thermaliq.keychain-db"
+          # Generate ephemeral password — passed via env var, not as a CLI argument,
+          # to avoid exposure in the process list.
           KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
@@ -84,11 +87,13 @@ jobs:
             -P "$APPLE_CERTIFICATE_PASSWORD" \
             -A -t cert -f pkcs12 \
             -k "$KEYCHAIN_PATH"
+          # Remove temp cert file immediately after import to avoid leaking it
+          rm -f /tmp/cert.p12
           security list-keychain -d user -s "$KEYCHAIN_PATH"
 
       - name: Build Tauri app (macOS)
         if: startsWith(matrix.os, 'macos')
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -105,8 +110,10 @@ jobs:
 
       - name: Notarize DMG with xcrun notarytool (macOS)
         # Use xcrun notarytool directly — Tauri's built-in notarize hangs (tauri#14579/#8630)
-        if: startsWith(matrix.os, 'macos') && env.APPLE_ID != ''
+        # HAVE_APPLE_ID is derived from the secret at step-env level (mirrors HAVE_APPLE_CERT pattern)
+        if: startsWith(matrix.os, 'macos') && env.HAVE_APPLE_ID == 'true'
         env:
+          HAVE_APPLE_ID: ${{ secrets.APPLE_ID != '' && 'true' || 'false' }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
@@ -146,7 +153,7 @@ jobs:
 
       - name: Build Tauri app (Windows)
         if: matrix.os == 'windows-latest'
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -155,27 +162,56 @@ jobs:
           projectPath: thermaliq-ui
           args: --target ${{ matrix.target }}
 
+      - name: Check signing secrets (Windows)
+        # On stable release tags (vX.Y.Z — no pre-release suffix), missing signing
+        # secrets are a hard error. Beta/RC tags (v*-alpha, v*-beta, v*-rc.*) and
+        # manual workflow_dispatch may proceed unsigned with a warning.
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        env:
+          ESIGNER_USERNAME: ${{ secrets.ESIGNER_USERNAME }}
+          REF_NAME: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          $isStableTag = ($env:EVENT_NAME -eq 'push') -and ($env:REF_NAME -match '^v[0-9]+\.[0-9]+\.[0-9]+$')
+          if ($isStableTag -and (-not $env:ESIGNER_USERNAME)) {
+            Write-Error "ESIGNER_USERNAME secret is required for stable release tags but is not set. Configure ssl.com eSigner credentials before publishing a stable release."
+            exit 1
+          }
+          if (-not $env:ESIGNER_USERNAME) {
+            Write-Warning "ESIGNER_USERNAME not set — skipping code signing (acceptable for prerelease/manual dispatch)"
+          }
+
       - name: Sign with ssl.com eSigner (Windows)
         # Requires secrets: ESIGNER_USERNAME, ESIGNER_PASSWORD,
         # ESIGNER_TOTP_SECRET, ESIGNER_CREDENTIAL_ID
         # Sign up at https://www.ssl.com/esigner/ (EV cert preferred for SmartScreen reputation)
-        if: matrix.os == 'windows-latest'
+        #
+        # To update CodeSignTool version:
+        #   1. Download new zip from https://github.com/SSLcom/CodeSignTool/releases
+        #   2. Compute: sha256sum CodeSignTool-vX.Y.Z-windows.zip
+        #   3. Update CODESIGNTOOL_URL and EXPECTED_SHA256 below
+        if: matrix.os == 'windows-latest' && env.ESIGNER_USERNAME != ''
         env:
           ESIGNER_USERNAME: ${{ secrets.ESIGNER_USERNAME }}
           ESIGNER_PASSWORD: ${{ secrets.ESIGNER_PASSWORD }}
           ESIGNER_TOTP_SECRET: ${{ secrets.ESIGNER_TOTP_SECRET }}
           ESIGNER_CREDENTIAL_ID: ${{ secrets.ESIGNER_CREDENTIAL_ID }}
         run: |
-          if (-not $env:ESIGNER_USERNAME) {
-            Write-Warning "ESIGNER_USERNAME secret not set — skipping code signing"
-            exit 0
-          }
-
-          # Download CodeSignTool
+          $CODESIGNTOOL_URL = "https://github.com/SSLcom/CodeSignTool/releases/download/v1.3.2/CodeSignTool-v1.3.2-windows.zip"
+          $EXPECTED_SHA256  = "7e18b23a03e6c2ead2c8ec96e37905bc40fb41cab0c5b68dc0fcf8ee4e2fd7f3"
           $ZIP = "$env:RUNNER_TEMP\CodeSignTool.zip"
           $DIR = "$env:RUNNER_TEMP\CodeSignTool"
-          Invoke-WebRequest -Uri "https://www.ssl.com/download/codesigntool-for-windows/" `
-            -OutFile $ZIP -UseBasicParsing
+
+          Invoke-WebRequest -Uri $CODESIGNTOOL_URL -OutFile $ZIP -UseBasicParsing
+
+          # Verify integrity before execution — fail hard on mismatch
+          $ACTUAL_SHA256 = (Get-FileHash -Path $ZIP -Algorithm SHA256).Hash.ToLower()
+          if ($ACTUAL_SHA256 -ne $EXPECTED_SHA256) {
+            Write-Error "CodeSignTool SHA256 mismatch!`nExpected: $EXPECTED_SHA256`nActual:   $ACTUAL_SHA256"
+            exit 1
+          }
+
           Expand-Archive -Path $ZIP -DestinationPath $DIR -Force
           $TOOL = (Get-ChildItem -Path $DIR -Filter "CodeSignTool.bat" -Recurse).FullName
 
@@ -226,14 +262,14 @@ jobs:
 
       - name: Upload artifact (Unix)
         if: matrix.os != 'windows-latest'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}.tar.gz
 
       - name: Upload artifact (Windows)
         if: matrix.os == 'windows-latest'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}.zip
@@ -248,18 +284,18 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # actions/checkout@v4
         with:
           fetch-depth: 0  # Required for git-cliff to access full history
 
       - name: Generate CHANGELOG with git-cliff
-        uses: orhun/git-cliff-action@v4
+        uses: orhun/git-cliff-action@c93ef52f3d0ddcdcc9bd5447d98d458a11cd4f72 # orhun/git-cliff-action@v4
         with:
           config: cliff.toml
           args: --verbose
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # actions/download-artifact@v4
         with:
           path: artifacts/
 
@@ -279,14 +315,14 @@ jobs:
             sed "s/0\.3\.0/$VERSION/g" "$file" > "$WINGET_DIR/$filename"
           done
 
-          # Find the NSIS installer in artifacts
+          # Find the NSIS installer in artifacts — fail hard if missing (no placeholder SHA)
           NSIS_FILE=$(find artifacts -name "*_x64-setup.exe" -type f | head -1)
           if [ -z "$NSIS_FILE" ]; then
-            echo "Warning: NSIS installer not found, using placeholder SHA256"
-            SHA256="0000000000000000000000000000000000000000000000000000000000000000"
-          else
-            SHA256=$(sha256sum "$NSIS_FILE" | awk '{print $1}')
+            echo "ERROR: NSIS installer not found in artifacts — cannot generate a valid winget manifest."
+            echo "Ensure the Windows build produced an NSIS installer before cutting a release."
+            exit 1
           fi
+          SHA256=$(sha256sum "$NSIS_FILE" | awk '{print $1}')
 
           # Update installer SHA256 and URL
           INSTALLER_YAML="$WINGET_DIR/thermaliq.ThermalIQ.installer.yaml"
@@ -415,7 +451,7 @@ EOF
           cat latest.json
 
       - name: Create draft release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # softprops/action-gh-release@v2
         with:
           draft: true
           files: |

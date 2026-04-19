@@ -1,3 +1,5 @@
+mod privileged_helper;
+
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -69,7 +71,14 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(PendingUpdate::default())
-        .invoke_handler(tauri::generate_handler![send_notification, check_update_info, install_update])
+        .invoke_handler(tauri::generate_handler![
+            send_notification,
+            check_update_info,
+            install_update,
+            privileged_helper::install_privileged_helper,
+            privileged_helper::uninstall_privileged_helper,
+            privileged_helper::helper_status,
+        ])
         .setup(|app| {
             let state = Arc::new(Mutex::new(TrayState::default()));
             setup_tray(app, Arc::clone(&state))?;
@@ -116,7 +125,8 @@ fn send_notification(title: String, body: String) {
 
 fn setup_tray(app: &mut tauri::App, state: Arc<Mutex<TrayState>>) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "Show ThermalIQ", true, None::<&str>)?;
-    let agent_toggle = MenuItem::with_id(app, "agent_toggle", "⏸ Pause AI Agent", true, None::<&str>)?;
+    let agent_toggle =
+        MenuItem::with_id(app, "agent_toggle", "⏸ Pause AI Agent", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &agent_toggle, &sep, &quit])?;
@@ -124,9 +134,11 @@ fn setup_tray(app: &mut tauri::App, state: Arc<Mutex<TrayState>>) -> tauri::Resu
     let state_clone = Arc::clone(&state);
 
     let _tray = TrayIconBuilder::with_id(TRAY_ID)
-        .icon(app.default_window_icon().cloned().unwrap_or_else(|| {
-            tauri::image::Image::new(&[0, 0, 0, 255], 1, 1)
-        }))
+        .icon(
+            app.default_window_icon()
+                .cloned()
+                .unwrap_or_else(|| tauri::image::Image::new(&[0, 0, 0, 255], 1, 1)),
+        )
         .tooltip("ThermalIQ")
         .menu(&menu)
         .on_menu_event(move |app, event| {
@@ -210,7 +222,11 @@ fn read_api_token() -> String {
 
 fn fetch_daemon_state(token: &str) -> (Vec<String>, String, String) {
     if token.is_empty() {
-        return (Vec::new(), String::new(), "Daemon not connected".to_string());
+        return (
+            Vec::new(),
+            String::new(),
+            "Daemon not connected".to_string(),
+        );
     }
 
     // Fetch profile list
@@ -258,7 +274,9 @@ fn rebuild_tray_menu(
     agent_status: &str,
     token: &str,
 ) {
-    let Some(tray) = app.tray_by_id(TRAY_ID) else { return };
+    let Some(tray) = app.tray_by_id(TRAY_ID) else {
+        return;
+    };
 
     // Update tooltip
     let _ = tray.set_tooltip(Some(&format!("ThermalIQ — {agent_status}")));
@@ -275,7 +293,8 @@ fn rebuild_tray_menu(
         )?;
         let sep1 = PredefinedMenuItem::separator(app)?;
 
-        let mut items: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = vec![&show, &sep1, &status_item];
+        let mut items: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> =
+            vec![&show, &sep1, &status_item];
 
         // Profile items — only show if daemon is online and has profiles
         let profile_items: Vec<MenuItem<tauri::Wry>>;
@@ -324,7 +343,9 @@ fn apply_profile(profile_name: String, token: String) {
             .call();
         match result {
             Ok(_) => tracing::info!(profile = %profile_name, "tray: profile applied"),
-            Err(e) => tracing::warn!(profile = %profile_name, error = %e, "tray: profile apply failed"),
+            Err(e) => {
+                tracing::warn!(profile = %profile_name, error = %e, "tray: profile apply failed")
+            }
         }
     });
 }
@@ -340,7 +361,11 @@ fn toggle_agent(token: String) {
 
         if let Some(status) = status_result {
             let current_state = status["state"].as_str().unwrap_or("unknown");
-            let new_state = if current_state == "running" { "paused" } else { "running" };
+            let new_state = if current_state == "running" {
+                "paused"
+            } else {
+                "running"
+            };
 
             // POST to toggle agent state
             let result = ureq::post(&format!("{API_BASE}/api/agent/{new_state}"))

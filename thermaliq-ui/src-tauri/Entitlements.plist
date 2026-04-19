@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Hardened Runtime entitlements for signed + notarized ThermalIQ macOS app.
+       Tauri 2 / WKWebView requires JIT and unsigned-executable-memory on macOS 12+.
+       Reference: https://tauri.app/distribute/sign/macos/ -->
+
+  <!-- Allow JIT compilation (required by WKWebView JavaScript engine) -->
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+
+  <!-- Allow unsigned executable memory (needed by WKWebView on macOS 12+) -->
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
+
+  <!-- Outbound network access for AI provider API calls and local daemon HTTP/WS -->
+  <key>com.apple.security.network.client</key>
+  <true/>
+
+  <!-- NOTE: App Sandbox is intentionally NOT enabled.
+       The privileged IOKit helper (SMJobBless) requires unsandboxed host app access.
+       Enabling the sandbox here would break fan control writes on macOS. -->
+</dict>
+</plist>
