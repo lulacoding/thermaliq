@@ -5,6 +5,14 @@
 # Requires PowerShell 5.1+ (built into Windows 10/11).
 
 #Requires -Version 5.1
+[CmdletBinding()]
+param(
+    # Dev-only: skip SHA256 verification when the release has no .sha256 sidecar.
+    # Do NOT use in production — defeats tamper protection on a self-elevating
+    # admin installer. Without this flag, a missing checksum aborts the install.
+    [switch]$SkipChecksum
+)
+
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
@@ -101,8 +109,19 @@ if ($shaAsset) {
         Write-Fail "SHA256 mismatch!`n  Expected: $expected`n  Got:      $actual"
     }
     Write-Success "Checksum verified"
+} elseif ($SkipChecksum) {
+    Write-Host "  (!) -SkipChecksum set — installing without verification (dev-only)" -ForegroundColor Yellow
 } else {
-    Write-Host "  (!) No checksum file found — skipping verification" -ForegroundColor Yellow
+    Remove-Item $tmpExe -Force -ErrorAction SilentlyContinue
+    Write-Fail @"
+No .sha256 checksum asset found for release $version.
+Refusing to install an unverified binary with Administrator privileges.
+
+If you are a developer and understand the risk, re-run with -SkipChecksum:
+  irm https://thermaliq.dev/install.ps1 | iex -SkipChecksum
+Or download the installer manually from:
+  https://github.com/$REPO/releases/latest
+"@
 }
 
 # ── Install ───────────────────────────────────────────────────────────────────
