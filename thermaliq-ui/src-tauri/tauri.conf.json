@@ -23,7 +23,7 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' ws://127.0.0.1:7272 http://127.0.0.1:7272 https://api.anthropic.com https://api.openai.com https://generativelanguage.googleapis.com https://openrouter.ai; img-src 'self' data:;"
     }
   },
   "bundle": {
@@ -32,7 +32,35 @@
     "windows": {
       "nsis": {
         "installerIcon": "icons/icon.ico"
+      },
+      "certificateThumbprint": null,
+      "digestAlgorithm": "sha256",
+      "timestampUrl": "http://timestamp.sectigo.com"
+    },
+    "macOS": {
+      "signingIdentity": null,
+      "providerShortName": null,
+      "entitlements": "Entitlements.plist",
+      "exceptionDomain": null,
+      "minimumSystemVersion": null,
+      "frameworks": [],
+      "dmg": {
+        "background": null,
+        "windowX": 180,
+        "windowY": 100,
+        "windowWidth": 600,
+        "windowHeight": 400,
+        "iconSize": 80,
+        "iconX": 180,
+        "iconY": 170,
+        "appsX": 480,
+        "appsY": 170
       }
+    },
+    "macOS": {
+      "infoPlist": "Info.plist",
+      "frameworks": [],
+      "minimumSystemVersion": "13.0"
     }
   },
   "plugins": {

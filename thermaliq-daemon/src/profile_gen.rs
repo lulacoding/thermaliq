@@ -9,6 +9,9 @@ use anyhow::{anyhow, Context, Result};
 use thermaliq_common::config::{profiles_dir, Profile};
 use thermaliq_common::HardwareSnapshot;
 
+// TODO(post-v1.0): profile_gen bypasses the configured AI provider and calls Anthropic directly.
+// Multi-provider support for profile/curve generation endpoints is tracked for post-v1.0.
+// See docs/AI_AGENT.md — "Profile generation requires ANTHROPIC_API_KEY" note.
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
 const MODEL: &str = "claude-haiku-4-5-20251001";
 
