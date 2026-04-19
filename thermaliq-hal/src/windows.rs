@@ -373,7 +373,7 @@ impl HwinfoMapping {
             ("sensor_element_size", header.sensor_element_size),
             ("reading_element_size", header.reading_element_size),
         ] {
-            if val < HWINFO_MIN_ELEMENT_SIZE || val > HWINFO_MAX_ELEMENT_SIZE {
+            if !(HWINFO_MIN_ELEMENT_SIZE..=HWINFO_MAX_ELEMENT_SIZE).contains(&val) {
                 cleanup_err!(HwinfoError::LayoutInvalid { field, value: val });
             }
         }
