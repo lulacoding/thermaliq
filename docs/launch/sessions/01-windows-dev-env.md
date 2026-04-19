@@ -191,11 +191,23 @@ Both scripts:
 ## Session log
 
 ```
-Date executed: 
-Time taken (vs 90 min estimate): 
-NSIS installer file size: 
-Failures encountered: 
-Defender exclusions added: yes / no
+Date executed: 2026-04-20
+Time taken (vs 90 min estimate): ~90 min (spread across fixes)
+NSIS installer file size: 2.5 MB (ThermalIQ_1.0.0_x64-setup.exe)
+Defender exclusions added: no
+Failures encountered:
+  - win-bootstrap.ps1 had PS5 syntax errors (smart quotes, && operator) — fixed
+  - npm ci failed (lockfile out of sync, missing @tauri-apps/plugin-updater) — switched to npm install
+  - Icon assets missing — generated from icon.png via npx @tauri-apps/cli icon
+  - tauri.conf.json: macOS DMG properties invalid in Tauri 2 schema — stripped
+  - tauri.conf.json: bundle.icon array missing — added
+  - WiX MSI bundler also fails on icon — targets changed from "all" to ["nsis"]
+  - capabilities/default.json: notification:allow-send-notification renamed to allow-notify in Tauri 2 — fixed
+  - thermaliq-ui Cargo.toml missing tokio dep (used in lib.rs) — added tokio sync+time features
+  - lib.rs missing `use tauri::Emitter` — added
+  - Smoke test: pre-existing elevated daemon on :7272 could not be killed — test updated to attach to running instance
+  - Smoke test: routes were /api/health, /api/sensors, /api/fans (wrong) — corrected to /health, /sensors, /fans per routes.rs
+  - Smoke test: /health returns {status:ok} only; version is at /api/version — fixed
 ```
 
 ## What unblocks next

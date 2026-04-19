@@ -1,1 +1,1 @@
-{"default":{"identifier":"default","description":"Enables core and notification permissions","local":true,"windows":["main"],"permissions":["core:webview:allow-internal-toggle-devtools","notification:default"]}}
+{"default":{"identifier":"default","description":"Enables core and notification permissions","local":true,"windows":["main"],"permissions":["core:webview:allow-internal-toggle-devtools","notification:default","notification:allow-request-permission","notification:allow-is-permission-granted","notification:allow-notify","updater:default"]}}
