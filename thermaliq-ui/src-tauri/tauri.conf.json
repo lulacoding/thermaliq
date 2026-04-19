@@ -67,7 +67,12 @@
     "shell": {
       "open": true
     },
-    "notification": null,
+    "notification": {
+      "windows": {
+        "aumid": "com.thermaliq.app",
+        "iconPath": "icons/icon.png"
+      }
+    },
     "updater": {
       "active": true,
       "pubkey": "dW1sVHEzV21SM1o5RjJyVzBXUENXczJqL3pFRjRxaE5kOFVUaEN2L0RGQkk9",

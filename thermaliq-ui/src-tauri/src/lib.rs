@@ -8,6 +8,7 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Manager,
 };
+use tauri_plugin_notification::NotificationExt;
 
 const API_BASE: &str = "http://127.0.0.1:7272";
 const TRAY_ID: &str = "thermaliq-tray";
@@ -36,6 +37,15 @@ pub fn run() {
             privileged_helper::helper_status,
         ])
         .setup(|app| {
+            // On Windows, request notification permission on first launch.
+            // This is a no-op on macOS/Linux where permission is implicit.
+            #[cfg(target_os = "windows")]
+            {
+                if let Err(e) = app.notification().request_permission() {
+                    tracing::warn!(error = %e, "Failed to request notification permission");
+                }
+            }
+
             let state = Arc::new(Mutex::new(TrayState::default()));
             setup_tray(app, Arc::clone(&state))?;
             start_daemon_poller(app.handle().clone(), state);
@@ -53,11 +63,21 @@ pub fn run() {
         .expect("error while running ThermalIQ application");
 }
 
+/// Send a native OS toast notification via the Tauri notification plugin.
+/// On Windows this produces a proper Action Center toast (WinRT).
+/// On macOS/Linux the plugin handles the platform-native path.
 #[tauri::command]
-fn send_notification(title: String, body: String) {
+fn send_notification(app: AppHandle, title: String, body: String) {
     tracing::info!(title = %title, body = %body, "Sending notification");
-    // Notification is sent via Tauri's native Windows toast API on Windows
-    // On other platforms, it falls back gracefully
+    if let Err(e) = app
+        .notification()
+        .builder()
+        .title(&title)
+        .body(&body)
+        .show()
+    {
+        tracing::warn!(error = %e, "Failed to send notification");
+    }
 }
 
 // ── Tray setup ────────────────────────────────────────────────────────────────
