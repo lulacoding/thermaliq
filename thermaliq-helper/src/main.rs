@@ -19,6 +19,13 @@ fn main() {
 
 #[cfg(target_os = "macos")]
 fn main() -> anyhow::Result<()> {
+    // Support `--version` so the UI crate can detect staleness by comparing
+    // the installed binary version against the one embedded in the app bundle.
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("{}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     macos::run()
 }
 
@@ -29,6 +36,7 @@ mod macos {
     use std::ffi::{c_char, c_void, CString};
     use std::io::{BufRead, BufReader, Write};
     use std::mem;
+    use std::os::unix::io::AsRawFd;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::Path;
     use std::sync::{Arc, Mutex};
@@ -276,31 +284,21 @@ mod macos {
             .with_context(|| format!("setting Ftst={}", enabled as u8))
     }
 
-    /// Detect Apple Silicon by shelling out to sysctl -n hw.model and checking
-    /// for "Apple" / "Mac" ARM identifiers. Intel returns strings like "MacBookPro16,1".
+    /// Detect Apple Silicon by reading `hw.optional.arm64` via sysctlbyname(3).
+    /// Returns true if the integer value is 1 (Apple Silicon), false otherwise.
     fn detect_apple_silicon() -> bool {
-        use std::process::Command;
-        let out = Command::new("sysctl").args(["-n", "hw.model"]).output();
-        if let Ok(out) = out {
-            let s = String::from_utf8_lossy(&out.stdout);
-            // Apple Silicon hw.model strings look like "Mac14,3", "Mac15,6", etc.
-            // (The "MacBookPro"/"iMac" prefix means Intel.)
-            let trimmed = s.trim();
-            return trimmed.starts_with("Mac")
-                && !trimmed.starts_with("MacBook")
-                && !trimmed.starts_with("Macmini")
-                && !trimmed.starts_with("MacPro")
-                && !trimmed.starts_with("iMac");
-        }
-        // Fallback: check CPU brand string
-        let brand = Command::new("sysctl")
-            .args(["-n", "machdep.cpu.brand_string"])
-            .output();
-        if let Ok(out) = brand {
-            let s = String::from_utf8_lossy(&out.stdout);
-            return s.contains("Apple");
-        }
-        false
+        let mut value: libc::c_int = 0;
+        let mut size = std::mem::size_of::<libc::c_int>();
+        let ret = unsafe {
+            libc::sysctlbyname(
+                c"hw.optional.arm64".as_ptr(),
+                &mut value as *mut libc::c_int as *mut libc::c_void,
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        ret == 0 && value == 1
     }
 
     fn encode_fan_rpm_intel(rpm: f32) -> [u8; 2] {
@@ -458,19 +456,41 @@ mod macos {
         let listener = UnixListener::bind(socket_path)
             .with_context(|| format!("binding {}", socket_path.display()))?;
 
-        // Permissions: allow local users to connect (helper validates commands).
+        // Permissions: owner (root) only — peer credential check enforces caller identity.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o666);
+            let perms = std::fs::Permissions::from_mode(0o600);
             let _ = std::fs::set_permissions(socket_path, perms);
         }
 
-        tracing::info!(path = %socket_path.display(), "listening on Unix socket");
+        // Determine the allowed caller UID. If THERMALIQ_DAEMON_UID is set, accept
+        // that UID; otherwise accept only UID 0 (root).
+        let allowed_uid: libc::uid_t = std::env::var("THERMALIQ_DAEMON_UID")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+
+        tracing::info!(path = %socket_path.display(), allowed_uid, "listening on Unix socket");
 
         for conn in listener.incoming() {
             match conn {
                 Ok(stream) => {
+                    // Peer credential check — reject connections from unexpected UIDs.
+                    let fd = stream.as_raw_fd();
+                    let mut peer_uid: libc::uid_t = libc::uid_t::MAX;
+                    let mut peer_gid: libc::gid_t = 0;
+                    let cred_ok =
+                        unsafe { libc::getpeereid(fd, &mut peer_uid, &mut peer_gid) } == 0;
+                    if !cred_ok || peer_uid != allowed_uid {
+                        tracing::warn!(
+                            peer_uid,
+                            allowed_uid,
+                            "rejected connection from unauthorized peer"
+                        );
+                        // Drop stream — connection closed.
+                        continue;
+                    }
                     let state = Arc::clone(&state);
                     thread::spawn(move || handle_client(stream, state));
                 }

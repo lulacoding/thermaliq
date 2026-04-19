@@ -379,10 +379,32 @@ impl HardwareLayer for MacosHardwareLayer {
     }
 }
 
+/// Returns `true` if the helper socket exists and the helper process responds
+/// to a `ping` within the connect timeout.  Used to switch between active fan
+/// control and advisory (read-only) mode at runtime.
+pub fn helper_available() -> bool {
+    let Ok(stream) = UnixStream::connect(HELPER_SOCKET_PATH) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+    let Ok(mut writer) = stream.try_clone() else {
+        return false;
+    };
+    if writeln!(writer, r#"{{"cmd":"ping"}}"#).is_err() {
+        return false;
+    }
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).is_ok() && line.contains("\"ok\":true")
+}
+
 fn send_helper_command(fan_idx: u8, duty: u8) -> Result<()> {
     let stream = UnixStream::connect(HELPER_SOCKET_PATH).map_err(|e| {
         anyhow!(
-            "thermaliq-helper not running — install via ThermalIQ.app to enable fan control ({e})"
+            "thermaliq-helper is not running — install it via ThermalIQ \u{2192} Settings \u{2192} \
+             Install Privileged Helper to enable fan control. ({})",
+            e
         )
     })?;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));

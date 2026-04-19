@@ -1,23 +1,81 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    launchd plist for the ThermalIQ privileged helper.
+
+    Installed by install_helper() (privileged_helper.rs) to:
+        /Library/LaunchDaemons/com.thermaliq.helper.plist
+
+    The helper binary lives at:
+        /Library/PrivilegedHelperTools/com.thermaliq.helper
+
+    This plist is bundled inside the app at:
+        Contents/Library/LaunchServices/com.thermaliq.helper.plist
+
+    and is also embedded in the helper binary's __TEXT,__info_plist section
+    by the embed_helper.sh post-build script so that launchd can validate it
+    without needing a separate plist file on disk during bless time.
+-->
 <plist version="1.0">
 <dict>
     <key>Label</key>
     <string>com.thermaliq.helper</string>
+
+    <key>Program</key>
+    <string>/Library/PrivilegedHelperTools/com.thermaliq.helper</string>
+
+    <!--
+        MachServices: required by SMJobBless to register and validate the
+        helper.  The key name must match the helper's bundle identifier.
+    -->
     <key>MachServices</key>
     <dict>
         <key>com.thermaliq.helper</key>
         <true/>
     </dict>
-    <key>Program</key>
-    <string>/Library/PrivilegedHelperTools/com.thermaliq.helper</string>
+
+    <!--
+        RunAtLoad / KeepAlive: start immediately on bootstrap and restart
+        if it crashes.  The helper is lightweight (blocked on accept(2));
+        the restart policy is safe.
+    -->
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <true/>
+
+    <!--
+        Socket directory: /var/run/thermaliq/ is created by the helper at
+        startup (mkdir -p + chmod 755).  The Unix socket path is hardcoded
+        in both thermaliq-helper/src/main.rs and thermaliq-hal/src/macos.rs
+        as /var/run/thermaliq/helper.sock.
+    -->
+
+    <!--
+        Logging: write stdout/stderr to a single log file.  Rotate via
+        newsyslog if desired (add an entry to /etc/newsyslog.d/).
+    -->
     <key>StandardOutPath</key>
     <string>/var/log/thermaliq-helper.log</string>
     <key>StandardErrorPath</key>
     <string>/var/log/thermaliq-helper.log</string>
+
+    <!--
+        ProcessType: Background — reduces scheduling priority when the
+        system is under thermal pressure, appropriate for a daemon that
+        only acts when the main app sends commands.
+    -->
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <!--
+        SoftResourceLimits: cap open file descriptors.  The helper only
+        needs a handful (SMC handle + Unix socket + one fd per client).
+    -->
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>64</integer>
+    </dict>
 </dict>
 </plist>

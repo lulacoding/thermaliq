@@ -33,6 +33,11 @@
       "nsis": {
         "installerIcon": "icons/icon.ico"
       }
+    },
+    "macOS": {
+      "infoPlist": "Info.plist",
+      "frameworks": [],
+      "minimumSystemVersion": "13.0"
     }
   },
   "plugins": {
