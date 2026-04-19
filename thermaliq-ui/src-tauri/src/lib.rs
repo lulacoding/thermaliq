@@ -1,7 +1,7 @@
 mod privileged_helper;
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
@@ -9,6 +9,44 @@ use tauri::{
     AppHandle, Manager,
 };
 use tauri_plugin_notification::NotificationExt;
+use tauri_plugin_updater::Update;
+
+/// Shared cache for the pending `Update` returned by `check_update_info`.
+/// `install_update` consumes it via `.take()` so the exact version shown in
+/// the banner is the one installed — preventing a TOCTOU where the server's
+/// `latest.json` could change between the check and the install.
+#[derive(Default)]
+struct PendingUpdate(tokio::sync::Mutex<Option<Update>>);
+
+/// Windows requires an AppUserModelID (AUMID) for toast notifications to be
+/// attributed to the correct application in Action Center.  We set it once at
+/// process startup before any notification can fire.
+#[cfg(target_os = "windows")]
+fn register_app_user_model_id() {
+    // The AUMID must match the one used in the NSIS installer shortcut.
+    // Format: <Publisher>.<ProductName>
+    let aumid: Vec<u16> = "ThermalIQ.ThermalIQ\0"
+        .encode_utf16()
+        .collect();
+
+    // SAFETY: SetCurrentProcessExplicitAppUserModelID is a well-defined Win32
+    // API; the pointer is valid for the duration of the call.
+    unsafe {
+        #[link(name = "shell32")]
+        extern "system" {
+            fn SetCurrentProcessExplicitAppUserModelID(app_id: *const u16) -> i32;
+        }
+        let hr = SetCurrentProcessExplicitAppUserModelID(aumid.as_ptr());
+        if hr != 0 {
+            tracing::warn!(hr = hr, "SetCurrentProcessExplicitAppUserModelID failed");
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn register_app_user_model_id() {
+    // No-op on macOS / Linux — notifications work without an AUMID there.
+}
 
 const API_BASE: &str = "http://127.0.0.1:7272";
 const TRAY_ID: &str = "thermaliq-tray";
@@ -24,14 +62,20 @@ struct TrayState {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Register AUMID before the event loop starts so Windows can attribute
+    // toast notifications to ThermalIQ in Action Center.
+    register_app_user_model_id();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .manage(PendingUpdate::default())
         .invoke_handler(tauri::generate_handler![
             send_notification,
-            check_for_updates,
+            check_update_info,
+            install_update,
             privileged_helper::install_privileged_helper,
             privileged_helper::uninstall_privileged_helper,
             privileged_helper::helper_status,
@@ -50,12 +94,29 @@ pub fn run() {
             setup_tray(app, Arc::clone(&state))?;
             start_daemon_poller(app.handle().clone(), state);
 
-            // Check for updates on app start (non-blocking)
-            let app_handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                tokio::time::sleep(Duration::from_secs(2)).await; // Wait for UI to be ready
-                let _ = check_for_updates_internal(&app_handle).await;
-            });
+            // Background update check: only if user hasn't opted out and 24h have elapsed.
+            if auto_update_check_enabled() && should_run_update_check() {
+                let app_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    // Brief delay so the UI is ready before any banner appears.
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    use tauri_plugin_updater::UpdaterExt;
+                    if let Ok(updater) = app_handle.updater() {
+                        match updater.check().await {
+                            Ok(Some(update)) => {
+                                tracing::info!(version = %update.version, "Background update check: update available");
+                                let _ = app_handle.emit("update-available", &update.version);
+                                // Store in PendingUpdate so install_update can consume it.
+                                if let Some(state) = app_handle.try_state::<PendingUpdate>() {
+                                    *state.0.lock().await = Some(update);
+                                }
+                            }
+                            Ok(None) => tracing::debug!("Background update check: already up to date"),
+                            Err(e) => tracing::warn!(error = %e, "Background update check failed"),
+                        }
+                    }
+                });
+            }
 
             Ok(())
         })
@@ -338,21 +399,148 @@ fn toggle_agent(token: String) {
     });
 }
 
-// ── Auto-updater ──────────────────────────────────────────────────────────────
+// ── Auto-updater helpers ──────────────────────────────────────────────────────
 
-#[tauri::command]
-async fn check_for_updates(app: tauri::AppHandle) -> Result<bool, String> {
-    check_for_updates_internal(&app).await
+/// Path to the file storing the unix timestamp of the last successful update check.
+fn last_check_path() -> std::path::PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("thermaliq")
+        .join("last_update_check")
 }
 
-async fn check_for_updates_internal(app: &tauri::AppHandle) -> Result<bool, String> {
-    if let Ok(update) = app.updater().check().await {
-        if update.is_update_available() {
-            tracing::info!("Update available: {}", update.latest_version());
-            // The updater plugin automatically shows a dialog if configured with "dialog": true
-            let _ = update.download_and_install().await;
-            return Ok(true);
+/// Read `auto_update_check_enabled` from `~/.config/thermaliq/settings.toml`.
+/// Defaults to `true` if the file or key is absent.
+fn auto_update_check_enabled() -> bool {
+    let path = dirs::config_dir()
+        .unwrap_or_default()
+        .join("thermaliq")
+        .join("settings.toml");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return true;
+    };
+    // Simple key=value parse; full TOML parser not needed for one bool.
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("auto_update_check_enabled") {
+            let val = rest.trim_start_matches(|c: char| c == ' ' || c == '=').trim();
+            return val != "false";
         }
     }
-    Ok(false)
+    true
+}
+
+/// Returns true if more than 24 hours have passed since the last stored check,
+/// and records the current time as the new last-check timestamp.
+fn should_run_update_check() -> bool {
+    let path = last_check_path();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let last: u64 = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+
+    if now.saturating_sub(last) < 86_400 {
+        return false;
+    }
+
+    // Update stored timestamp (best-effort).
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, now.to_string());
+    true
+}
+
+// ── Auto-updater ──────────────────────────────────────────────────────────────
+
+#[derive(serde::Serialize)]
+struct UpdateInfoResult {
+    available: bool,
+    version: String,
+    body: Option<String>,
+}
+
+/// Check whether an update is available. Returns metadata but does NOT
+/// download or install — that requires explicit user consent via
+/// `install_update`.
+///
+/// The resolved `Update` handle is cached in `PendingUpdate` state so that
+/// `install_update` can consume *exactly* that version, closing a TOCTOU
+/// gap where the server's `latest.json` could change between check and
+/// install.
+#[tauri::command]
+async fn check_update_info(
+    app: tauri::AppHandle,
+    pending: tauri::State<'_, PendingUpdate>,
+) -> Result<UpdateInfoResult, String> {
+    use tauri_plugin_updater::UpdaterExt;
+
+    // If no public key is configured the updater is a no-op in dev builds.
+    let updater = match app.updater() {
+        Ok(u) => u,
+        Err(_) => {
+            *pending.0.lock().await = None;
+            return Ok(UpdateInfoResult {
+                available: false,
+                version: String::new(),
+                body: None,
+            });
+        }
+    };
+
+    match updater.check().await {
+        Ok(Some(update)) => {
+            tracing::info!(version = %update.version, "Update available");
+            let info = UpdateInfoResult {
+                available: true,
+                version: update.version.clone(),
+                body: update.body.clone(),
+            };
+            *pending.0.lock().await = Some(update);
+            Ok(info)
+        }
+        Ok(None) => {
+            *pending.0.lock().await = None;
+            Ok(UpdateInfoResult {
+                available: false,
+                version: String::new(),
+                body: None,
+            })
+        }
+        Err(e) => {
+            *pending.0.lock().await = None;
+            Err(e.to_string())
+        }
+    }
+}
+
+/// Download and install the pending update, then restart. Only called after
+/// explicit user consent ("Install now").
+///
+/// Consumes the `Update` cached by the preceding `check_update_info` call
+/// rather than issuing a fresh `updater.check()`, so the installed version
+/// is guaranteed to match what the user saw in the banner.
+#[tauri::command]
+async fn install_update(
+    app: tauri::AppHandle,
+    pending: tauri::State<'_, PendingUpdate>,
+) -> Result<(), String> {
+    let update = pending
+        .0
+        .lock()
+        .await
+        .take()
+        .ok_or_else(|| "No pending update — call check_update_info first".to_string())?;
+
+    update
+        .download_and_install(|_chunk, _total| {}, || {})
+        .await
+        .map_err(|e| e.to_string())?;
+
+    app.restart();
 }

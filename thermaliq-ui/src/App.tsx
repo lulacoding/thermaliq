@@ -20,6 +20,8 @@ import HardwareDetect from "./components/HardwareDetect";
 import AgentPanel from "./components/AgentPanel";
 import { useNotifications } from "./hooks/useNotifications";
 import { useNotificationSettings } from "./hooks/useNotificationSettings";
+import { useUpdater } from "./hooks/useUpdater";
+import UpdateBanner from "./components/UpdateBanner";
 import "./index.css";
 
 type View = "dashboard" | "profiles" | "curves" | "settings" | "calibrate" | "hardware" | "agent";
@@ -43,6 +45,7 @@ export default function App() {
   const [activeView, setActiveView] = useState<View>("dashboard");
   const { settings: notifSettings } = useNotificationSettings();
   useNotifications(notifSettings);
+  const { updateAvailable, installing, error, install, dismiss } = useUpdater();
 
   return (
     <div style={styles.root}>
@@ -91,6 +94,15 @@ export default function App() {
           <span style={styles.footerText}>v1.0.0</span>
         </div>
       </aside>
+
+      {/* Update banner — non-blocking, bottom-right */}
+      <UpdateBanner
+        updateAvailable={updateAvailable}
+        installing={installing}
+        error={error}
+        onInstall={install}
+        onDismiss={dismiss}
+      />
 
       {/* Main Content */}
       <main style={styles.main}>
