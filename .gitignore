@@ -10,3 +10,6 @@ thermaliq-ui/src-tauri/resources/thermaliq-daemon.exe
 
 # Project context files (generated from brain/projects/thermaliq/, keep in sync)
 .claude/context/
+
+# Agent-managed git worktrees
+.claude/worktrees/

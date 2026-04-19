@@ -1,0 +1,91 @@
+name: Hardware Support Report
+description: Report that a device works (or does not work) with ThermalIQ
+title: "[Hardware] "
+labels: ["hardware", "compatibility"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template to report a hardware combination — whether it works or not.
+        Confirmed working reports are added to the [hardware support matrix](../../docs/HARDWARE_SUPPORT.md).
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Operating System
+      options:
+        - Windows 10
+        - Windows 11
+        - macOS (Intel)
+        - macOS (Apple Silicon)
+        - Linux (Ubuntu)
+        - Linux (Fedora)
+        - Linux (Arch)
+        - Linux (Other)
+    validations:
+      required: true
+
+  - type: input
+    id: thermaliq_version
+    attributes:
+      label: ThermalIQ Version
+      placeholder: "e.g. 1.0.0 (run: tq status)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: cpu
+    attributes:
+      label: CPU Model
+      placeholder: "e.g. Intel Core i9-13900K, AMD Ryzen 7 7800X3D"
+    validations:
+      required: true
+
+  - type: textarea
+    id: gpu
+    attributes:
+      label: GPU(s)
+      placeholder: "e.g. NVIDIA RTX 4090, AMD RX 7900 XTX"
+    validations:
+      required: true
+
+  - type: textarea
+    id: motherboard
+    attributes:
+      label: Motherboard / Laptop Model
+      placeholder: "e.g. ASUS ROG Maximus Z790, ThinkPad X1 Carbon Gen 11"
+
+  - type: dropdown
+    id: result
+    attributes:
+      label: Result
+      options:
+        - Everything works (sensors + fan writes)
+        - Sensors work, fan writes do not
+        - Partial (some sensors/fans missing)
+        - Nothing detected
+    validations:
+      required: true
+
+  - type: textarea
+    id: details
+    attributes:
+      label: Details
+      description: |
+        What works and what does not? Include:
+        - Output of `tq sensors` and `tq fans`
+        - HWiNFO64 sensor list (Windows) vs what ThermalIQ shows
+        - Any error messages or log lines
+      render: shell
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I am running the latest ThermalIQ release
+          required: false
+        - label: On Windows — HWiNFO64 was running when I tested
+          required: false
+        - label: I have attached `tq sensors` and `tq fans` output
+          required: false

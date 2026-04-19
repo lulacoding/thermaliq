@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+        SMPrivilegedExecutables: maps the helper's bundle identifier to its
+        designated requirement (DR) string.  The DR must match the codesign
+        requirement embedded in the helper binary.
+
+        At release time these values are filled in by the embed_helper.sh
+        post-build script using:
+            codesign -dr - <helper_binary> | sed 's/designated => //'
+        and stored in the signed build.
+
+        During development / CI (unsigned), the DR is the anchor apple generic
+        form that passes on any Developer ID cert.  For production you MUST
+        replace this with the exact DR from your Developer ID Application cert.
+    -->
+    <key>SMPrivilegedExecutables</key>
+    <dict>
+        <key>com.thermaliq.helper</key>
+        <string>anchor apple generic and identifier "com.thermaliq.helper" and (certificate leaf[field.1.2.840.113635.100.6.1.9] /* exists */ or certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = "REPLACE_WITH_TEAM_ID")</string>
+    </dict>
+</dict>
+</plist>
