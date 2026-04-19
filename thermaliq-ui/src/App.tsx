@@ -19,6 +19,7 @@ import CalibrationWizard from "./components/CalibrationWizard";
 import HardwareDetect from "./components/HardwareDetect";
 import AgentPanel from "./components/AgentPanel";
 import { useNotifications } from "./hooks/useNotifications";
+import { useNotificationSettings } from "./hooks/useNotificationSettings";
 import { useUpdater } from "./hooks/useUpdater";
 import UpdateBanner from "./components/UpdateBanner";
 import "./index.css";
@@ -42,7 +43,8 @@ const NAV_ITEMS: NavItem[] = [
 
 export default function App() {
   const [activeView, setActiveView] = useState<View>("dashboard");
-  useNotifications();
+  const { settings: notifSettings } = useNotificationSettings();
+  useNotifications(notifSettings);
   const { updateAvailable, installing, error, install, dismiss } = useUpdater();
 
   return (
@@ -89,7 +91,7 @@ export default function App() {
         </nav>
 
         <div style={styles.sidebarFooter}>
-          <span style={styles.footerText}>v0.1.0</span>
+          <span style={styles.footerText}>v1.0.0</span>
         </div>
       </aside>
 

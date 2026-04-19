@@ -64,7 +64,11 @@
       "open": true
     },
     "notification": {
-      "icon": "icons/icon.png"
+      "icon": "icons/icon.png",
+      "windows": {
+        "aumid": "com.thermaliq.app",
+        "iconPath": "icons/icon.png"
+      }
     },
     "updater": {
       "pubkey": "$TAURI_SIGNING_PUBLIC_KEY",

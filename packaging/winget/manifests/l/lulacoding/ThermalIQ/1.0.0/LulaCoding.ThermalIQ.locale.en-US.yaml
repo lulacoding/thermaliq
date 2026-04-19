@@ -1,17 +1,17 @@
-# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
-PackageIdentifier: thermaliq.ThermalIQ
-PackageVersion: 0.3.0
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.9.0.schema.json
+PackageIdentifier: LulaCoding.ThermalIQ
+PackageVersion: 1.0.0
 PackageLocale: en-US
-Publisher: ThermalIQ Contributors
-PublisherUrl: https://thermaliq.dev
+Publisher: LulaCoding
+PublisherUrl: https://github.com/lulacoding
 PublisherSupportUrl: https://github.com/lulacoding/thermaliq/issues
 PrivacyUrl: https://thermaliq.dev/privacy
-Author: ThermalIQ Contributors
+Author: LulaCoding
 PackageName: ThermalIQ
 PackageUrl: https://thermaliq.dev
 License: MIT
 LicenseUrl: https://github.com/lulacoding/thermaliq/blob/main/LICENSE
-Copyright: Copyright (c) ThermalIQ Contributors
+Copyright: Copyright (c) LulaCoding
 CopyrightUrl: https://github.com/lulacoding/thermaliq/blob/main/LICENSE
 ShortDescription: AI-powered fan control for Windows, macOS, and Linux
 Description: |-
@@ -36,11 +36,11 @@ Tags:
   - cpu
   - ai
 ReleaseNotes: |-
-  Phase 1 — Windows support.
+  v1.0.0 — Windows launch release.
   - HWiNFO64 shared memory sensor backend
   - NVML GPU fan control (driver 520+ required)
   - Windows service (auto-start on login)
   - NSIS installer
 ReleaseNotesUrl: https://github.com/lulacoding/thermaliq/blob/main/CHANGELOG.md
 ManifestType: defaultLocale
-ManifestVersion: 1.6.0
+ManifestVersion: 1.9.0

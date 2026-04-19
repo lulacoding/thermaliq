@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import { useTranslation } from "react-i18next";
+import { useNotificationSettings, type NotificationCategory } from "../hooks/useNotificationSettings";
 
 interface Settings {
   provider: string;
@@ -15,8 +16,15 @@ interface Settings {
 
 const API_BASE = "http://127.0.0.1:7272";
 
+const CATEGORY_LABELS: Record<NotificationCategory, string> = {
+  intervention: "AI Agent interventions",
+  profile_switch: "Profile switches",
+  alert: "Thermal alerts",
+};
+
 export default function SettingsPanel() {
   const { t } = useTranslation();
+  const { settings: notifSettings, setEnabled: setNotifEnabled, setCategoryEnabled } = useNotificationSettings();
   const [settings, setSettings] = useState<Settings>({
     provider: "anthropic",
     api_key: "",
@@ -348,6 +356,43 @@ export default function SettingsPanel() {
             {t("settings.telemetryLabel")}
           </label>
         </div>
+      </div>
+
+      {/* ── Notifications ─────────────────────────────────────────────── */}
+      <div style={{...styles.section, ...styles.sectionCard}}>
+        <div style={styles.cardAccentBar} />
+        <h2 style={styles.sectionTitle}>Notifications</h2>
+
+        <div style={styles.checkboxGroup}>
+          <input
+            type="checkbox"
+            id="notif_enabled"
+            checked={notifSettings.enabled}
+            onChange={(e) => setNotifEnabled(e.target.checked)}
+          />
+          <label htmlFor="notif_enabled" style={styles.checkboxLabel}>
+            Enable OS toast notifications
+          </label>
+        </div>
+
+        {notifSettings.enabled && (
+          <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 8 }}>
+            <p style={{ ...styles.helperText, marginBottom: 4 }}>Show toasts for:</p>
+            {(Object.keys(CATEGORY_LABELS) as NotificationCategory[]).map((cat) => (
+              <div key={cat} style={styles.checkboxGroup}>
+                <input
+                  type="checkbox"
+                  id={`notif_cat_${cat}`}
+                  checked={notifSettings.categories[cat]}
+                  onChange={(e) => setCategoryEnabled(cat, e.target.checked)}
+                />
+                <label htmlFor={`notif_cat_${cat}`} style={styles.checkboxLabel}>
+                  {CATEGORY_LABELS[cat]}
+                </label>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
       <button
