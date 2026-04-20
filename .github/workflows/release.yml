@@ -392,6 +392,20 @@ jobs:
           echo "$BODY" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
+      - name: Extract artifact archives
+        # The Windows artifact is a .zip and macOS/Linux are .tar.gz. To read
+        # updater signatures we need the extracted contents, not the archives.
+        run: |
+          set -euo pipefail
+          for zip in artifacts/*/*.zip; do
+            [ -f "$zip" ] && unzip -o "$zip" -d "$(dirname "$zip")"
+          done
+          for tgz in artifacts/*/*.tar.gz; do
+            [ -f "$tgz" ] && tar xzf "$tgz" -C "$(dirname "$tgz")"
+          done
+          echo "== extracted =="
+          find artifacts -type f | sort
+
       - name: Generate latest.json update manifest
         # Format: https://tauri.app/plugin/updater/#update-server
         # Built with `jq` to avoid heredoc indentation + shell injection pitfalls,
