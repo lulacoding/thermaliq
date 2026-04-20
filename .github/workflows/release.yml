@@ -343,30 +343,30 @@ jobs:
           # Extract the first release section (up to next ## or end of file)
           sed -n '/^## \[/,/^## \[/p' CHANGELOG.md | head -n -1 > /tmp/release_notes.md
           # Append installation instructions
-          cat >> /tmp/release_notes.md << 'EOF'
-
-## Installation
-
-**Windows**
-
-Download the NSIS installer below. After the winget manifest is submitted to winget-pkgs,
-you will be able to install via:
-```powershell
-winget install LulaCoding.ThermalIQ
-```
-See [packaging/winget/README.md](packaging/winget/README.md) for submission status.
-
-**macOS**
-```bash
-brew tap thermaliq/tap && brew install thermaliq
-```
-Or download the DMG below.
-
-**Linux**
-```bash
-curl -fsSL https://thermaliq.dev/install.sh | sh
-```
-EOF
+          {
+            echo ""
+            echo "## Installation"
+            echo ""
+            echo "**Windows**"
+            echo ""
+            echo "Download the NSIS installer below. After the winget manifest is submitted to winget-pkgs,"
+            echo "you will be able to install via:"
+            echo '```powershell'
+            echo "winget install LulaCoding.ThermalIQ"
+            echo '```'
+            echo "See [packaging/winget/README.md](packaging/winget/README.md) for submission status."
+            echo ""
+            echo "**macOS**"
+            echo '```bash'
+            echo "brew tap thermaliq/tap && brew install thermaliq"
+            echo '```'
+            echo "Or download the DMG below."
+            echo ""
+            echo "**Linux**"
+            echo '```bash'
+            echo "curl -fsSL https://thermaliq.dev/install.sh | sh"
+            echo '```'
+          } >> /tmp/release_notes.md
           # Store the result in an environment variable for use in the release
           BODY=$(cat /tmp/release_notes.md)
           echo "body<<EOF" >> $GITHUB_OUTPUT
