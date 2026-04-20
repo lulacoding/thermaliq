@@ -91,6 +91,11 @@ jobs:
           rm -f /tmp/cert.p12
           security list-keychain -d user -s "$KEYCHAIN_PATH"
 
+      - name: Install frontend dependencies (macOS)
+        if: startsWith(matrix.os, 'macos')
+        working-directory: thermaliq-ui
+        run: npm install
+
       - name: Build Tauri app (macOS)
         if: startsWith(matrix.os, 'macos')
         uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # tauri-apps/tauri-action@v0
@@ -150,6 +155,11 @@ jobs:
           New-Item -ItemType Directory -Force -Path thermaliq-ui\src-tauri\resources | Out-Null
           Copy-Item "target\${{ matrix.target }}\release\thermaliq-daemon.exe" `
                     "thermaliq-ui\src-tauri\resources\thermaliq-daemon.exe"
+
+      - name: Install frontend dependencies (Windows)
+        if: matrix.os == 'windows-latest'
+        working-directory: thermaliq-ui
+        run: npm install
 
       - name: Build Tauri app (Windows)
         if: matrix.os == 'windows-latest'
