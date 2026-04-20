@@ -296,10 +296,19 @@ jobs:
           fetch-depth: 0  # Required for git-cliff to access full history
 
       - name: Generate CHANGELOG with git-cliff
+        continue-on-error: true
         uses: orhun/git-cliff-action@c93ef52f3d0ddcdcc9bd5447d98d458a11cd4f72 # orhun/git-cliff-action@v4
         with:
           config: cliff.toml
           args: --verbose
+
+      - name: Ensure CHANGELOG.md exists
+        run: |
+          if [ ! -f CHANGELOG.md ]; then
+            echo "## [${{ github.ref_name }}] - $(date -u +%Y-%m-%d)" > CHANGELOG.md
+            echo "" >> CHANGELOG.md
+            echo "See commits: https://github.com/lulacoding/thermaliq/commits/${{ github.ref_name }}" >> CHANGELOG.md
+          fi
 
       - name: Download all artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # actions/download-artifact@v4
