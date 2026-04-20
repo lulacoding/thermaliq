@@ -207,15 +207,43 @@ Append to `.claude/context/lessons.md` under a new heading:
 ## Session log
 
 ```
-Date executed:
-Time taken:
-Bugs logged: <count>, severities: <P0:X P1:Y P2:Z>
-CurveEditor persistence: works / broken
-Toast rate-limit: works / broken
-Memory growth over 10 min idle: ___ MB → ___ MB
-Daemon CPU baseline: ___%
-UI CPU baseline: ___%
+Date executed: 2026-04-20
+Time taken: ~30 min
+Bugs logged: 3, severities: P0:0 P1:2 P2:1
+CurveEditor persistence: broken (save fails — frontend may not send correct body format)
+Toast rate-limit: not tested (AI key not persisted, agent panel non-functional without it)
+Memory growth over 10 min idle: not measured (session cut short)
+Daemon CPU baseline: not measured
+UI CPU baseline: not measured
 ```
+
+### Bugs
+
+### [P1] CurveEditor: save fails
+
+**Repro:** Open CurveEditor, modify curve, click Save
+**Expected:** Curve saved to profile TOML on disk
+**Observed:** Save fails (error response from daemon)
+**Likely cause:** Frontend may not be sending required fields (profile, fan_id, points)
+  or body format mismatch with backend `save_curve` handler (routes.rs:534-577)
+
+### [P1] Settings: API key not persisted to disk
+
+**Repro:** Open Settings, enter API key, click Save. Shows "saved". Restart daemon.
+  Every page says "no API key".
+**Expected:** API key persists across daemon restarts
+**Observed:** Key stored in-memory only (AppState.ai_provider). Never written to config file.
+**Likely cause:** `set_ai_provider` handler (routes.rs:646-705) updates in-memory state only,
+  has no file write logic. Needs to write to %APPDATA%\thermaliq\config.toml.
+
+### [P2] WebSocket: reconnect spam in console
+
+**Repro:** Open DevTools console on UI launch
+**Expected:** Clean WS connection
+**Observed:** "WebSocket closed before established" errors repeat every few seconds
+  for both /ws/sensors and /ws/agent. Dashboard still works via REST polling.
+**Likely cause:** WS connects before Tauri webview is ready, or initial connection
+  races with daemon response. Functional impact: none (data still flows via REST).
 
 ## What unblocks next
 
