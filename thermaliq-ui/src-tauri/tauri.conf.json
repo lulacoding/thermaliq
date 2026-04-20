@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "ThermalIQ",
-  "version": "1.0.0",
+  "version": "1.0.0-test.0",
   "identifier": "com.thermaliq.app",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -62,7 +62,7 @@
       "open": true
     },
     "updater": {
-      "pubkey": "$TAURI_SIGNING_PUBLIC_KEY",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEMzMkRFOEFCMUU1MDhCOTAKUldTUWkxQWVxK2d0dy9tUEE0dXF0WlA4eDRlQWhRcVZ5bVh4WTk5ZU02MUhPd2k1UTBHaU9jWG4K",
       "endpoints": [
         "https://github.com/lulacoding/thermaliq/releases/latest/download/latest.json"
       ]
