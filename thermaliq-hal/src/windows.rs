@@ -174,7 +174,7 @@ const HWINFO_MAX_ELEMENT_SIZE: u32 = 4096;
 const READING_TYPE_TEMP: u32 = 1;
 const READING_TYPE_FAN: u32 = 3;
 
-#[repr(C)]
+#[repr(C, packed)]
 struct HwinfoHeader {
     signature: u32,
     version: u32,
@@ -188,7 +188,7 @@ struct HwinfoHeader {
     reading_element_count: u32,
 }
 
-#[repr(C)]
+#[repr(C, packed)]
 #[allow(dead_code)]
 struct HwinfoSensor {
     sensor_id: u32,
@@ -197,7 +197,7 @@ struct HwinfoSensor {
     name_user: [u8; 128],
 }
 
-#[repr(C)]
+#[repr(C, packed)]
 struct HwinfoReading {
     reading_type: u32,
     sensor_index: u32,
@@ -338,7 +338,8 @@ impl HwinfoMapping {
         }
 
         // Validate all header fields before any further pointer arithmetic.
-        let header = unsafe { &*(view_ptr as *const HwinfoHeader) };
+        // SAFETY: read_unaligned because HwinfoHeader is #[repr(packed)].
+        let header = unsafe { std::ptr::read_unaligned(view_ptr as *const HwinfoHeader) };
 
         macro_rules! cleanup_err {
             ($err:expr) => {{
@@ -391,14 +392,20 @@ impl HwinfoMapping {
             cleanup_err!(HwinfoError::StaleData);
         }
 
-        tracing::debug!(
-            backend = "hwinfo",
-            version = header.version,
-            revision = header.revision,
-            sensors = header.sensor_element_count,
-            readings = header.reading_element_count,
-            "HWiNFO64 shared memory opened"
-        );
+        {
+            let ver = header.version;
+            let rev = header.revision;
+            let sens = header.sensor_element_count;
+            let reads = header.reading_element_count;
+            tracing::debug!(
+                backend = "hwinfo",
+                version = ver,
+                revision = rev,
+                sensors = sens,
+                readings = reads,
+                "HWiNFO64 shared memory opened"
+            );
+        }
 
         Ok(Self {
             handle,
@@ -406,43 +413,60 @@ impl HwinfoMapping {
         })
     }
 
+    /// Returns true if HWiNFO64 has stopped updating the shared memory
+    /// (poll_time_ms == 0 means frozen or HWiNFO64 has exited).
+    fn is_stale(&self) -> bool {
+        let header = unsafe { std::ptr::read_unaligned(self.view as *const HwinfoHeader) };
+        header.poll_time_ms == 0
+    }
+
     fn read_snapshot(&self) -> (Vec<SensorReading>, Vec<FanReading>) {
         let span = tracing::debug_span!("hwinfo_read_snapshot", backend = "hwinfo");
         let _enter = span.enter();
 
-        let header = unsafe { &*(self.view as *const HwinfoHeader) };
+        let header = unsafe { std::ptr::read_unaligned(self.view as *const HwinfoHeader) };
         let mut sensors = Vec::new();
         let mut fans = Vec::new();
 
         let reading_base = unsafe { self.view.add(header.reading_section_offset as usize) };
 
         for i in 0..header.reading_element_count as usize {
+            // SAFETY: read_unaligned because HwinfoReading is #[repr(packed)].
             let reading = unsafe {
-                &*(reading_base.add(i * header.reading_element_size as usize)
-                    as *const HwinfoReading)
+                std::ptr::read_unaligned(
+                    reading_base.add(i * header.reading_element_size as usize)
+                        as *const HwinfoReading,
+                )
             };
 
-            // Prefer user-assigned label; fall back to original label if blank.
-            let label_user = cstr_to_string(&reading.label_user);
+            // Copy fields out of the packed struct to avoid unaligned references.
+            let rtype = reading.reading_type;
+            let sensor_idx = reading.sensor_index;
+            let rid = reading.reading_id;
+            let value = reading.value;
+            let label_orig = reading.label_orig;
+            let label_user_bytes = reading.label_user;
+
+            let label_user = cstr_to_string(&label_user_bytes);
             let label = if label_user.trim().is_empty() {
-                cstr_to_string(&reading.label_orig)
+                cstr_to_string(&label_orig)
             } else {
                 label_user
             };
 
-            match reading.reading_type {
+            match rtype {
                 READING_TYPE_TEMP => {
-                    let temp = reading.value as f32;
+                    let temp = value as f32;
                     if temp > -40.0 && temp < 150.0 {
                         sensors.push(SensorReading {
-                            id: hwinfo_sensor_id(reading.sensor_index, reading.reading_id, &label),
+                            id: hwinfo_sensor_id(sensor_idx, rid, &label),
                             label,
                             temp_celsius: temp,
                         });
                     } else {
                         tracing::trace!(
                             backend = "hwinfo",
-                            reading_id = reading.reading_id,
+                            reading_id = rid,
                             temp,
                             "temperature out of plausible range, skipped"
                         );
@@ -450,10 +474,9 @@ impl HwinfoMapping {
                 }
                 READING_TYPE_FAN => {
                     fans.push(FanReading {
-                        id: hwinfo_fan_id(reading.reading_id, &label),
+                        id: hwinfo_fan_id(rid, &label),
                         label,
-                        rpm: reading.value as u32,
-                        // HWiNFO exposes RPM only, not duty cycle
+                        rpm: value as u32,
                         duty_percent: 0,
                     });
                 }
@@ -1064,9 +1087,17 @@ impl HardwareLayer for WindowsHardwareLayer {
         };
 
         let (mapping_result, sensors, fans) = tokio::task::spawn_blocking(move || {
-            // Try to (re-)open HWiNFO64 mapping if we don't have one.
+            // Try to (re-)open HWiNFO64 mapping if we don't have one,
+            // or if the cached one has gone stale (HWiNFO64 exited).
             let mapping = match cached {
-                Some(m) => Ok(m),
+                Some(m) if !m.is_stale() => Ok(m),
+                Some(_stale) => {
+                    tracing::info!(
+                        backend = "hwinfo",
+                        "HWiNFO64 shared memory went stale — reopening"
+                    );
+                    HwinfoMapping::open()
+                }
                 None => HwinfoMapping::open(),
             };
 
@@ -1278,10 +1309,8 @@ mod tests {
         use super::*;
 
         /// Build a valid HwinfoHeader via struct literal.
-        /// Constructing via the struct itself (rather than hardcoded byte
-        /// offsets) is robust to ABI padding — the `i64` after three `u32`s
-        /// introduces 4 bytes of alignment padding on MSVC x86_64, which
-        /// invalidated an earlier byte-offset implementation on Windows CI.
+        /// The struct is `#[repr(C, packed)]` to match HWiNFO64's packed
+        /// shared memory layout (no alignment padding before `poll_time_ms`).
         fn valid_header() -> HwinfoHeader {
             let hdr_size = std::mem::size_of::<HwinfoHeader>() as u32;
             HwinfoHeader {
