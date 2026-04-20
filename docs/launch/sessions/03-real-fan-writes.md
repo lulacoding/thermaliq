@@ -186,15 +186,28 @@ The 95°C CPU / 90°C GPU emergency limits are hardcoded. **Do not induce heat**
 ## Session log
 
 ```
-Date executed:
-Time taken:
-GPU model under test:
-NVML/ADL driver version:
-Fan IDs successfully written: 
-Fan IDs that returned NotSupported: 
-Profile transitions tested: balanced → silent → balanced
-Final fan state restored: yes / no
-Bugs filed:
+Date executed: 2026-04-20
+Time taken: ~30 min
+GPU model under test: NVIDIA GeForce RTX 4060
+NVML driver: nvml.dll in C:\Windows\System32 (driver dated 2026-03-07)
+Fan IDs successfully written: nvml_gpu0_fan0 (31% -> 60% confirmed, gradual ramp via GPU slew rate)
+Fan IDs that returned NotSupported: none
+Profile transitions tested: balanced -> silent -> balanced (both activated successfully)
+Final fan state restored: yes (auto-revert script + profile restore)
+Bugs fixed:
+  - nvml.dll not nvidia-ml.dll (Windows ships it as nvml.dll)
+  - nvmlDeviceSetFanSpeed_v2 takes 3 params (device, fan, speed), not 4;
+    extra "policy" arg caused speed=1% instead of target (commit 2122530)
+  - fan write route handler swallowed errors silently; added tracing::error
+Emergency limits code review:
+  - Constants: MAX_CPU_TEMP=90.0, EMERGENCY_TEMP=95.0 in agent_task.rs:12-13
+  - Trigger: check_safety() runs every agent tick (5s); CPU>=95 or GPU>=90 -> 100% all fans
+  - Action: immediate emergency intervention, logged to audit DB
+  - NOT live-tested (too risky for hardware)
+Notes:
+  - GPU BIOS enforces ~31% minimum duty; writes below this are clamped by hardware
+  - HWiNFO fan reads show RPM; NVML reads show duty% but 0 RPM (NVML limitation on Windows)
+  - Created 3 default profiles: balanced, silent, performance in %APPDATA%\thermaliq\profiles\
 ```
 
 ## What unblocks next
