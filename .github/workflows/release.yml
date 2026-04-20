@@ -231,7 +231,7 @@ jobs:
             "target\${{ matrix.target }}\release\tq.exe"
           )
           $NSIS = Get-ChildItem `
-            -Path "thermaliq-ui\src-tauri\target\release\bundle\nsis" `
+            -Path "thermaliq-ui\src-tauri\target\${{ matrix.target }}\release\bundle\nsis" `
             -Filter "*_x64-setup.exe" -Recurse -ErrorAction SilentlyContinue |
             Select-Object -First 1
           if ($NSIS) { $FILES += $NSIS.FullName }
@@ -261,7 +261,7 @@ jobs:
           Copy-Item "target\${{ matrix.target }}\release\tq.exe" dist\
           Copy-Item "target\${{ matrix.target }}\release\thermaliq-daemon.exe" dist\
           $NSIS = Get-ChildItem `
-            -Path "thermaliq-ui\src-tauri\target\release\bundle\nsis" `
+            -Path "thermaliq-ui\src-tauri\target\${{ matrix.target }}\release\bundle\nsis" `
             -Filter "*_x64-setup.exe" -Recurse -ErrorAction SilentlyContinue |
             Select-Object -First 1
           if ($NSIS) { Copy-Item $NSIS.FullName dist\ }
