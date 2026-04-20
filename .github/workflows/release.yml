@@ -137,7 +137,10 @@ jobs:
           mkdir -p dist
           cp target/${{ matrix.target }}/release/tq dist/
           cp target/${{ matrix.target }}/release/thermaliq-daemon dist/
-          tar czf ${{ matrix.artifact }}.tar.gz -C dist tq thermaliq-daemon
+          # Copy .app.tar.gz (updater bundle) and .sig + .dmg (installer)
+          BUNDLE_DIR="thermaliq-ui/src-tauri/target/${{ matrix.target }}/release/bundle"
+          find "$BUNDLE_DIR" -type f \( -name "*.app.tar.gz" -o -name "*.sig" -o -name "*.dmg" \) -exec cp {} dist/ \; 2>/dev/null || true
+          tar czf ${{ matrix.artifact }}.tar.gz -C dist .
 
       # ── Windows ───────────────────────────────────────────────────────────
 
@@ -257,11 +260,11 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item "target\${{ matrix.target }}\release\tq.exe" dist\
           Copy-Item "target\${{ matrix.target }}\release\thermaliq-daemon.exe" dist\
-          $NSIS = Get-ChildItem `
-            -Path "thermaliq-ui\src-tauri\target\${{ matrix.target }}\release\bundle\nsis" `
-            -Filter "*_x64-setup.exe" -Recurse -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-          if ($NSIS) { Copy-Item $NSIS.FullName dist\ }
+          # Copy NSIS installer + updater bundle (.nsis.zip) + signatures (.sig)
+          $BUNDLE_DIR = "thermaliq-ui\src-tauri\target\${{ matrix.target }}\release\bundle\nsis"
+          Get-ChildItem -Path $BUNDLE_DIR -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '(_x64-setup\.exe|\.nsis\.zip|\.sig)$' } |
+            ForEach-Object { Copy-Item $_.FullName dist\ }
           Compress-Archive -Path dist\* -DestinationPath "${{ matrix.artifact }}.zip"
         shell: pwsh
 
@@ -428,15 +431,14 @@ jobs:
 
           WIN_URL="https://github.com/lulacoding/thermaliq/releases/download/v${VERSION}/ThermalIQ_${VERSION}_x64-setup.exe"
           MAC_ARM_URL="https://github.com/lulacoding/thermaliq/releases/download/v${VERSION}/ThermalIQ_${VERSION}_aarch64.dmg"
-          LIN_URL="https://github.com/lulacoding/thermaliq/releases/download/v${VERSION}/thermaliq_${VERSION}_amd64.AppImage"
 
           # tauri-action emits signatures next to each bundle:
           #   *.nsis.zip.sig     — windows NSIS updater bundle
           #   *.app.tar.gz.sig   — macOS updater bundle (per-arch)
-          #   *.AppImage.tar.gz.sig — linux AppImage updater bundle
+          # (Linux AppImage updater not yet wired — Tauri bundle build requires
+          #  webkit2gtk system deps; deferred until Linux first-class support.)
           WIN_SIG=$(read_sig "windows-x86_64" "*-setup.nsis.zip.sig")
           MAC_ARM_SIG=$(read_sig "darwin-aarch64" "*aarch64.app.tar.gz.sig")
-          LIN_SIG=$(read_sig "linux-x86_64" "*amd64.AppImage.tar.gz.sig")
 
           # Build JSON via jq so values are properly escaped and no heredoc
           # indentation can leak into the payload.
@@ -446,15 +448,13 @@ jobs:
             --arg pub_date "$PUBDATE" \
             --arg win_url "$WIN_URL" --arg win_sig "$WIN_SIG" \
             --arg mac_arm_url "$MAC_ARM_URL" --arg mac_arm_sig "$MAC_ARM_SIG" \
-            --arg lin_url "$LIN_URL" --arg lin_sig "$LIN_SIG" \
             '{
                version: $version,
                notes: $notes,
                pub_date: $pub_date,
                platforms: {
                  "windows-x86_64":  { signature: $win_sig,     url: $win_url     },
-                 "darwin-aarch64":  { signature: $mac_arm_sig, url: $mac_arm_url },
-                 "linux-x86_64":    { signature: $lin_sig,     url: $lin_url     }
+                 "darwin-aarch64":  { signature: $mac_arm_sig, url: $mac_arm_url }
                }
              }' > latest.json
 
