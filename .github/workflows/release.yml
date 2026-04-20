@@ -262,9 +262,12 @@ jobs:
           Copy-Item "target\${{ matrix.target }}\release\thermaliq-daemon.exe" dist\
           # Copy NSIS installer + updater bundle (.nsis.zip) + signatures (.sig)
           $BUNDLE_DIR = "thermaliq-ui\src-tauri\target\${{ matrix.target }}\release\bundle\nsis"
-          Get-ChildItem -Path $BUNDLE_DIR -Recurse -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -match '(_x64-setup\.exe|\.nsis\.zip|\.sig)$' } |
-            ForEach-Object { Copy-Item $_.FullName dist\ }
+          Write-Host "Bundle dir contents:"
+          Get-ChildItem -Path $BUNDLE_DIR -Recurse -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $($_.FullName)" }
+          Get-ChildItem -Path $BUNDLE_DIR -Recurse -ErrorAction SilentlyContinue -Include @("*.exe","*.nsis.zip","*.sig") |
+            ForEach-Object { Write-Host "Copying: $($_.Name)"; Copy-Item $_.FullName dist\ }
+          Write-Host "Dist contents:"
+          Get-ChildItem dist\ | ForEach-Object { Write-Host "  $($_.Name)" }
           Compress-Archive -Path dist\* -DestinationPath "${{ matrix.artifact }}.zip"
         shell: pwsh
 
