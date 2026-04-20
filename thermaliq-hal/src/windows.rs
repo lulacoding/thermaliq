@@ -776,8 +776,8 @@ fn nvml_set_fan(fan_id: &str, duty_percent: u8) -> Result<()> {
     //
     // Note: Requires NVIDIA driver 520+ and admin privileges.
 
-    let lib = unsafe { libloading::Library::new("nvidia-ml.dll") }
-        .context("nvidia-ml.dll not found — NVIDIA driver (520+) required")?;
+    let lib = unsafe { libloading::Library::new("nvml.dll") }
+        .context("nvml.dll not found — NVIDIA driver (520+) required")?;
 
     unsafe {
         // Load NVML functions
@@ -793,7 +793,7 @@ fn nvml_set_fan(fan_id: &str, duty_percent: u8) -> Result<()> {
                 .or_else(|_| lib.get(b"nvmlDeviceGetHandleByIndex\0"))
                 .context("nvmlDeviceGetHandleByIndex not found")?;
 
-        let fan_set: libloading::Symbol<unsafe extern "C" fn(nvml_device_t, u32, u32, u32) -> i32> =
+        let fan_set: libloading::Symbol<unsafe extern "C" fn(nvml_device_t, u32, u32) -> i32> =
             lib.get(b"nvmlDeviceSetFanSpeed_v2\0")
                 .context("nvmlDeviceSetFanSpeed_v2 not found — driver 520+ required")?;
 
@@ -807,10 +807,9 @@ fn nvml_set_fan(fan_id: &str, duty_percent: u8) -> Result<()> {
             bail!("nvmlDeviceGetHandleByIndex failed for GPU {gpu_idx}");
         }
 
-        // Set fan speed: policy=1 (manual), speed=0-100. `fan_idx` targets the
-        // specific fan on multi-fan cards (e.g. RTX 4090 has 3).
+        // nvmlDeviceSetFanSpeed_v2(device, fan_index, speed) — speed 0-100%.
         let speed = (duty_percent as u32).clamp(0, 100);
-        let ret = fan_set(device, fan_idx, 1, speed);
+        let ret = fan_set(device, fan_idx, speed);
         shutdown();
 
         if ret != NVML_OK {

@@ -230,7 +230,10 @@ async fn set_fan_pwm(
             stop_percent: None,
         })
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| {
+            tracing::error!(fan = %fan_id, duty = duty, error = %e, "fan write failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     Ok(Json(json!({ "fan_id": fan_id, "duty_percent": duty })))
 }
