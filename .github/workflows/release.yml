@@ -260,15 +260,17 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item "target\${{ matrix.target }}\release\tq.exe" dist\
           Copy-Item "target\${{ matrix.target }}\release\thermaliq-daemon.exe" dist\
-          # Copy NSIS installer + updater bundle (.nsis.zip) + signatures (.sig)
-          $BUNDLE_DIR = "thermaliq-ui\src-tauri\target\${{ matrix.target }}\release\bundle\nsis"
-          Write-Host "Bundle dir contents:"
-          Get-ChildItem -Path $BUNDLE_DIR -Recurse -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $($_.FullName)" }
-          Get-ChildItem -Path $BUNDLE_DIR -Recurse -ErrorAction SilentlyContinue -Include @("*.exe","*.nsis.zip","*.sig") |
-            ForEach-Object { Write-Host "Copying: $($_.Name)"; Copy-Item $_.FullName dist\ }
+          # Copy NSIS installer + updater bundle (.nsis.zip) + all signatures
+          $BUNDLE_ROOT = "thermaliq-ui\src-tauri\target\${{ matrix.target }}\release\bundle"
+          Write-Host "Bundle root contents (recursive):"
+          Get-ChildItem -Path $BUNDLE_ROOT -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $($_.FullName)" }
+          # Match by extension via -like on filename (more reliable than -Include)
+          Get-ChildItem -Path $BUNDLE_ROOT -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like "*_x64-setup.exe" -or $_.Name -like "*.nsis.zip" -or $_.Name -like "*.sig" } |
+            ForEach-Object { Write-Host "Copying: $($_.Name)"; Copy-Item $_.FullName dist\ -Force }
           Write-Host "Dist contents:"
           Get-ChildItem dist\ | ForEach-Object { Write-Host "  $($_.Name)" }
-          Compress-Archive -Path dist\* -DestinationPath "${{ matrix.artifact }}.zip"
+          Compress-Archive -Path dist\* -DestinationPath "${{ matrix.artifact }}.zip" -Force
         shell: pwsh
 
       # ── Upload ─────────────────────────────────────────────────────────────
