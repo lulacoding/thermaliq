@@ -217,13 +217,18 @@ Run the verify script (Mac-side prep) OR manually check each:
 ## Session log
 
 ```
-Date executed:
-Time taken:
-NSIS installer version:
-Service runs as account: 
-Reboot survival: yes / no
-Uninstall preserved config: yes / no
-Bugs filed:
+Date executed: 2026-04-20
+Time taken: ~15 min
+NSIS installer version: not tested (direct install-service path used instead)
+Service runs as account: LocalSystem (default)
+Reboot survival: yes - service auto-started on boot, /health responded immediately
+Uninstall preserved config: not tested (uninstall-service exists, NSIS uninstaller not exercised)
+Bugs filed: none
+Notes:
+  - Used `thermaliq-daemon.exe install-service` directly instead of NSIS installer
+  - HWiNFO64 needs manual start on boot (known: it's not a service, user must start it)
+  - Start menu shortcut only created by NSIS installer (expected gap for direct install path)
+  - NSIS installer end-to-end test deferred to S8 (beta cut)
 ```
 
 ## What unblocks next
