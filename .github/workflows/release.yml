@@ -374,11 +374,11 @@ jobs:
           echo "EOF" >> $GITHUB_OUTPUT
 
       - name: Generate latest.json update manifest
-        # Gated on TAURI_SIGNING_PRIVATE_KEY so unsigned dev/fork runs are no-ops.
         # Format: https://tauri.app/plugin/updater/#update-server
         # Built with `jq` to avoid heredoc indentation + shell injection pitfalls,
         # then validated with `jq -e .` so malformed JSON fails the job loudly.
-        if: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+        # (No if-gate on secrets — GHA rejects `secrets.*` in step-level `if:`;
+        #  secrets are required for all release tags by convention.)
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
