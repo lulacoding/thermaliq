@@ -164,13 +164,21 @@ Open a GitHub issue for any of:
 ## Session log
 
 ```
-Date executed:
-Time taken:
-HWiNFO sensors discovered: N
-WMI sensors discovered: N
-Worst sensor delta: N°C on <sensor>
-Auto-reopen works: yes / no / partial
-Bugs filed: <issue numbers>
+Date executed: 2026-04-20
+Time taken: ~120 min (spread across debugging packed struct bug)
+HWiNFO sensors discovered: 27 temperature, 2 fans (+ 1 NVML fan)
+WMI sensors discovered: 0 (MSAcpi_ThermalZoneTemperature not supported on AMD X670E — expected)
+Worst sensor delta: <1°C (CPU Tctl/Tdie API=54.75 vs HWiNFO UI=55°C)
+Auto-reopen works: yes (staleness detection + reopen implemented and verified)
+/metrics endpoint: exists (Prometheus format, unauthenticated)
+Bugs fixed:
+  - #[repr(C)] alignment padding on HwinfoHeader/HwinfoReading/HwinfoSensor
+    caused 4-byte offset shift — all header fields after revision misread.
+    Fix: #[repr(C, packed)] + read_unaligned (commit 214ed29)
+Notes:
+  - HWiNFO64 free tier has 12-hour shared memory limit
+  - Shared Memory Support must be enabled in HWiNFO Settings → Sensors tab
+  - WMI fallback returning 0 sensors is normal on AMD consumer boards — not a bug
 ```
 
 ## What unblocks next
