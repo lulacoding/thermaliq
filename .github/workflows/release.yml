@@ -20,9 +20,6 @@ jobs:
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             artifact: thermaliq-linux-x86_64
-          - os: macos-13
-            target: x86_64-apple-darwin
-            artifact: thermaliq-macos-intel
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: thermaliq-macos-arm64
@@ -422,7 +419,6 @@ jobs:
 
           WIN_URL="https://github.com/lulacoding/thermaliq/releases/download/v${VERSION}/ThermalIQ_${VERSION}_x64-setup.exe"
           MAC_ARM_URL="https://github.com/lulacoding/thermaliq/releases/download/v${VERSION}/ThermalIQ_${VERSION}_aarch64.dmg"
-          MAC_X64_URL="https://github.com/lulacoding/thermaliq/releases/download/v${VERSION}/ThermalIQ_${VERSION}_x64.dmg"
           LIN_URL="https://github.com/lulacoding/thermaliq/releases/download/v${VERSION}/thermaliq_${VERSION}_amd64.AppImage"
 
           # tauri-action emits signatures next to each bundle:
@@ -431,7 +427,6 @@ jobs:
           #   *.AppImage.tar.gz.sig — linux AppImage updater bundle
           WIN_SIG=$(read_sig "windows-x86_64" "*-setup.nsis.zip.sig")
           MAC_ARM_SIG=$(read_sig "darwin-aarch64" "*aarch64.app.tar.gz.sig")
-          MAC_X64_SIG=$(read_sig "darwin-x86_64" "*x64.app.tar.gz.sig")
           LIN_SIG=$(read_sig "linux-x86_64" "*amd64.AppImage.tar.gz.sig")
 
           # Build JSON via jq so values are properly escaped and no heredoc
@@ -442,7 +437,6 @@ jobs:
             --arg pub_date "$PUBDATE" \
             --arg win_url "$WIN_URL" --arg win_sig "$WIN_SIG" \
             --arg mac_arm_url "$MAC_ARM_URL" --arg mac_arm_sig "$MAC_ARM_SIG" \
-            --arg mac_x64_url "$MAC_X64_URL" --arg mac_x64_sig "$MAC_X64_SIG" \
             --arg lin_url "$LIN_URL" --arg lin_sig "$LIN_SIG" \
             '{
                version: $version,
@@ -451,7 +445,6 @@ jobs:
                platforms: {
                  "windows-x86_64":  { signature: $win_sig,     url: $win_url     },
                  "darwin-aarch64":  { signature: $mac_arm_sig, url: $mac_arm_url },
-                 "darwin-x86_64":   { signature: $mac_x64_sig, url: $mac_x64_url },
                  "linux-x86_64":    { signature: $lin_sig,     url: $lin_url     }
                }
              }' > latest.json
