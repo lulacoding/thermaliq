@@ -30,7 +30,7 @@ toml = { workspace = true }
 rusqlite = { version = "0.31", features = ["bundled"] }
 futures-util = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
-sysinfo = { version = "0.31", default-features = false, features = ["system"] }
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 reqwest = { version = "0.12", features = ["json"] }
 chrono = { workspace = true }
 async-trait = "0.1"
