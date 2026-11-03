@@ -39,7 +39,6 @@ Tick a box only when its tests pass in CI and a reviewer has signed off (SPEC §
 - [ ] **M14 `tq` CLI** — port · v0: `thermaliq-cli/src/main.rs`
 - [ ] **M15 Profiles, app rules, schedule** — port schedule, fix app rules (read from base profile/config, not the active one) · v0: `schedule_monitor.rs`, `app_monitor.rs`
 - [ ] **M16 Alerts** — port `AlertEvaluator` (has cooldowns) and run its actions · v0: `thermaliq-common/src/alert.rs`
-- [ ] **M17 Linux hwmon** — port reads, fix writes (`pwmN_mode` for DC, save/restore `pwm_enable`, match chips by path) · v0: `thermaliq-hal/src/linux.rs` · drop NBFC EC writes
 - [ ] **M18 UI** — port screens, rewrite data layer (token via Tauri command, real endpoints only) · v0: `thermaliq-ui/` · then **G2**
 - [ ] **M19 LLM profile generation** — port prompt, rewrite provider (one OpenAI-compatible client, timeouts, keychain key) · v0: `profile_gen.rs`
 
@@ -50,6 +49,10 @@ Tick a box only when its tests pass in CI and a reviewer has signed off (SPEC §
 ## Phase 6 — Release
 
 - [ ] **M21 Release pipeline** — port · v0: `.github/workflows/release.yml`, `packaging/`, Tauri updater config
+
+## Later (v2.1)
+
+- **Linux hwmon** — port reads, fix writes (`pwmN_mode` for DC, save/restore `pwm_enable`, match chips by path) · v0: `thermaliq-hal/src/linux.rs` · drop NBFC EC writes
 
 ## Dropped (do not port)
 

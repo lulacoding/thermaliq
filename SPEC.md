@@ -15,7 +15,8 @@ A background service that reads temperatures and drives fans from user-defined c
 | Windows 10/11 x64 | macOS (helper, SMC) |
 | NVIDIA GPU fans (NVML) | AMD GPU fans (ADLX) |
 | Motherboard fans via LHM bridge (LibreHardwareMonitorLib + PawnIO) | Laptop EC / NBFC |
-| Linux hwmon reads + writes (second platform) | Battery-based switching |
+| | Linux (hwmon) — v2.1 |
+| | Battery-based switching |
 | Curves: linear, flat, graph, mix, sync, trigger | Curves: auto, ai, predictive, learning |
 | Custom sensors: time-average, mix, file, offset | Webhooks |
 | Profiles, app rules, schedule | Community profile library |
@@ -68,7 +69,7 @@ One snapshot per tick, cached and shared. API reads use the cache, never the har
 
 ## 6. Data, paths, auth
 
-- One shared data directory: `%ProgramData%\ThermalIQ` on Windows, `/var/lib/thermaliq` on Linux (overridable by env var for dev). Config, profiles, token, history DB live there.
+- One shared data directory: `%ProgramData%\ThermalIQ` (overridable by env var for dev and CI). Config, profiles, token, history DB live there.
 - `config.toml`, written atomically (temp file + rename). Settings changed through the API are saved there.
 - API keys in the OS keychain, never in TOML.
 - Every mutating endpoint needs `Authorization: Bearer <token>`. Read-only endpoints may be open. CORS lists the real production origins (including `http://tauri.localhost` on Windows).
@@ -77,7 +78,7 @@ One snapshot per tick, cached and shared. API reads use the cache, never the har
 
 ## 7. Agent
 
-- Modes: see Open decisions (v0 had passive / approval / autonomous).
+- Modes: **passive** (observe and log), **approval** (propose; you approve or reject each change), **autonomous** (apply within the rate limit).
 - Every 5 s: builds a JSON state (5-min temperature window, slopes, foreground app, active profile) and asks a decision provider two typed questions: workload `[idle, gaming, compiling, encoding, stress]` and action `[none, propose, apply]`, with confidence.
 - `DecisionProvider` speaks the Jev API format and reads `TYPESAFE_BASE_URL`. Default: a local runner (Ollaya + open decision model). Real Jev: optional, user's key. No endpoint → threshold fallback.
 - Agent requests go through the engine at priority 3. Max 6 interventions per hour. The agent never runs inside the fan loop.
@@ -92,9 +93,11 @@ One snapshot per tick, cached and shared. API reads use the cache, never the har
 
 A module is done when its tests pass in CI on Windows, macOS and Ubuntu runners (mock hardware), it is ticked in `PORTING.md`, and a separate reviewer (not the session that wrote it) has checked it against this spec.
 
-## 10. Open decisions (Sam decides; update this section when decided)
+## 10. Decisions
 
-- Agent modes: 2 (passive, autonomous — per the Aug 2026 design doc) or 3 (adds approval)?
-- Linux in v2.0, or move to v2.1?
-- Keep HWiNFO as an optional extra sensor source once the LHM bridge works?
-- LLM provider for profile generation: OpenRouter default (Aug 2026 design doc) — confirm.
+Decided 2026-11-04 by Sam:
+
+- Agent modes: 3 — passive, approval, autonomous.
+- Linux moves to v2.1. v2.0 is Windows-only. CI still builds and tests on Ubuntu and macOS with mock hardware.
+- HWiNFO stays as an optional extra sensor source once the LHM bridge works.
+- LLM for profile generation: OpenRouter by default; any OpenAI-compatible base URL (e.g. local Ollama) can be configured.

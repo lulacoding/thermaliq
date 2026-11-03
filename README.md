@@ -1,6 +1,6 @@
 # ThermalIQ v2
 
-Safe, local-first fan control for Windows (Linux second), with an optional AI agent.
+Safe, local-first fan control for Windows, with an optional AI agent. Linux follows in v2.1.
 
 **Status:** rebuild in progress. Nothing here controls fans yet. See `PORTING.md` for what is actually done.
 
