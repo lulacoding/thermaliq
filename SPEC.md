@@ -16,9 +16,10 @@ A background service that reads temperatures and drives fans from user-defined c
 | NVIDIA GPU fans (NVML) | AMD GPU fans (ADLX) |
 | Motherboard fans via LHM bridge (LibreHardwareMonitorLib + PawnIO) | Laptop EC / NBFC |
 | | Linux (hwmon) — v2.1 |
+| | File custom sensor — v2.1 |
 | | Battery-based switching |
 | Curves: linear, flat, graph, mix, sync, trigger | Curves: auto, ai, predictive, learning |
-| Custom sensors: time-average, mix, file, offset | Webhooks |
+| Custom sensors: time-average, mix, offset | Webhooks |
 | Profiles, app rules, schedule | Community profile library |
 | Alerts: log + notify + apply-profile | |
 | Tauri UI, `tq` CLI, HTTP API + WebSocket | |

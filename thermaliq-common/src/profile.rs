@@ -2,6 +2,9 @@ use crate::{invalid, Error, MAX_VALID_TEMP_C, MIN_VALID_TEMP_C};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
+/// Longest time-average window; bounds the sample buffer.
+const MAX_TIME_AVERAGE_S: u64 = 3600;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
@@ -29,7 +32,7 @@ pub enum MixFunction {
     Sum,
 }
 
-/// SPEC §2: time-average, mix, file, offset.
+/// SPEC §2: time-average, mix, offset.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CustomSensor {
@@ -42,10 +45,6 @@ pub enum CustomSensor {
         id: String,
         function: MixFunction,
         sources: Vec<String>,
-    },
-    File {
-        id: String,
-        path: std::path::PathBuf,
     },
     Offset {
         id: String,
@@ -198,8 +197,10 @@ impl Profile {
         for s in &self.sensors {
             let id = match s {
                 CustomSensor::TimeAverage { id, time_s, .. } => {
-                    if *time_s == 0 {
-                        return invalid(format!("sensor `{id}`: time_s must be above 0"));
+                    if !(1..=MAX_TIME_AVERAGE_S).contains(time_s) {
+                        return invalid(format!(
+                            "sensor `{id}`: time_s must be 1..{MAX_TIME_AVERAGE_S}"
+                        ));
                     }
                     id
                 }
@@ -209,7 +210,6 @@ impl Profile {
                     }
                     id
                 }
-                CustomSensor::File { id, .. } => id,
                 CustomSensor::Offset { id, offset, .. } => {
                     finite(&format!("sensor `{id}`"), "offset", *offset)?;
                     id
