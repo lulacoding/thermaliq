@@ -134,6 +134,12 @@ pub struct Control {
     /// Floor applied after the curve, before ramping (S7).
     #[serde(default)]
     pub min_pwm: u8,
+    /// 0-RPM hysteresis: the fan stops below `stop_percent` and restarts at
+    /// `start_percent`. Both or neither.
+    #[serde(default)]
+    pub start_percent: Option<u8>,
+    #[serde(default)]
+    pub stop_percent: Option<u8>,
 }
 
 fn default_step_up() -> u8 {
@@ -249,6 +255,23 @@ impl Profile {
             }
             let ctx = format!("control for fan `{}`", c.fan);
             duty(&ctx, "min_pwm", c.min_pwm)?;
+            match (c.start_percent, c.stop_percent) {
+                (None, None) => {}
+                (Some(start), Some(stop)) => {
+                    duty(&ctx, "start_percent", start)?;
+                    duty(&ctx, "stop_percent", stop)?;
+                    if start < stop {
+                        return invalid(format!(
+                            "{ctx}: start_percent must not be below stop_percent"
+                        ));
+                    }
+                }
+                _ => {
+                    return invalid(format!(
+                        "{ctx}: set both start_percent and stop_percent, or neither"
+                    ))
+                }
+            }
             for (k, v) in [
                 ("step_up_pct", c.step_up_pct),
                 ("step_down_pct", c.step_down_pct),
@@ -356,13 +379,18 @@ fn validate_curve(c: &Curve) -> Result<(), Error> {
             max_pwm,
             ..
         } => {
-            finite(ctx, "min_temp", *min_temp)?;
-            finite(ctx, "max_temp", *max_temp)?;
+            temp(ctx, "min_temp", *min_temp)?;
+            temp(ctx, "max_temp", *max_temp)?;
             if min_temp >= max_temp {
                 return invalid(format!("{ctx}: min_temp must be below max_temp"));
             }
             duty(ctx, "min_pwm", *min_pwm)?;
-            duty(ctx, "max_pwm", *max_pwm)
+            duty(ctx, "max_pwm", *max_pwm)?;
+            // an inverted curve would slow the fan as it gets hotter
+            if min_pwm > max_pwm {
+                return invalid(format!("{ctx}: min_pwm must not exceed max_pwm"));
+            }
+            Ok(())
         }
         Curve::Flat { pwm, .. } => duty(ctx, "pwm", *pwm),
         Curve::Graph { points, .. } => {
@@ -370,11 +398,14 @@ fn validate_curve(c: &Curve) -> Result<(), Error> {
                 return invalid(format!("{ctx}: graph needs at least two points"));
             }
             for p in points {
-                finite(ctx, "temp", p.temp)?;
+                temp(ctx, "temp", p.temp)?;
                 duty(ctx, "pwm", p.pwm)?;
             }
             if !points.windows(2).all(|w| w[0].temp < w[1].temp) {
                 return invalid(format!("{ctx}: point temps must be strictly increasing"));
+            }
+            if !points.windows(2).all(|w| w[0].pwm <= w[1].pwm) {
+                return invalid(format!("{ctx}: point pwm must be non-decreasing"));
             }
             Ok(())
         }
@@ -392,18 +423,37 @@ fn validate_curve(c: &Curve) -> Result<(), Error> {
             response_ms,
             ..
         } => {
-            finite(ctx, "idle_temp", *idle_temp)?;
-            finite(ctx, "load_temp", *load_temp)?;
+            temp(ctx, "idle_temp", *idle_temp)?;
+            temp(ctx, "load_temp", *load_temp)?;
             if load_temp <= idle_temp {
                 return invalid(format!("{ctx}: load_temp must be above idle_temp"));
             }
             duty(ctx, "idle_pwm", *idle_pwm)?;
             duty(ctx, "load_pwm", *load_pwm)?;
+            if idle_pwm > load_pwm {
+                return invalid(format!("{ctx}: idle_pwm must not exceed load_pwm"));
+            }
             if *response_ms == 0 {
                 return invalid(format!("{ctx}: response_ms must be above 0"));
             }
             Ok(())
         }
-        Curve::Sync { .. } => Ok(()),
+        Curve::Sync { offset, .. } => {
+            if !(-100..=100).contains(offset) {
+                return invalid(format!("{ctx}: offset {offset} is outside -100..100"));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Curve temperatures must be plausible sensor values (S3 range), not just finite.
+fn temp(ctx: &str, field: &str, v: f32) -> Result<(), Error> {
+    if (MIN_VALID_TEMP_C..=MAX_VALID_TEMP_C).contains(&v) {
+        Ok(())
+    } else {
+        invalid(format!(
+            "{ctx}: {field} must be a finite value within {MIN_VALID_TEMP_C}..{MAX_VALID_TEMP_C}"
+        ))
     }
 }

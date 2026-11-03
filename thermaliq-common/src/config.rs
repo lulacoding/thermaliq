@@ -38,9 +38,10 @@ impl DaemonConfig {
         if c.api_port == 0 {
             return invalid("api_port must not be 0".into());
         }
-        if !(100..=60_000).contains(&c.polling_interval_ms) {
+        // S3/S4 trip after 3 ticks, so a slow tick delays the failsafe
+        if !(250..=2000).contains(&c.polling_interval_ms) {
             return invalid(format!(
-                "polling_interval_ms {} is outside 100..60000",
+                "polling_interval_ms {} is outside 250..2000",
                 c.polling_interval_ms
             ));
         }

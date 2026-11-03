@@ -232,3 +232,86 @@ fn config_defaults_and_validation() {
     // keys never live in TOML; unknown sections are errors, not ignored
     assert!(DaemonConfig::from_toml("[ai]\napi_key = \"sk-x\"").is_err());
 }
+
+#[test]
+fn inverted_curves_are_rejected() {
+    let lin = "[[curves]]\nid=\"c\"\ntype=\"linear\"\nsource=\"s\"\nmin_temp=40\nmax_temp=80\nmin_pwm=100\nmax_pwm=0\n";
+    assert!(err(lin).contains("min_pwm"));
+    let tr = "[[curves]]\nid=\"t\"\ntype=\"trigger\"\nsource=\"s\"\nidle_temp=45\nidle_pwm=90\nload_temp=70\nload_pwm=10\n";
+    assert!(err(tr).contains("idle_pwm"));
+    let g = "[[curves]]\nid=\"g\"\ntype=\"graph\"\nsource=\"s\"\npoints=[{temp=30,pwm=80},{temp=60,pwm=20}]\n";
+    assert!(err(g).contains("non-decreasing"));
+    // equal duties are fine
+    parse("[[curves]]\nid=\"g\"\ntype=\"graph\"\nsource=\"s\"\npoints=[{temp=30,pwm=50},{temp=60,pwm=50}]\n").unwrap();
+}
+
+#[test]
+fn curve_temps_must_be_in_sensor_range() {
+    let lin = |a: &str, b: &str| {
+        format!("[[curves]]\nid=\"c\"\ntype=\"linear\"\nsource=\"s\"\nmin_temp={a}\nmax_temp={b}\nmin_pwm=0\nmax_pwm=100\n")
+    };
+    assert!(err(&lin("40", "1e30")).contains("max_temp"));
+    assert!(err(&lin("-50", "80")).contains("min_temp"));
+    parse(&lin("-20", "150")).unwrap();
+    let g = "[[curves]]\nid=\"g\"\ntype=\"graph\"\nsource=\"s\"\npoints=[{temp=30,pwm=10},{temp=500,pwm=20}]\n";
+    assert!(err(g).contains("temp"));
+    let tr = "[[curves]]\nid=\"t\"\ntype=\"trigger\"\nsource=\"s\"\nidle_temp=45\nidle_pwm=10\nload_temp=900\nload_pwm=90\n";
+    assert!(err(tr).contains("load_temp"));
+}
+
+#[test]
+fn polling_interval_is_capped_so_failsafes_trip_quickly() {
+    for ms in [249, 2001, 60_000] {
+        assert!(
+            DaemonConfig::from_toml(&format!("polling_interval_ms = {ms}")).is_err(),
+            "{ms}"
+        );
+    }
+    for ms in [250, 2000] {
+        DaemonConfig::from_toml(&format!("polling_interval_ms = {ms}")).unwrap();
+    }
+}
+
+#[test]
+fn zero_rpm_hysteresis_is_both_or_neither_and_start_not_below_stop() {
+    let ctl = |extra: &str| {
+        format!("[[curves]]\nid=\"a\"\ntype=\"flat\"\npwm=5\n[[controls]]\nfan=\"f\"\ncurve=\"a\"\n{extra}")
+    };
+    let p = parse(&ctl("start_percent = 30\nstop_percent = 20\n")).unwrap();
+    assert_eq!(
+        (p.controls[0].start_percent, p.controls[0].stop_percent),
+        (Some(30), Some(20))
+    );
+    assert_eq!(parse(&ctl("")).unwrap().controls[0].start_percent, None);
+    parse(&ctl("start_percent = 20\nstop_percent = 20\n")).unwrap();
+    assert!(err(&ctl("start_percent = 30\n")).contains("both"));
+    assert!(err(&ctl("stop_percent = 30\n")).contains("both"));
+    assert!(err(&ctl("start_percent = 10\nstop_percent = 20\n")).contains("start_percent"));
+    assert!(err(&ctl("start_percent = 101\nstop_percent = 20\n")).contains("100"));
+}
+
+#[test]
+fn sync_offset_is_limited_to_100() {
+    let s = |o: i32| {
+        format!("[[curves]]\nid=\"a\"\ntype=\"flat\"\npwm=5\n[[curves]]\nid=\"s\"\ntype=\"sync\"\ntarget=\"a\"\noffset={o}\n")
+    };
+    parse(&s(100)).unwrap();
+    parse(&s(-100)).unwrap();
+    assert!(err(&s(101)).contains("offset"));
+    assert!(err(&s(-101)).contains("offset"));
+}
+
+#[test]
+fn bundled_profiles_say_their_ids_are_roles() {
+    for (name, toml) in bundled_profiles() {
+        let head: String = toml
+            .lines()
+            .take_while(|l| l.starts_with('#'))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            head.contains("role"),
+            "{name} lacks the role-ID header comment"
+        );
+    }
+}

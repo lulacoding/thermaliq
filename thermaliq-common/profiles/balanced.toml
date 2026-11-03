@@ -1,3 +1,6 @@
+# Sensor and fan IDs here (cpu_package, gpu_edge, chassis1, ...) are role IDs, not real hardware IDs.
+# The first-run mapping (PORTING M13) translates them to this PC's hardware before the profile is used.
+
 name = "balanced"
 description = "Default: moderate noise and temperatures"
 
