@@ -46,10 +46,20 @@ pub(crate) fn invalid<T>(msg: String) -> Result<T, Error> {
     Err(Error::Invalid(msg))
 }
 
+/// Which component a sensor measures, set by the backend (SPEC S2 needs CPU vs GPU).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SensorKind {
+    Cpu,
+    Gpu,
+    Other,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SensorReading {
     pub id: String,
     pub label: String,
+    pub kind: SensorKind,
     pub temp_celsius: f32,
 }
 
