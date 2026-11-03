@@ -9,7 +9,7 @@ Tick a box only when its tests pass in CI and a reviewer has signed off (SPEC §
 ## Phase 1 — Safety core
 
 - [x] **M1 Common types + profile/config schema** — rewrite · v0: `thermaliq-common/src/{lib,config}.rs` · test: every bundled profile parses; invalid profiles give a readable error; no `ai/predictive/learning/auto` variants
-- [ ] **M2 HAL trait + mock** — rewrite · v0: `thermaliq-hal/src/{lib,mock}.rs` · test: mock temps can be scripted per tick; mock records every write and `restore_auto` call
+- [x] **M2 HAL trait + mock** — rewrite · v0: `thermaliq-hal/src/{lib,mock}.rs` · test: mock temps can be scripted per tick; mock records every write and `restore_auto` call
 - [ ] **M3 Curves + custom sensors** — port linear/flat/graph/custom sensors, fix mix/sync, rewrite trigger · v0: `thermaliq-daemon/src/poller.rs` · test: mix of a CPU curve at 75 °C equals the CPU curve at 75 °C; trigger respects `response_ms` and hysteresis
 - [ ] **M4 Engine: priority, ramping, 0-RPM** — rewrite · v0: `poller.rs`, `agent_task.rs` · test: a lower-priority request never overwrites a higher one; overrides expire
 - [ ] **M5 Engine: safety S2–S5, S7** — new · v0: `agent_task.rs::check_safety` (intent only) · test: 97 °C holds 100% for 30 s; sensor missing 3 ticks → 100%; drop/panic calls `restore_auto` on every touched fan
