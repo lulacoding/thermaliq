@@ -39,10 +39,6 @@ type = "mix"
 function = "max"
 sources = ["cpu_avg", "gpu_edge"]
 [[sensors]]
-id = "ext"
-type = "file"
-path = "C:/temp.txt"
-[[sensors]]
 id = "cpu_off"
 type = "offset"
 source = "cpu_package"
@@ -314,4 +310,10 @@ fn bundled_profiles_say_their_ids_are_roles() {
             "{name} lacks the role-ID header comment"
         );
     }
+}
+
+#[test]
+fn file_sensor_is_out_of_scope() {
+    // SPEC §2: `file` moved to v2.1
+    err("[[sensors]]\nid = \"ext\"\ntype = \"file\"\npath = \"C:/temp.txt\"\n");
 }

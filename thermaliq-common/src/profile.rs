@@ -29,7 +29,7 @@ pub enum MixFunction {
     Sum,
 }
 
-/// SPEC §2: time-average, mix, file, offset.
+/// SPEC §2: time-average, mix, offset.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CustomSensor {
@@ -42,10 +42,6 @@ pub enum CustomSensor {
         id: String,
         function: MixFunction,
         sources: Vec<String>,
-    },
-    File {
-        id: String,
-        path: std::path::PathBuf,
     },
     Offset {
         id: String,
@@ -209,7 +205,6 @@ impl Profile {
                     }
                     id
                 }
-                CustomSensor::File { id, .. } => id,
                 CustomSensor::Offset { id, offset, .. } => {
                     finite(&format!("sensor `{id}`"), "offset", *offset)?;
                     id
