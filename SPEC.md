@@ -64,6 +64,7 @@ thermaliq-ui       (later) Tauri 2 + React
 ```
 
 `HardwareLayer` (minimum): `snapshot()`, `set_fan_duty(fan, duty)`, `restore_auto(fan)`, `capabilities()`.
+It is synchronous; the engine runs on its own thread (no async in the HAL).
 
 One snapshot per tick, cached and shared. API reads use the cache, never the hardware directly.
 
