@@ -1,0 +1,9 @@
+/target
+node_modules/
+dist/
+.omc/
+CLAUDE.local.md
+.claude/settings.local.json
+*.db
+*.db-journal
+.DS_Store

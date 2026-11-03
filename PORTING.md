@@ -1,0 +1,56 @@
+# Porting ledger
+
+Work top to bottom, one module per session. v0 paths are relative to the reference worktree `../thermaliq-v0` (tag `v0-archive`).
+
+Actions: **port** = bring the v0 logic across, re-read and re-tested · **rewrite** = new code, v0 is only a reference for intent · **new** = nothing in v0.
+
+Tick a box only when its tests pass in CI and a reviewer has signed off (SPEC §9).
+
+## Phase 1 — Safety core
+
+- [ ] **M1 Common types + profile/config schema** — rewrite · v0: `thermaliq-common/src/{lib,config}.rs` · test: every bundled profile parses; invalid profiles give a readable error; no `ai/predictive/learning/auto` variants
+- [ ] **M2 HAL trait + mock** — rewrite · v0: `thermaliq-hal/src/{lib,mock}.rs` · test: mock temps can be scripted per tick; mock records every write and `restore_auto` call
+- [ ] **M3 Curves + custom sensors** — port linear/flat/graph/custom sensors, fix mix/sync, rewrite trigger · v0: `thermaliq-daemon/src/poller.rs` · test: mix of a CPU curve at 75 °C equals the CPU curve at 75 °C; trigger respects `response_ms` and hysteresis
+- [ ] **M4 Engine: priority, ramping, 0-RPM** — rewrite · v0: `poller.rs`, `agent_task.rs` · test: a lower-priority request never overwrites a higher one; overrides expire
+- [ ] **M5 Engine: safety S2–S5, S7** — new · v0: `agent_task.rs::check_safety` (intent only) · test: 97 °C holds 100% for 30 s; sensor missing 3 ticks → 100%; drop/panic calls `restore_auto` on every touched fan
+
+> Gate check (mock): all S-tests green before Phase 2.
+
+## Phase 2 — Daemon, paths, auth
+
+- [ ] **M6 Paths + config + token** — rewrite paths/config, port token · v0: `thermaliq-daemon/src/token.rs`, `thermaliq-common/src/config.rs` · test: atomic write; ProgramData path on Windows; env override for dev
+- [ ] **M7 History DB** — port schema, add prune + batching · v0: `thermaliq-common/src/history.rs` · test: one transaction per tick; prune keeps 7 days raw
+- [ ] **M8 HTTP API + WebSocket** — port router/auth/ws, rewrite handlers · v0: `thermaliq-daemon/src/api/*` · test: every mutation rejects missing token; no handler returns success without effect; reads use the snapshot cache
+- [ ] **M9 Windows service** — port, add graceful stop · v0: `thermaliq-daemon/src/service.rs` · test (Windows CI): stop path calls engine shutdown, not `abort()`
+- [ ] **M10 NVIDIA backend** — port + fix · v0: `thermaliq-hal/src/windows.rs` (`nvml_*`) · fix: load + init once; `restore_auto` = default fan speed
+- [ ] **M11 HWiNFO sensor source (optional)** — port · v0: `thermaliq-hal/src/windows.rs` (`Hwinfo*`) · keep its tests
+
+> **G1** on the Windows PC (SPEC §8).
+
+## Phase 3 — Windows motherboard fans
+
+- [ ] **M12 LHM bridge** — new · .NET sidecar on LibreHardwareMonitorLib + PawnIO, JSON over a named pipe, 5 s watchdog (S6) · test: protocol tests; watchdog restores auto
+- [ ] **M13 Stable fan IDs + first-run mapping** — new · v0 lesson: HWiNFO IDs shift with sensor index · test: IDs survive reorder
+
+> **G3** on the Windows PC.
+
+## Phase 4 — Features
+
+- [ ] **M14 `tq` CLI** — port · v0: `thermaliq-cli/src/main.rs`
+- [ ] **M15 Profiles, app rules, schedule** — port schedule, fix app rules (read from base profile/config, not the active one) · v0: `schedule_monitor.rs`, `app_monitor.rs`
+- [ ] **M16 Alerts** — port `AlertEvaluator` (has cooldowns) and run its actions · v0: `thermaliq-common/src/alert.rs`
+- [ ] **M17 Linux hwmon** — port reads, fix writes (`pwmN_mode` for DC, save/restore `pwm_enable`, match chips by path) · v0: `thermaliq-hal/src/linux.rs` · drop NBFC EC writes
+- [ ] **M18 UI** — port screens, rewrite data layer (token via Tauri command, real endpoints only) · v0: `thermaliq-ui/` · then **G2**
+- [ ] **M19 LLM profile generation** — port prompt, rewrite provider (one OpenAI-compatible client, timeouts, keychain key) · v0: `profile_gen.rs`
+
+## Phase 5 — Agent
+
+- [ ] **M20 Agent + DecisionProvider** — rewrite · v0: `agent_task.rs`, `ai_provider.rs` (intent only) · test: fallback when no endpoint; rate limit; requests go through engine at priority 3
+
+## Phase 6 — Release
+
+- [ ] **M21 Release pipeline** — port · v0: `.github/workflows/release.yml`, `packaging/`, Tauri updater config
+
+## Dropped (do not port)
+
+Curve types `auto`, `ai`, `predictive`, `learning` · fake settings handlers (trust level, guardrails, telemetry) · battery switching claims · macOS helper (v2.1) · AMD ADL Overdrive5 · NBFC EC writes · oh-my-claudecode config and `.omc/` state · generated Tauri schemas

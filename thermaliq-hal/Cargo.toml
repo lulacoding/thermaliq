@@ -1,0 +1,11 @@
+[package]
+name = "thermaliq-hal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thermaliq-common = { path = "../thermaliq-common" }
+
+[lints]
+workspace = true

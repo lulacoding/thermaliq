@@ -1,0 +1,13 @@
+[package]
+name = "thermaliq-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thermaliq-common = { path = "../thermaliq-common" }
+thermaliq-hal = { path = "../thermaliq-hal" }
+thermaliq-engine = { path = "../thermaliq-engine" }
+
+[lints]
+workspace = true
