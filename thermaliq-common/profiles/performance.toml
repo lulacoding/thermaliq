@@ -1,0 +1,44 @@
+name = "performance"
+description = "Cooler, louder: fans ramp early"
+
+[[curves]]
+id = "cpu"
+type = "linear"
+source = "cpu_package"
+min_temp = 35
+max_temp = 75
+min_pwm = 40
+max_pwm = 100
+
+[[curves]]
+id = "gpu"
+type = "linear"
+source = "gpu_edge"
+min_temp = 35
+max_temp = 75
+min_pwm = 40
+max_pwm = 100
+
+[[controls]]
+fan = "chassis1"
+curve = "cpu"
+step_down_pct = 3
+min_pwm = 40
+
+[[controls]]
+fan = "gpu1"
+curve = "gpu"
+step_down_pct = 3
+min_pwm = 40
+
+[[alerts]]
+sensor = "cpu_package"
+threshold = 85
+severity = "warn"
+action = { type = "notify" }
+
+[[alerts]]
+sensor = "cpu_package"
+threshold = 92
+severity = "crit"
+action = { type = "log" }

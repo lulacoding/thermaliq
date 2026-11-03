@@ -1,0 +1,44 @@
+name = "silent"
+description = "Quiet: fans stay low until it gets warm"
+
+[[curves]]
+id = "cpu"
+type = "linear"
+source = "cpu_package"
+min_temp = 50
+max_temp = 85
+min_pwm = 20
+max_pwm = 100
+
+[[curves]]
+id = "gpu"
+type = "linear"
+source = "gpu_edge"
+min_temp = 50
+max_temp = 85
+min_pwm = 20
+max_pwm = 100
+
+[[controls]]
+fan = "chassis1"
+curve = "cpu"
+step_down_pct = 3
+min_pwm = 20
+
+[[controls]]
+fan = "gpu1"
+curve = "gpu"
+step_down_pct = 3
+min_pwm = 20
+
+[[alerts]]
+sensor = "cpu_package"
+threshold = 85
+severity = "warn"
+action = { type = "notify" }
+
+[[alerts]]
+sensor = "cpu_package"
+threshold = 92
+severity = "crit"
+action = { type = "log" }
