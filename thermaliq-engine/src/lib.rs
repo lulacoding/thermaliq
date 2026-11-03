@@ -3,9 +3,11 @@
 //!
 //! Modules M3–M5 (PORTING.md): curves and custom sensors so far.
 
+mod control;
 mod curves;
 mod sensors;
 
+pub use control::{FanControl, Source};
 pub use curves::CurveEngine;
 pub use sensors::SensorEngine;
 
