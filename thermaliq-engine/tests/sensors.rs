@@ -83,3 +83,14 @@ fn nan_samples_do_not_poison_the_average() {
     let o = e.evaluate(&temps(&[("cpu", 60.0)]), s(1));
     assert_eq!(o["avg"], 60.0);
 }
+
+#[test]
+fn custom_sensor_never_overwrites_a_real_reading() {
+    for offset in ["40.0", "-40.0"] {
+        let mut e = engine(&format!(
+            "[[sensors]]\nid = \"cpu\"\ntype = \"offset\"\nsource = \"cpu\"\noffset = {offset}\n"
+        ));
+        let o = e.evaluate(&temps(&[("cpu", 60.0)]), s(0));
+        assert_eq!(o["cpu"], 60.0, "offset {offset}");
+    }
+}

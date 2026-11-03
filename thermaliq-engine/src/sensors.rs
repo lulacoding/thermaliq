@@ -52,6 +52,10 @@ impl SensorEngine {
                     h.iter().map(|(_, t)| t).sum::<f32>() / h.len() as f32
                 }),
             };
+            // A real reading wins over a custom sensor with the same id.
+            if real.contains_key(id_of(s)) {
+                continue;
+            }
             if let Some(v) = value.filter(|v| valid_temp(*v)) {
                 out.insert(id_of(s).to_string(), v);
             }

@@ -317,3 +317,12 @@ fn file_sensor_is_out_of_scope() {
     // SPEC §2: `file` moved to v2.1
     err("[[sensors]]\nid = \"ext\"\ntype = \"file\"\npath = \"C:/temp.txt\"\n");
 }
+
+#[test]
+fn time_average_window_is_capped_at_one_hour() {
+    let s = |t: u32| {
+        format!("[[sensors]]\nid=\"a\"\ntype=\"time_average\"\nsource=\"s\"\ntime_s={t}\n")
+    };
+    assert!(parse(&s(3600)).is_ok());
+    assert!(err(&s(3601)).contains("time_s"));
+}
