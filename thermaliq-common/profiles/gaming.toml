@@ -1,0 +1,66 @@
+# Sensor and fan IDs here (cpu_package, gpu_edge, chassis1, ...) are role IDs, not real hardware IDs.
+# The first-run mapping (PORTING M13) translates them to this PC's hardware before the profile is used.
+
+name = "gaming"
+description = "Aggressive CPU and GPU curves, chassis reacts to load"
+
+[[curves]]
+id = "cpu_aggressive"
+type = "linear"
+source = "cpu_package"
+min_temp = 35
+max_temp = 75
+min_pwm = 35
+max_pwm = 100
+
+[[curves]]
+id = "gpu_curve"
+type = "linear"
+source = "gpu_edge"
+min_temp = 35
+max_temp = 75
+min_pwm = 35
+max_pwm = 100
+
+[[curves]]
+id = "chassis_gaming"
+type = "trigger"
+source = "cpu_package"
+idle_temp = 45
+idle_pwm = 35
+load_temp = 70
+load_pwm = 90
+response_ms = 2000
+
+[[controls]]
+fan = "cpu1"
+curve = "cpu_aggressive"
+step_up_pct = 15
+step_down_pct = 3
+min_pwm = 35
+
+[[controls]]
+fan = "gpu1"
+curve = "gpu_curve"
+step_up_pct = 15
+step_down_pct = 3
+min_pwm = 35
+
+[[controls]]
+fan = "chassis1"
+curve = "chassis_gaming"
+step_up_pct = 15
+step_down_pct = 3
+min_pwm = 35
+
+[[alerts]]
+sensor = "cpu_package"
+threshold = 85
+severity = "warn"
+action = { type = "notify" }
+
+[[alerts]]
+sensor = "gpu_edge"
+threshold = 85
+severity = "crit"
+action = { type = "notify" }

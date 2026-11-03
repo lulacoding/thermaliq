@@ -1,0 +1,47 @@
+# Sensor and fan IDs here (cpu_package, gpu_edge, chassis1, ...) are role IDs, not real hardware IDs.
+# The first-run mapping (PORTING M13) translates them to this PC's hardware before the profile is used.
+
+name = "balanced"
+description = "Default: moderate noise and temperatures"
+
+[[curves]]
+id = "cpu"
+type = "linear"
+source = "cpu_package"
+min_temp = 40
+max_temp = 80
+min_pwm = 30
+max_pwm = 100
+
+[[curves]]
+id = "gpu"
+type = "linear"
+source = "gpu_edge"
+min_temp = 40
+max_temp = 80
+min_pwm = 30
+max_pwm = 100
+
+[[controls]]
+fan = "chassis1"
+curve = "cpu"
+step_down_pct = 3
+min_pwm = 30
+
+[[controls]]
+fan = "gpu1"
+curve = "gpu"
+step_down_pct = 3
+min_pwm = 30
+
+[[alerts]]
+sensor = "cpu_package"
+threshold = 85
+severity = "warn"
+action = { type = "notify" }
+
+[[alerts]]
+sensor = "cpu_package"
+threshold = 92
+severity = "crit"
+action = { type = "log" }
