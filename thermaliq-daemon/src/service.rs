@@ -24,7 +24,7 @@ const WAIT_HINT: Duration = Duration::from_secs(10);
 pub const STOP_BUDGET: Duration = Duration::from_secs(8);
 
 /// Locks the data dir, then registers the service (LocalSystem, automatic start).
-pub fn install() -> Result<(), String> {
+pub fn install(force: bool) -> Result<(), String> {
     app::hardware()?; // don't install a service that can only refuse to start
     let dir = store::data_dir().map_err(|e| e.to_string())?;
     // Opening the SCM first fails fast without elevation, before the dir is touched.
@@ -32,7 +32,8 @@ pub fn install() -> Result<(), String> {
         ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CREATE_SERVICE)
             .map_err(|e| format!("cannot open the service manager (run as Administrator): {e}"))?;
     let sid = acl::installer_sid().map_err(|e| e.to_string())?;
-    acl::lock_data_dir(&dir, &sid).map_err(|e| format!("cannot lock {}: {e}", dir.display()))?;
+    acl::lock_data_dir(&dir, &sid, force)
+        .map_err(|e| format!("cannot lock {}: {e}", dir.display()))?;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let info = ServiceInfo {
         name: NAME.into(),

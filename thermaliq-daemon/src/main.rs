@@ -9,7 +9,7 @@ use std::time::Duration;
 use thermaliq_daemon::app::{self, Token};
 use thermaliq_daemon::store;
 
-const USAGE: &str = "usage: thermaliq-daemon [install-service | uninstall-service]";
+const USAGE: &str = "usage: thermaliq-daemon [install-service [--force] | uninstall-service]";
 /// Same budget as the service stop.
 const STOP_BUDGET: Duration = Duration::from_secs(8);
 
@@ -20,13 +20,16 @@ fn main() -> ExitCode {
         #[cfg(windows)]
         ["--service"] => thermaliq_daemon::service::run(),
         #[cfg(windows)]
-        ["install-service"] => thermaliq_daemon::service::install()
-            .map(|()| eprintln!("service installed; start it with: sc start ThermalIQ")),
+        ["install-service"] | ["install-service", "--force"] => {
+            thermaliq_daemon::service::install(args.len() == 2)
+                .map(|()| eprintln!("service installed; start it with: sc start ThermalIQ"))
+        }
         #[cfg(windows)]
         ["uninstall-service"] => thermaliq_daemon::service::uninstall()
             .map(|()| eprintln!("service removed (the data directory was left in place)")),
         #[cfg(not(windows))]
-        ["--service" | "install-service" | "uninstall-service"] => {
+        ["--service" | "install-service" | "uninstall-service"]
+        | ["install-service", "--force"] => {
             Err("the Windows service is only available on Windows".into())
         }
         _ => Err(USAGE.into()),
