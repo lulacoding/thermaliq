@@ -31,7 +31,14 @@ The agent should use a **Jev-style decision model, not an LLM**: fast, structure
 
 **Important nuance:** the open alternatives don't generate text, but they **are built on LLM backbones** (Qwen) with the text-generating head removed and a scoring head added. Only Jev's internals are unknown.
 
-## Questions the M20 brainstorm must answer
+## Re-check, 2026-11-04 (agent brainstorm)
+
+- Jev is now at **1.14** (2026-10-14) and is listed on OpenRouter (`typesafe/jev-1.14`). It's still hosted-only. Answer types: yes/no, pick one of up to 255 options, or a score on an ordered scale, each with a calibrated confidence. TypeSafe suggests higher thresholds for irreversible actions.
+- **Strands Decider 2B on the CPU is slow:** 1.6–18 s per decision (byteiota, measured on AgentCore CPU microVMs). On the GPU it's ~115 ms (RTX 3090). v21 scores about 0.76 on JevBench. The local HTTP server binds to 127.0.0.1 with no auth.
+- New in the same class: OpenAI Decisions API (limited preview), Microsoft-Decision-1, Perplexity pplx-decider-v1.1-27b, Cloudflare clef-omni (multimodal). Clef-flash is now cheaper than Jev.
+- The result is in SPEC §7: a fast layer (own small models, CPU, every tick) plus a slow layer (decision model every 60 s / on app change, hosted Jev if a key is set, local otherwise, both voting on big calls).
+
+## Questions the M20 brainstorm answered (see SPEC §7)
 
 1. **GPU contention while gaming.** A 2B–9B model on the same GPU as the game costs VRAM and GPU time. Can it run on CPU fast enough at a 5 s agent tick? Measure it on Sam's PC.
 2. **Input type.** Decision models read text or JSON state. ThermalIQ's inputs are mostly numbers over time (temperatures, slopes, load, foreground app). Check how well they handle numeric windows.
@@ -50,4 +57,8 @@ The agent should use a **Jev-style decision model, not an LLM**: fast, structure
 - [The New Stack: Strands Decider 2B](https://thenewstack.io/aws-strands-decider-model/)
 - [iThome: Strands Decider architecture and latency](https://www.ithome.com.tw/news/179373)
 - [eesel: Strands Decider tested, JevBench chart](https://www.eesel.ai/blog/strands-decider)
+- [OpenRouter: Jev 1.14](https://openrouter.ai/typesafe/jev-1.14/providers)
+- [byteiota: Strands Decider CPU vs GPU latency](https://byteiota.com/?p=25326)
+- [ecosistemastartup: TypeSafe Series A, competing decision models](https://ecosistemastartup.com/typesafe-startup-de-modelos-de-decisiones-levanta-us870m/)
+- [MarkTechPost: Strands Decider 2B release](https://www.marktechpost.com/2026/10/01/aws-strands-labs-releases-strands-decider-2b/)
 - [Towards AI: running Jev locally, Ollaya](https://pub.towardsai.net/can-you-run-jev-locally-we-checked-520-jev-clients-only-193-switch-to-ollaya-with-one-setting-1d7e48e22e05)

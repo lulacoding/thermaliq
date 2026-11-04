@@ -9,7 +9,7 @@ Reference: the v0 code is tagged `v0-archive` (see `PORTING.md`). The audit that
 **The agent is the product** (decided by Sam, 2026-11-04). ThermalIQ is not a manual fan-control tool with an optional AI add-on. Instead of the user building curves and configuring every system fan, GPU fan, CPU cooler and AIO pump, the agent:
 
 1. **Sets up:** finds every fan and pump, calibrates each one, and works out which fan cools what by spinning each and watching which temperatures change.
-2. **Runs:** a Jev-style decision model (not an LLM) reads the live state every few seconds and picks the right behaviour for the workload.
+2. **Runs:** every second, a small learned model predicts temperatures and adjusts fans to the user's quiet ↔ cool goal, during gaming too. A Jev-style decision model (not an LLM) makes the bigger calls: which profile, whether to accept a learned curve.
 3. **Improves over time:** learns from history which settings meet the user's temperature goals with the least noise, per workload, and keeps tuning.
 
 All of this happens inside the SPEC §3 safety rules, which the agent can never override. Manual curves stay available as an advanced option. Underneath is a background service with a desktop UI, a CLI and a local API. Local-first: no cloud, no telemetry. A hosted decision model is only used if the user opts in.
@@ -30,7 +30,7 @@ All of this happens inside the SPEC §3 safety rules, which the agent can never 
 | Alerts: log + notify + apply-profile | |
 | Tauri UI, `tq` CLI, HTTP API + WebSocket | |
 | LLM profile generation (one OpenAI-compatible provider) | Multiple LLM providers |
-| Agent with a Jev-style decision provider | Predictive thermal model |
+| Agent (§7): setup, live optimiser with a learned thermal model, Jev-style decision provider, learning | Agent-only curve types in profiles (the agent writes normal curves) |
 
 Anything not in the left column does not get code, stubs, enum variants, UI, or docs claiming it exists.
 
@@ -66,7 +66,8 @@ The engine resolves this every tick. A lower source never overwrites a higher on
 thermaliq-common   types, config + profile schema, validation (no IO beyond parsing)
 thermaliq-hal      HardwareLayer trait, mock, platform backends
 thermaliq-engine   control loop: curves, sensors, priority, safety, ramping (pure logic + HAL trait)
-thermaliq-daemon   wiring: config/paths, history DB, HTTP API, WebSocket, service, agent
+thermaliq-agent    agent logic (§7): thermal model, classifier, live optimiser, decision routing (no HAL; submits to the engine)
+thermaliq-daemon   wiring: config/paths, history DB, HTTP API, WebSocket, service, agent thread
 thermaliq-cli      `tq` — talks to the daemon over HTTP
 bridges/lhm-bridge (later) .NET sidecar for Windows motherboard fans, JSON over a named pipe
 thermaliq-ui       (later) Tauri 2 + React
@@ -88,12 +89,52 @@ One snapshot per tick, cached and shared. API reads use the cache, never the har
 
 ## 7. Agent
 
-*Being redesigned in the M20 brainstorm (now first in PORTING's brainstorm list). The lines below are the pre-2026-11-04 draft. The brainstorm replaces them with setup, runtime and learning, and the inputs they need (load %, power, foreground app, as well as temperatures).*
+Decided in the agent brainstorm (Sam, 2026-11-04). Research: `docs/dev/research/decision-models.md`.
 
-- Modes: **passive** (observe and log), **approval** (propose; you approve or reject each change), **autonomous** (apply within the rate limit).
-- Every 5 s: builds a JSON state (5-min temperature window, slopes, foreground app, active profile) and asks a decision provider two typed questions: workload `[idle, gaming, compiling, encoding, stress]` and action `[none, propose, apply]`, with confidence.
-- `DecisionProvider` speaks the Jev API format and reads `TYPESAFE_BASE_URL`. Default: a local runner (Ollaya + open decision model). Real Jev: optional, user's key. No endpoint → threshold fallback.
-- Agent requests go through the engine at priority 3. Max 6 interventions per hour. The agent never runs inside the fan loop.
+**Ground rules.** The agent is a separate thread, never inside the engine loop. It reads the cached snapshot and history and only *submits* to the engine (S1): duty requests at priority 3 with a short expiry, and profile or curve changes through the normal validated config path. If it stops or crashes, its requests expire and the active profile takes over. It cannot see or change the S2–S4 thresholds. It never stops a pump, and never sets a fan below the profile's minimum.
+
+**Inputs.** Temperatures, CPU/GPU load %, power (W), clocks and GPU throttle reasons (Metrics module), fan duty and RPM, the foreground app's exe name (never window titles or file contents), and time of day.
+
+**Goal.** A quiet ↔ cool slider (0–100) per workload. Quiet = the lowest noise that keeps temps under safe targets. Cool = keep the GPU and CPU cool enough to hold full boost (no thermal throttling). Defaults: gaming leans cool, browsing and idle lean quiet.
+
+### 7.1 Setup (first run, and again when hardware changes)
+
+1. Discover every fan and pump (M10–M13 backends).
+2. Calibrate each fan at priority 2 (time-limited): start %, stop %, max RPM. Pumps are measured, never stopped.
+3. Map fans to components: raise one fan at a time under a steady load and watch which temperatures drop. A clear result is applied. An unclear one is asked of the decision model, then of the user if the model isn't confident.
+4. Write a starting profile per workload from the mapping, and record a baseline for the thermal model.
+
+### 7.2 Runtime
+
+**Fast layer: every tick (1 s), CPU only, microseconds, always on, including while gaming.**
+- *Workload classifier:* small gradient-boosted trees over the inputs give idle / browsing / gaming / compiling / rendering / other. It is trained on history labelled by the slow layer and by the user's corrections.
+- *Thermal model:* small, learned per component. It predicts each controlled temperature 10–30 s ahead from duty, load and power.
+- *Live optimiser:* it adjusts each fan up or down from its curve output to meet the slider target. Ramping up early for a predicted spike counts as a **short boost**, which expires in ≤ 60 s. Limits: it may raise any fan freely. It may lower a fan by at most 15 points below the curve output, and only while every temperature that fan cools is under its target and predicted to stay there. Requests expire in 3 s and are renewed every tick.
+
+**Slow layer: every 60 s and whenever the foreground app changes. Decision model, not an LLM.**
+- Typed questions with confidence: the workload for an app not seen before (cached per exe afterwards); which profile to use; whether to accept a learned curve or a new profile.
+- **Provider routing:** hosted Jev when the user has added a key (OS keychain), is online, and gets an answer within 2 s. Otherwise local: an open decision model (Strands Decider / Clef-flash class) behind an Ollaya-compatible endpoint (`TYPESAFE_BASE_URL`). The local model runs on one CPU core at background priority. It is loaded on demand and unloaded after use, so it isn't resident in VRAM. It may use the GPU only while GPU load is < 50%.
+- **Big calls** (accept a learned curve, create a profile): when both providers are available, both answer. Agreement → apply. Disagreement → ask the user.
+- Hosted requests contain numbers and exe names only. The user can turn hosted off at any time.
+- No provider available: the fast layer keeps running, the slow layer's calls queue as questions for the user, and nothing pretends to have decided (S8).
+
+### 7.3 Learning (when the PC is idle)
+
+Retrain the classifier and the thermal models on history. Search curve changes per workload that meet the slider target with less noise, using the thermal model, and only within validated profile rules (monotonic, within 0–100, at or above minimums). The results are proposals for the slow layer.
+
+### 7.4 Autonomy and reporting
+
+- **Modes:** *observe* (log what it would do), *ask* (propose every change), *auto* (**default**). In auto, a change is applied when the decision's confidence is ≥ its threshold and asked otherwise. Thresholds are higher for bigger changes.
+- **The agent may:** pick a profile per app, tune curves, create profiles, run short boosts and live adjustments. Slow-layer changes are limited to 6 per hour. Fast-layer adjustments are bounded by §7.2 instead.
+- **Activity feed** in the UI and API: every applied change with its reason and confidence, one-click undo (restores the previous profile or curve exactly), and a Windows toast only when it needs the user to answer.
+
+### 7.5 Evaluation (tests + M20 spike on Sam's PC)
+
+- Decisions: Brier score and accuracy against labelled history and user accept/undo.
+- Thermal model: mean error at 20 s ahead, ≤ 2 °C on held-out history.
+- Live optimiser: in mock-hardware tests, it never lowers a fan whose temperature is over target or predicted over target, and never goes past the 15-point limit.
+- Gaming cost: the local CPU decision model's FPS cost in a real game must be < 2% (average FPS, same scene, with and without it). If it fails, the local model doesn't run while a game is in the foreground, and its calls queue until the game closes.
+- Latency: the fast layer takes < 1 ms per tick. Slow-layer timing is logged per provider.
 
 ## 8. Gates (real hardware, run by Sam on the Windows PC)
 
@@ -109,7 +150,8 @@ A module is done when its tests pass in CI on Windows, macOS and Ubuntu runners 
 
 Decided 2026-11-04 by Sam:
 
-- Agent modes: 3 — passive, approval, autonomous.
+- Agent modes: 3 — observe, ask, auto. Auto is the default and applies above a confidence threshold, asking below it (agent brainstorm, §7).
+- Agent decision provider: hosted Jev if a key is set and online, local open model otherwise. Both vote on big calls (§7.2).
 - Linux moves to v2.1. v2.0 is Windows-only. CI still builds and tests on Ubuntu and macOS with mock hardware.
 - HWiNFO stays as an optional extra sensor source once the LHM bridge works.
 - LLM for profile generation: OpenRouter by default; any OpenAI-compatible base URL (e.g. local Ollama) can be configured.
