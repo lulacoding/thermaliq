@@ -19,3 +19,8 @@ unsafe_code = "deny"
 
 [workspace.lints.clippy]
 unwrap_used = "warn"
+
+# SPEC S5: Engine::drop hands fans back on panic, which needs unwinding.
+# Never set panic = "abort" (v0's Tauri crate did).
+[profile.release]
+panic = "unwind"

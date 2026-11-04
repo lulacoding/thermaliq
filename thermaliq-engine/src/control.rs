@@ -19,7 +19,7 @@ impl Source {
     }
 }
 
-struct Request {
+pub(crate) struct Request {
     source: Source,
     duty: u8,
     expires_at: Option<Duration>,
@@ -70,6 +70,19 @@ impl FanControl {
             expires_at,
         });
         Ok(())
+    }
+
+    /// Everything except the profile's own request, for carrying across a profile switch.
+    pub(crate) fn take_requests(&mut self) -> Vec<Request> {
+        let (keep, take) = std::mem::take(&mut self.requests)
+            .into_iter()
+            .partition(|r| r.source == Source::Profile);
+        self.requests = keep;
+        take
+    }
+
+    pub(crate) fn put_requests(&mut self, requests: Vec<Request>) {
+        self.requests.extend(requests);
     }
 
     /// Drops a source's request, e.g. an app closed or its curve has no valid input.
