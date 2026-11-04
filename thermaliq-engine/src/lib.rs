@@ -1,14 +1,16 @@
 //! The control loop: curves, sensors, priority, safety, ramping.
 //! The only crate allowed to write to fans (SPEC.md §3, S1).
 //!
-//! Modules M3–M5 (PORTING.md): curves and custom sensors so far.
+//! Modules M3–M5 (PORTING.md): curves, sensors, priority/ramping, safety.
 
 mod control;
 mod curves;
+mod engine;
 mod sensors;
 
 pub use control::{FanControl, Source};
 pub use curves::CurveEngine;
+pub use engine::Engine;
 pub use sensors::SensorEngine;
 
 use std::collections::HashMap;
