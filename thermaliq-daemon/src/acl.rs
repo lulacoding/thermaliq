@@ -56,10 +56,18 @@ pub fn lock_data_dir(dir: &Path, installer_sid: &str) -> io::Result<()> {
     }
     std::fs::create_dir_all(dir)?;
     let d = dir.to_string_lossy();
-    // Users are added last, so a token created in between never inherits a Users entry.
+    // A CREATOR OWNER entry on the parent turns into an explicit full-control entry for
+    // whoever created the dir, and survives `/inheritance:r`. Drop the installer's own entry
+    // (it gets Users' read below); SYSTEM and Administrators are granted again just after.
     icacls(&[
         &d,
         "/inheritance:r",
+        "/remove:g",
+        &format!("*{installer_sid}"),
+    ])?;
+    // Users are added last, so a token created in between never inherits a Users entry.
+    icacls(&[
+        &d,
         "/grant:r",
         &format!("{SYSTEM}:(OI)(CI)F"),
         &format!("{ADMINS}:(OI)(CI)F"),
