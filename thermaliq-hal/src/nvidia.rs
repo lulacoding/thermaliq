@@ -541,7 +541,7 @@ mod tests {
 
     /// Real GPU. Run: `cargo test -p thermaliq-hal -- --ignored nvidia --nocapture`. Needs an
     /// elevated shell; moves the first controllable fan to 75 % (or 35 %), kept
-    /// inside the range the driver allows, for 5 s.
+    /// inside the range the driver allows, until it gets there (20 s at most).
     #[cfg(windows)]
     #[test]
     #[ignore = "needs an NVIDIA GPU with a controllable fan and admin rights"]
@@ -577,11 +577,17 @@ mod tests {
             .expect("no target 20+ points from the current duty inside the allowed range");
         let target = target as u8;
         hw.set_fan_duty(&id, target).unwrap();
-        for s in 1..=5 {
+        // The readback follows the fan's own slew (0 -> 65 % took 5 s on the dev card), so wait
+        // for the target instead of reading once.
+        let mut during = before;
+        for s in 1..=20 {
             std::thread::sleep(Duration::from_secs(1));
-            println!("  +{s} s: {} %", duty(&hw));
+            during = duty(&hw);
+            println!("  +{s} s: {during} %");
+            if during.abs_diff(target) <= 2 {
+                break;
+            }
         }
-        let during = duty(&hw);
         println!("{id}: {before} % -> {during} % (asked for {target})");
         assert!(
             during.abs_diff(target) <= 2,
