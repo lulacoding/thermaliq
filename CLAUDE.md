@@ -4,9 +4,9 @@ Rust fan-control daemon rebuilt from an empty tree. Safety first.
 
 ## Every session
 
-1. Read `HANDOFF.md` (where we are), then the relevant part of `SPEC.md`, then the next unticked item in `PORTING.md`.
+1. Read `docs/dev/HANDOFF.md` (where we are), then the relevant part of `SPEC.md`, then the next unticked item in `PORTING.md`.
 2. Work on ONE module. Write the failing test first, from SPEC, then the code.
-3. Before ending: tests green, tick `PORTING.md` only if CI-green + reviewed, rewrite `HANDOFF.md` (≤ 15 lines), commit.
+3. Before ending: tests green, tick `PORTING.md` only if CI-green + reviewed, rewrite `docs/dev/HANDOFF.md` (≤ 15 lines), commit.
 
 ## Reference code (v0)
 
@@ -32,8 +32,8 @@ Rust fan-control daemon rebuilt from an empty tree. Safety first.
 
 ## Memory
 
-- `HANDOFF.md` is the shared memory across sessions and machines (Mac + Windows PC). It's committed.
-- Claude Code auto memory is on (`.claude/settings.json`) for machine-local learnings. Anything both machines need goes in `HANDOFF.md` or this file, not auto memory.
+- `docs/dev/HANDOFF.md` is the shared memory across sessions and machines (Mac + Windows PC). It's committed.
+- Claude Code auto memory is on (`.claude/settings.json`) for machine-local learnings. Anything both machines need goes in `docs/dev/HANDOFF.md` or this file, not auto memory.
 
 ## Commands
 

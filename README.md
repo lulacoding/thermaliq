@@ -6,7 +6,7 @@ Safe, local-first fan control for Windows, with an optional AI agent. Linux foll
 
 - `SPEC.md` — what v2 is, scope, safety rules
 - `PORTING.md` — module checklist (the only progress tracker)
-- `HANDOFF.md` — where the last session stopped
+- `docs/dev/HANDOFF.md` — where the last session stopped
 - v0 code: tag `v0-archive`
 
 ## Dev setup
