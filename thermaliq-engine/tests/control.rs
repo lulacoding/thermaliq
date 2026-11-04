@@ -114,3 +114,60 @@ fn without_zero_rpm_config_the_fan_never_stops() {
     c.submit(Source::Profile, 0, None).unwrap();
     assert_eq!(c.tick(T0), Some(0)); // curve asked for 0: that is the duty, no latch involved
 }
+
+#[test]
+fn withdraw_falls_back_to_next_source() {
+    let mut c = ctl(100, 100, 0, None);
+    c.submit(Source::Profile, 30, None).unwrap();
+    c.submit(Source::AppRule, 80, None).unwrap();
+    assert_eq!(c.tick(T0), Some(80));
+    c.withdraw(Source::AppRule);
+    assert_eq!(c.tick(T0), Some(30));
+}
+
+#[test]
+fn withdrawing_every_source_gives_none_not_a_stale_duty() {
+    let mut c = ctl(100, 100, 0, None);
+    c.submit(Source::Profile, 30, None).unwrap();
+    assert_eq!(c.tick(T0), Some(30));
+    c.withdraw(Source::Profile);
+    assert_eq!(c.tick(T0), None);
+}
+
+#[test]
+fn seed_starts_ramping_from_the_real_fan() {
+    let mut c = ctl(10, 3, 0, None);
+    c.seed(20, true);
+    c.submit(Source::Profile, 80, None).unwrap();
+    assert_eq!(c.tick(T0), Some(30));
+}
+
+#[test]
+fn seed_of_a_stopped_fan_without_zero_rpm_config_still_drives_it() {
+    let mut c = ctl(100, 100, 0, None);
+    c.seed(0, false);
+    c.submit(Source::Profile, 50, None).unwrap();
+    assert_eq!(c.tick(T0), Some(50));
+}
+
+#[test]
+fn seed_of_a_stopped_fan_stays_stopped_until_above_start() {
+    let mut c = ctl(10, 3, 0, Some((30, 20)));
+    c.seed(0, false);
+    c.submit(Source::Profile, 30, None).unwrap();
+    assert_eq!(c.tick(T0), Some(0));
+    c.submit(Source::Profile, 31, None).unwrap();
+    assert_eq!(c.tick(T0), Some(31));
+}
+
+#[test]
+fn restart_jumps_to_start_percent_then_ramps() {
+    let mut c = ctl(10, 100, 0, Some((30, 20)));
+    c.submit(Source::Profile, 50, None).unwrap();
+    c.tick(T0);
+    c.submit(Source::Profile, 10, None).unwrap();
+    assert_eq!(c.tick(T0), Some(0));
+    c.submit(Source::Profile, 60, None).unwrap();
+    assert_eq!(c.tick(T0), Some(40)); // jump to 30, then +10: never 10 or 20
+    assert_eq!(c.tick(T0), Some(50));
+}

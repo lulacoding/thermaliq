@@ -50,6 +50,8 @@ Every one of these has an automated test before any code that writes to real fan
 5. Schedule
 6. User's chosen profile
 
+0-RPM: a running fan stops at or below `stop_percent`; a stopped fan restarts only above `start_percent`, jumping straight to at least `start_percent`.
+
 The engine resolves this every tick. A lower source never overwrites a higher one. A profile change ramps using that fan's `step_up_pct` / `step_down_pct`; safety does not ramp.
 
 ## 5. Architecture

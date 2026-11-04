@@ -72,26 +72,41 @@ impl FanControl {
         Ok(())
     }
 
+    /// Drops a source's request, e.g. an app closed or its curve has no valid input.
+    pub fn withdraw(&mut self, source: Source) {
+        self.requests.retain(|r| r.source != source);
+    }
+
+    /// Start ramping from the fan's real state (first snapshot) instead of jumping.
+    pub fn seed(&mut self, duty: u8, spinning: bool) {
+        self.last = Some(duty.min(100));
+        self.running = spinning;
+    }
+
     /// The duty to write this tick, or `None` when nothing is requesting one
     /// (the caller decides; M5 turns missing input into S3).
     pub fn tick(&mut self, now: Duration) -> Option<u8> {
         self.requests
             .retain(|r| r.expires_at.is_none_or(|e| now < e));
         let want = self.requests.iter().min_by_key(|r| r.source)?.duty.min(100);
+        let mut last = self.last;
         if let Some((start, stop)) = self.zero_rpm {
             // v0 semantics: stop at or below stop, restart strictly above start.
             if self.running && want <= stop {
                 self.running = false;
             } else if !self.running && want > start {
                 self.running = true;
+                // Don't ramp through duties below the fan's own start threshold.
+                last = last.map(|l| l.max(start));
             }
         }
-        let target = if self.running {
+        // `running` only gates fans with 0-RPM configured; seed() may set it false for any fan.
+        let target = if self.running || self.zero_rpm.is_none() {
             want.max(self.min_pwm).min(100)
         } else {
             0
         };
-        let out = match self.last {
+        let out = match last {
             None => target,
             Some(l) if target > l => l.saturating_add(self.step_up).min(target),
             Some(l) => l.saturating_sub(self.step_down).max(target),
