@@ -22,6 +22,6 @@ if (-not (Test-Path ..\thermaliq-v0)) {
 
 Write-Host ""
 Write-Host "Done. Restart Claude Code in this folder."
-Write-Host "Ponytail: accept the plugin prompt on first start, or run:"
+Write-Host "Optional: install Ponytail with:"
 Write-Host "  /plugin marketplace add DietrichGebert/ponytail"
 Write-Host "  /plugin install ponytail@ponytail"
