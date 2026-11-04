@@ -14,7 +14,7 @@ const RELEASE_HOLD: Duration = Duration::from_secs(30);
 /// SPEC S3/S4: consecutive ticks before a fault is acted on.
 const FAULT_TICKS: u8 = 3;
 /// A pump is never written below this (SPEC §7: never stop a pump).
-/// shortcut: one fixed floor for every pump; take it from the pump's calibration (M20a) when that exists.
+/// shortcut: one fixed floor for every pump; take it from the pump's calibration (M20d) when that exists.
 const PUMP_MIN_DUTY: u8 = 20;
 
 /// S2: trips on a hot CPU or GPU; releases after 30 s continuously cool.
@@ -265,12 +265,13 @@ impl Engine {
         };
         self.snapshot_fails = 0;
         self.last = Some(snap.clone());
-        self.pumps = snap
-            .fans
-            .iter()
-            .filter(|f| f.kind == FanKind::Pump)
-            .map(|f| f.id.clone())
-            .collect();
+        // Sticky: a pump that drops out of one snapshot (backend hiccup) is still a pump.
+        self.pumps.extend(
+            snap.fans
+                .iter()
+                .filter(|f| f.kind == FanKind::Pump)
+                .map(|f| f.id.clone()),
+        );
         for f in self.fans.iter_mut().filter(|f| !f.seeded) {
             if let Some(r) = snap.fans.iter().find(|r| r.id == f.id) {
                 f.ctl.seed(r.duty_percent, r.rpm > 0);
@@ -437,6 +438,52 @@ step_down_pct = 100
         };
         assert!(duty("f1").contains(&0), "the plain fan does stop");
         assert!(duty("f2").iter().all(|&d| d > 0), "{:?}", duty("f2"));
+    }
+
+    /// Delegates to the mock but drops the fan list from the `gap`-th snapshot (0-based).
+    struct FansMissingOnce(
+        Arc<MockHardwareLayer>,
+        std::sync::atomic::AtomicUsize,
+        usize,
+    );
+    impl HardwareLayer for FansMissingOnce {
+        fn snapshot(&self) -> Result<HardwareSnapshot, thermaliq_hal::HalError> {
+            let mut s = self.0.snapshot()?;
+            if self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == self.2 {
+                s.fans.clear();
+            }
+            Ok(s)
+        }
+        fn set_fan_duty(&self, f: &str, d: u8) -> Result<(), thermaliq_hal::HalError> {
+            self.0.set_fan_duty(f, d)
+        }
+        fn restore_auto(&self, f: &str) -> Result<(), thermaliq_hal::HalError> {
+            self.0.restore_auto(f)
+        }
+        fn capabilities(&self) -> thermaliq_hal::Capabilities {
+            self.0.capabilities()
+        }
+    }
+
+    #[test]
+    fn a_pump_missing_from_one_snapshot_stays_a_pump() {
+        let mock = Arc::new(MockHardwareLayer::new(&["f1", "f2"], vec![at(30.0, 30.0)]).pump("f2"));
+        let hal = Arc::new(FansMissingOnce(mock.clone(), 0.into(), 1));
+        let p = zero_rpm_profile();
+        let mut e = Engine::new(hal, &p);
+        e.tick(secs(0));
+        assert!(e.check_profile(&p).is_err());
+        e.tick(secs(1)); // pump absent from this snapshot
+        assert!(e.check_profile(&p).is_err(), "still rejected after the gap");
+        e.tick(secs(2));
+        let f2: Vec<u8> = mock
+            .writes()
+            .iter()
+            .filter(|(f, _)| f == "f2")
+            .map(|&(_, d)| d)
+            .collect();
+        assert_eq!(f2.len(), 3);
+        assert!(f2.iter().all(|&d| d >= PUMP_MIN_DUTY), "{f2:?}");
     }
 
     #[test]
