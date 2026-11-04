@@ -49,7 +49,8 @@ pub fn install(force: bool) -> Result<(), String> {
         account_password: None,
     };
     let service = manager
-        .create_service(&info, ServiceAccess::CHANGE_CONFIG)
+        // START as well: the SCM refuses Restart failure actions on a handle without it.
+        .create_service(&info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)
         .map_err(|e| format!("cannot create the service: {e}"))?;
     service
         .set_description(
