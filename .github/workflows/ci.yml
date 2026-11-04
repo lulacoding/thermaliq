@@ -29,6 +29,8 @@ jobs:
       - run: cargo test --workspace
       - run: cargo clippy -p thermaliq-daemon --all-targets --features mock-hardware -- -D warnings
       - run: cargo test -p thermaliq-daemon --features mock-hardware
+      - run: cargo clippy -p thermaliq-daemon --all-targets --features gate-tests -- -D warnings
+      - run: cargo test -p thermaliq-daemon --features gate-tests,mock-hardware
       - name: Service smoke test
         if: runner.os == 'Windows'
         shell: pwsh

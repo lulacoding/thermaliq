@@ -25,6 +25,8 @@ windows-service = "0.8"
 [features]
 # Fake hardware for dev and CI. A build without it refuses to start (no backend until M10).
 mock-hardware = []
+# Gate G1 fault injection (THERMALIQ_INJECT_CPU_TEMP). Debug builds only; release refuses to compile.
+gate-tests = []
 
 [dev-dependencies]
 futures-util = "0.3"

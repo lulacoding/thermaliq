@@ -7,6 +7,10 @@ $dir = Join-Path $env:ProgramData 'ThermalIQ'
 & $exe install-service
 if ($LASTEXITCODE -ne 0) { throw "install-service failed" }
 try {
+    # G1: any crash restarts the service after 1 s, first, second and later failures.
+    $fail = sc.exe qfailure ThermalIQ | Out-String
+    if ([regex]::Matches($fail, 'RESTART -- Delay = 1000 milliseconds').Count -ne 3) { throw "recovery actions wrong:`n$fail" }
+
     Start-Service ThermalIQ
     $up = $false
     foreach ($i in 1..50) {
