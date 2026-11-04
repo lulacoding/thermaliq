@@ -23,8 +23,16 @@ pub enum Token {
     MustExist,
 }
 
-/// The hardware backend of this build. Fake hardware only exists behind `mock-hardware`.
+/// The hardware backend of this build, wrapped in fault injection under `gate-tests`.
 pub fn hardware() -> Result<Arc<dyn HardwareLayer>, String> {
+    let hal = backend()?;
+    #[cfg(feature = "gate-tests")]
+    let hal: Arc<dyn HardwareLayer> = Arc::new(crate::inject::InjectCpuTemp::new(hal));
+    Ok(hal)
+}
+
+/// Fake hardware only exists behind `mock-hardware`.
+fn backend() -> Result<Arc<dyn HardwareLayer>, String> {
     #[cfg(feature = "mock-hardware")]
     {
         use thermaliq_common::SensorKind;

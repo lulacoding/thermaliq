@@ -10,7 +10,8 @@ use std::io::Write;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use windows_service::service::{
-    ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
+    ServiceAccess, ServiceAction, ServiceActionType, ServiceControl, ServiceControlAccept,
+    ServiceErrorControl, ServiceExitCode, ServiceFailureActions, ServiceFailureResetPeriod,
     ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
 };
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
@@ -48,13 +49,31 @@ pub fn install(force: bool) -> Result<(), String> {
         account_password: None,
     };
     let service = manager
-        .create_service(&info, ServiceAccess::CHANGE_CONFIG)
+        // START as well: the SCM refuses Restart failure actions on a handle without it.
+        .create_service(&info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)
         .map_err(|e| format!("cannot create the service: {e}"))?;
     service
         .set_description(
             "Reads temperatures and drives fans from curves. Hands fans back to firmware on stop.",
         )
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    service
+        .update_failure_actions(recovery())
+        .map_err(|e| format!("cannot set crash recovery: {e}"))
+}
+
+/// Restart 1 s after a crash, every time (the SCM repeats the last action for later failures).
+fn recovery() -> ServiceFailureActions {
+    let restart = ServiceAction {
+        action_type: ServiceActionType::Restart,
+        delay: Duration::from_secs(1),
+    };
+    ServiceFailureActions {
+        reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(86_400)),
+        reboot_msg: None,
+        command: None,
+        actions: Some(vec![restart.clone(), restart.clone(), restart]),
+    }
 }
 
 /// Stops the service if it runs (waits for it), then deletes it. Leaves the data dir alone.
@@ -183,4 +202,25 @@ fn run_service() -> Result<(), String> {
     };
     report(ServiceState::Stopped, none, exit, 0, Duration::ZERO)?;
     stopped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recovery_restarts_after_one_second_on_every_failure() {
+        let r = recovery();
+        let actions = r.actions.expect("actions are set");
+        // The SCM reuses the last action for all later failures; three covers 1st, 2nd, later.
+        assert_eq!(actions.len(), 3);
+        for a in actions {
+            assert_eq!(a.action_type, ServiceActionType::Restart);
+            assert_eq!(a.delay, Duration::from_secs(1));
+        }
+        assert!(matches!(
+            r.reset_period,
+            ServiceFailureResetPeriod::After(_)
+        ));
+    }
 }

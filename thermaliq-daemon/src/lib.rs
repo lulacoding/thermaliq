@@ -5,6 +5,8 @@ pub mod acl;
 pub mod api;
 pub mod app;
 pub mod history;
+#[cfg(feature = "gate-tests")]
+pub mod inject;
 pub mod runtime;
 #[cfg(windows)]
 pub mod service;
