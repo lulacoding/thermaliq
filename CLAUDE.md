@@ -27,6 +27,7 @@ Rust fan-control daemon rebuilt from an empty tree. Safety first.
 - RTK is installed as a hook: Bash commands are compressed automatically. Prefer shell commands over Read/Grep for big outputs, and `rtk read <file> -l aggressive` to skim v0 files (signatures only).
 - Ponytail (plugin, `full` mode) keeps code minimal. Minimal never means removing a safety check, validation or error path.
 - Explore v0 with a subagent and get back a short summary; don't pull whole v0 files into the main context.
+- Run shell commands plainly so RTK can compress them: no | tail / | grep pipes, no cd … && chains, no here-docs. Create and edit files with the Write/Edit tools, not cat >, perl -pi or sed -i.
 - `/clear` between modules. Keep this file under 60 lines.
 
 ## Memory
