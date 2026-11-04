@@ -125,11 +125,20 @@ impl HardwareLayer for Hwinfo {
 pub(crate) fn kind_of(sensor_name: &str) -> SensorKind {
     if sensor_name.starts_with("CPU [#") {
         SensorKind::Cpu
-    } else if sensor_name.starts_with("GPU [#") {
+    } else if ["GPU [#", "dGPU [#", "iGPU [#"]
+        .iter()
+        .any(|p| sensor_name.starts_with(p))
+    {
         SensorKind::Gpu
     } else {
         SensorKind::Other
     }
+}
+
+/// GPU hot spot and memory junction readings (`Hot Spot`/`Hotspot`, `Junction`).
+fn is_hotter_than_core(label: &str) -> bool {
+    let l = label.to_ascii_lowercase();
+    l.contains("hot spot") || l.contains("hotspot") || l.contains("junction")
 }
 
 pub(crate) fn unix_now() -> i64 {
@@ -213,10 +222,12 @@ pub(crate) fn parse(buf: &[u8], now: i64) -> Result<HardwareSnapshot, HwinfoErro
             l if l.trim().is_empty() => text(&r[12..140]),
             l => l,
         };
-        // "Distance to TjMAX" is headroom, not a temperature: a low value would hide a hot core.
+        // "Distance to TjMAX" is headroom and "Thermal Limit" a threshold: neither is a
+        // measurement (a limit of 83 would hold the S2 latch forever).
         if u32_at(r, 0) != Some(READING_TYPE_TEMP)
             || !(value > -40.0 && value < 150.0)
             || label.contains("Distance to")
+            || label.contains("Limit")
         {
             continue;
         }
@@ -229,7 +240,11 @@ pub(crate) fn parse(buf: &[u8], now: i64) -> Result<HardwareSnapshot, HwinfoErro
         snap.sensors.push(thermaliq_common::SensorReading {
             id: format!("hwinfo_{sensor_id:08x}_{inst}_{reading_id:08x}"),
             label: format!("{label} ({name})"),
-            kind: kind_of(&name),
+            kind: match kind_of(&name) {
+                // SPEC S2 thresholds are for core temperature; these run hotter than the core.
+                SensorKind::Gpu if is_hotter_than_core(&label) => SensorKind::Other,
+                k => k,
+            },
             temp_celsius: value as f32,
         });
     }
@@ -363,7 +378,8 @@ mod tests {
         let kinds: Vec<_> = snap.sensors.iter().map(|s| s.kind).collect();
         use SensorKind::*;
         // The board chip's reading is labelled "CPU" but belongs to a motherboard group.
-        assert_eq!(kinds, [Cpu, Cpu, Gpu, Gpu, Other]);
+        // GPU Hot Spot is Other: only the core temperature feeds S2.
+        assert_eq!(kinds, [Cpu, Cpu, Gpu, Other, Other]);
     }
 
     #[test]
@@ -375,6 +391,11 @@ mod tests {
             ("CPU [#1]: Intel Xeon Gold 6130", Cpu),
             ("GPU [#0]: NVIDIA GeForce RTX 3080:", Gpu),
             ("GPU [#1]: AMD Radeon RX 6800 XT:", Gpu),
+            (
+                "dGPU [#0]: NVIDIA GeForce RTX 4060: PNY RTX 4060 VERTO",
+                Gpu,
+            ),
+            ("iGPU [#0]: AMD Radeon Graphics", Gpu),
             ("ASUS ROG STRIX X570-E GAMING (Nuvoton NCT6798D)", Other),
             ("Memory Timings", Other),
             ("S.M.A.R.T.: Samsung SSD 980 PRO 1TB (S5GXNF0R)", Other),
@@ -384,6 +405,88 @@ mod tests {
         ] {
             assert_eq!(kind_of(name), want, "{name}");
         }
+    }
+
+    /// Names exactly as HWiNFO printed them on a Ryzen 5 5600 / MSI B550M / RTX 4060 PC.
+    fn real_pc() -> Vec<Group> {
+        let ryzen = "CPU [#0]: AMD Ryzen 5 5600: Enhanced";
+        let board = "MSI B550M PRO-VDH WIFI (MS-7C95) (Nuvoton NCT6687D)";
+        let gpu = "dGPU [#0]: NVIDIA GeForce RTX 4060: PNY RTX 4060 VERTO";
+        vec![
+            (
+                0xF000_0501,
+                0,
+                ryzen,
+                vec![
+                    (TEMP, "CPU (Tctl/Tdie)", 56.6),
+                    (TEMP, "CPU Die (average)", 52.8),
+                    (TEMP, "CPU CCD1 (Tdie)", 60.8),
+                    (TEMP, "Core0 (CCD1)", 48.0),
+                    (TEMP, "L3 Cache (CCD1)", 47.8),
+                    (TEMP, "CPU IOD Hotspot", 47.8),
+                ],
+            ),
+            (
+                0xF700_6687,
+                0,
+                board,
+                vec![(TEMP, "CPU", 56.0), (TEMP, "System", 36.5)],
+            ),
+            (
+                0xF000_0100,
+                0,
+                "S.M.A.R.T.: ST2000DM008-2FR102 (WFL15P6V) [D:]",
+                vec![(TEMP, "Drive Temperature", 33.0)],
+            ),
+            (
+                0xE000_2000,
+                0,
+                gpu,
+                vec![
+                    (TEMP, "GPU Temperature", 47.3),
+                    (TEMP, "GPU Hot Spot Temperature", 55.6),
+                    (TEMP, "GPU Memory Junction Temperature", 60.0),
+                    (TEMP, "GPU Thermal Limit", 83.0),
+                ],
+            ),
+        ]
+    }
+
+    #[test]
+    fn real_pc_classification_is_pinned() {
+        use SensorKind::*;
+        let snap = parse(&build(NOW, &real_pc()), NOW).unwrap();
+        let kind = |label: &str| {
+            snap.sensors
+                .iter()
+                .find(|s| s.label.starts_with(&format!("{label} (")))
+                .unwrap_or_else(|| panic!("no sensor '{label}'"))
+                .kind
+        };
+        for cpu in [
+            "CPU (Tctl/Tdie)",
+            "CPU Die (average)",
+            "CPU CCD1 (Tdie)",
+            "Core0 (CCD1)",
+            "L3 Cache (CCD1)",
+            "CPU IOD Hotspot",
+        ] {
+            assert_eq!(kind(cpu), Cpu, "{cpu}");
+        }
+        assert_eq!(kind("GPU Temperature"), Gpu);
+        // Not the core: they run hotter than the core and must not feed the S2 latch.
+        assert_eq!(kind("GPU Hot Spot Temperature"), Other);
+        assert_eq!(kind("GPU Memory Junction Temperature"), Other);
+        let board_cpu = snap
+            .sensors
+            .iter()
+            .find(|s| s.label == "CPU (MSI B550M PRO-VDH WIFI (MS-7C95) (Nuvoton NCT6687D))")
+            .unwrap();
+        assert_eq!(board_cpu.kind, Other, "the board chip's CPU socket reading");
+        assert_eq!(kind("Drive Temperature"), Other);
+        // A threshold, not a measurement.
+        assert!(snap.sensors.iter().all(|s| !s.label.contains("Limit")));
+        assert_eq!(snap.sensors.len(), 12);
     }
 
     #[test]

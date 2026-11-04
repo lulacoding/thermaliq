@@ -33,7 +33,7 @@ Anything not in the left column does not get code, stubs, enum variants, UI, or 
 Every one of these has an automated test before any code that writes to real fans is merged.
 
 - **S1 One writer.** Only the engine calls `HardwareLayer::set_fan_duty`. Everything else submits requests to the engine.
-- **S2 Emergency latch.** CPU >= 95 °C or GPU >= 90 °C → every controllable fan at 100%. The latch holds until CPU < 85 °C and GPU < 80 °C continuously for 30 s. Nothing can lower a fan while latched.
+- **S2 Emergency latch.** CPU >= 95 °C or GPU >= 90 °C → every controllable fan at 100%. The latch holds until CPU < 85 °C and GPU < 80 °C continuously for 30 s. Nothing can lower a fan while latched. The thresholds are for core temperature: GPU hot spot and memory junction readings are never classified `Gpu`, and limit/threshold readings are not sensors.
 - **S3 Sensor loss.** If a fan's controlling sensor is missing or invalid (NaN, < -20 °C, > 150 °C) for 3 consecutive ticks, that fan goes to 100% until the sensor is back for 3 ticks.
 - **S4 HAL failure.** If a snapshot fails 3 ticks in a row, every fan goes to 100% (best effort) and the daemon reports `degraded`.
 - **S5 Hand back on exit.** On normal exit, service stop, Ctrl-C or panic, the engine calls `restore_auto()` for every fan it has touched (NVML default fan speed, original `pwm_enable`, bridge reset).
