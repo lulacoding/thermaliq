@@ -2,9 +2,13 @@
 //!
 //! Only `thermaliq-engine` may call `set_fan_duty` (SPEC S1).
 
+mod combined;
 mod mock;
+mod nvidia;
 
+pub use combined::CombinedHardwareLayer;
 pub use mock::{MockHardwareLayer, Tick};
+pub use nvidia::{Nvidia, Nvml};
 
 use std::fmt;
 use thermaliq_common::HardwareSnapshot;

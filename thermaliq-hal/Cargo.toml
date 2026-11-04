@@ -9,3 +9,6 @@ thermaliq-common = { path = "../thermaliq-common" }
 
 [lints]
 workspace = true
+
+[target."cfg(windows)".dependencies]
+nvml-wrapper = "0.13"
