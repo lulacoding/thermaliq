@@ -37,9 +37,9 @@ pub fn hardware() -> Result<Arc<dyn HardwareLayer>, String> {
     }
     #[cfg(all(windows, not(feature = "mock-hardware")))]
     {
-        use thermaliq_hal::{CombinedHardwareLayer, Nvidia};
-        // M11/M12 add their backends here; ones that fail to start are skipped, and with
-        // none left the daemon refuses to start rather than pretend.
+        use thermaliq_hal::{CombinedHardwareLayer, Hwinfo, Nvidia};
+        // M12 adds its backend here; ones that fail to start are skipped, and with none
+        // left the daemon refuses to start rather than pretend.
         let mut backends: Vec<Arc<dyn HardwareLayer>> = Vec::new();
         let mut why = Vec::new();
         match Nvidia::new() {
@@ -52,7 +52,10 @@ pub fn hardware() -> Result<Arc<dyn HardwareLayer>, String> {
         for w in why {
             eprintln!("hardware backend unavailable, continuing without it: {w}");
         }
-        let combined = CombinedHardwareLayer::new(backends).map_err(|e| e.to_string())?;
+        // HWiNFO is an optional extra: while it is down only its sensors drop out.
+        let combined = CombinedHardwareLayer::new(backends)
+            .and_then(|c| c.with_optional("hwinfo", Arc::new(Hwinfo::new())))
+            .map_err(|e| e.to_string())?;
         Ok(Arc::new(combined))
     }
     #[cfg(all(not(windows), not(feature = "mock-hardware")))]

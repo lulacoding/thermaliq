@@ -3,10 +3,15 @@
 //! Only `thermaliq-engine` may call `set_fan_duty` (SPEC S1).
 
 mod combined;
+mod hwinfo;
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod hwinfo_win;
 mod mock;
 mod nvidia;
 
 pub use combined::CombinedHardwareLayer;
+pub use hwinfo::{Hwinfo, HwinfoError};
 pub use mock::{MockHardwareLayer, Tick};
 pub use nvidia::{Nvidia, Nvml};
 
@@ -37,4 +42,8 @@ pub trait HardwareLayer: Send + Sync {
     /// Hand the fan back to firmware/driver control (S5).
     fn restore_auto(&self, fan: &str) -> Result<(), HalError>;
     fn capabilities(&self) -> Capabilities;
+    /// Names of optional sources that failed on the last snapshot and were left out of it.
+    fn unavailable_sources(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
