@@ -201,7 +201,14 @@ pub(crate) fn parse(buf: &[u8], now: i64) -> Result<HardwareSnapshot, HwinfoErro
         let Some(group) = u32_at(r, 4).and_then(|i| sensors.get(i as usize)) else {
             continue;
         };
-        let value = f64::from_le_bytes(r[284..292].try_into().unwrap_or_default());
+        let raw = f64::from_le_bytes(r[284..292].try_into().unwrap_or_default());
+        // The unit is C or F depending on HWiNFO's settings; the degree sign is UTF-8 or
+        // Windows-1252. Anything else is not a temperature we understand.
+        let value = match r[268..284].split(|&c| c == 0).next().unwrap_or_default() {
+            b"\xC2\xB0C" | b"\xB0C" => raw,
+            b"\xC2\xB0F" | b"\xB0F" => (raw - 32.0) * 5.0 / 9.0,
+            _ => continue,
+        };
         let label = match text(&r[140..268]) {
             l if l.trim().is_empty() => text(&r[12..140]),
             l => l,
@@ -282,7 +289,7 @@ mod tests {
                 b[r + 4..r + 8].copy_from_slice(&(gi as u32).to_le_bytes());
                 b[r + 8..r + 12].copy_from_slice(&(0x100 + ri as u32).to_le_bytes());
                 put(&mut b, r + 12, label);
-                put(&mut b, r + 268, "C");
+                put(&mut b, r + 268, "\u{b0}C");
                 b[r + 284..r + 292].copy_from_slice(&v.to_le_bytes());
                 r += READING;
             }
@@ -386,6 +393,57 @@ mod tests {
         put(&mut b, HEADER + 136, "My renamed box");
         let snap = parse(&b, NOW).unwrap();
         assert_eq!(snap.sensors[0].kind, SensorKind::Cpu);
+    }
+
+    /// Machine with the unit of its first reading (CPU "Core 0", 45) replaced by `unit`.
+    fn with_unit(unit: &[u8]) -> Vec<u8> {
+        let mut b = build(NOW, &machine());
+        let u = HEADER + 3 * SENSOR + 268;
+        b[u..u + 16].fill(0);
+        b[u..u + unit.len()].copy_from_slice(unit);
+        b
+    }
+
+    #[test]
+    fn celsius_in_utf8_and_windows_1252_is_accepted() {
+        for unit in [&b"\xC2\xB0C"[..], b"\xB0C"] {
+            let snap = parse(&with_unit(unit), NOW).unwrap();
+            assert_eq!(snap.sensors.len(), 5, "{unit:?}");
+            assert_eq!(snap.sensors[0].temp_celsius, 45.0);
+        }
+    }
+
+    #[test]
+    fn fahrenheit_is_converted_to_celsius() {
+        for unit in [&b"\xC2\xB0F"[..], b"\xB0F"] {
+            // 113 F = 45 C
+            let mut b = with_unit(unit);
+            let v = HEADER + 3 * SENSOR + 284;
+            b[v..v + 8].copy_from_slice(&113f64.to_le_bytes());
+            let snap = parse(&b, NOW).unwrap();
+            assert_eq!(snap.sensors[0].temp_celsius, 45.0, "{unit:?}");
+        }
+    }
+
+    #[test]
+    fn a_hot_fahrenheit_reading_is_range_checked_after_conversion() {
+        // 100 F is 37.8 C, kept; 400 F is 204 C, dropped.
+        let mut b = with_unit(b"\xC2\xB0F");
+        let v = HEADER + 3 * SENSOR + 284;
+        b[v..v + 8].copy_from_slice(&400f64.to_le_bytes());
+        assert_eq!(parse(&b, NOW).unwrap().sensors.len(), 4);
+    }
+
+    #[test]
+    fn unknown_or_missing_units_are_skipped() {
+        for unit in [&b"K"[..], b"%", b"C", b"", b"RPM"] {
+            let snap = parse(&with_unit(unit), NOW).unwrap();
+            assert_eq!(snap.sensors.len(), 4, "{unit:?}");
+            assert_ne!(
+                snap.sensors[0].label,
+                "Core 0 (CPU [#0]: Intel Core i7-12700K: DTS)"
+            );
+        }
     }
 
     #[test]
