@@ -74,20 +74,26 @@ pub fn save_config(dir: &Path, cfg: &DaemonConfig) -> io::Result<()> {
     write_atomic(&dir.join(CONFIG_FILE), s.as_bytes())
 }
 
-/// Reads `token.txt`, or creates it. A malformed token is replaced.
-pub fn load_or_create_token(dir: &Path) -> io::Result<String> {
-    let path = dir.join(TOKEN_FILE);
-    match fs::read_to_string(&path) {
+/// Reads `token.txt`. `None` if it is missing or malformed.
+pub fn load_token(dir: &Path) -> io::Result<Option<String>> {
+    match fs::read_to_string(dir.join(TOKEN_FILE)) {
         Ok(s) => {
             let s = s.trim();
-            if s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Ok(s.to_owned());
-            }
+            Ok((s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())).then(|| s.to_owned()))
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound || e.kind() == io::ErrorKind::InvalidData => {
+            Ok(None)
         }
-        Err(e) => return Err(e),
+        Err(e) => Err(e),
     }
+}
+
+/// Reads `token.txt`, or creates it. A malformed token is replaced.
+pub fn load_or_create_token(dir: &Path) -> io::Result<String> {
+    if let Some(t) = load_token(dir)? {
+        return Ok(t);
+    }
+    let path = dir.join(TOKEN_FILE);
     let mut raw = [0u8; 32];
     getrandom::fill(&mut raw).map_err(|e| io::Error::other(e.to_string()))?;
     let token: String = raw.iter().map(|b| format!("{b:02x}")).collect();

@@ -39,7 +39,7 @@ Tick a box only when its tests pass in CI and a reviewer has signed off (SPEC §
 - [ ] **M14 `tq` CLI** — port · v0: `thermaliq-cli/src/main.rs`
 - [ ] **M15 Profiles, app rules, schedule** — port schedule, fix app rules (read from base profile/config, not the active one) · v0: `schedule_monitor.rs`, `app_monitor.rs` · test: also, which profile is active is priority-arbitrated (agent > app rule > schedule > user), not last-switch-wins (M5 re-review)
 - [ ] **M16 Alerts** — port `AlertEvaluator` (has cooldowns) and run its actions · v0: `thermaliq-common/src/alert.rs`
-- [ ] **M18 UI** — port screens, rewrite data layer (token via Tauri command, real endpoints only) · v0: `thermaliq-ui/` · then **G2**
+- [ ] **M18 UI** — port screens, rewrite data layer (token via Tauri command, real endpoints only) · v0: `thermaliq-ui/` · then **G2** · M9 review: `token.txt` is readable by the user who ran `install-service`; if that is a separate admin account (UAC with another user) and the PC is used as a standard user, the UI cannot read the token, so M18 needs a way to name the token user
 - [ ] **M19 LLM profile generation** — port prompt, rewrite provider (one OpenAI-compatible client, timeouts, keychain key) · v0: `profile_gen.rs`
 
 ## Phase 5 — Agent

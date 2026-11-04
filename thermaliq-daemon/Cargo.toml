@@ -17,6 +17,15 @@ tower-http = { version = "0.6", features = ["cors"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+ctrlc = { version = "3.5", features = ["termination"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"
+
+[features]
+# Fake hardware for dev and CI. A build without it refuses to start (no backend until M10).
+mock-hardware = []
+
 [dev-dependencies]
 futures-util = "0.3"
 tempfile = "3"
