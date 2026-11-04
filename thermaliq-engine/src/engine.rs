@@ -118,7 +118,7 @@ impl Engine {
 
     /// Swap to another profile without leaving the control loop: the latch, S3/S4 counters
     /// and ramp state carry over, and kept fans are not handed back. Fans the new
-    /// profile drops are restored. Pending Override/Agent requests are not carried over.
+    /// profile drops are restored. Non-profile requests (override, agent, ...) carry over for kept fans (SPEC §4).
     pub fn set_profile(&mut self, profile: &Profile) {
         self.sensors = SensorEngine::new(profile);
         self.curves = CurveEngine::new(profile);
@@ -129,7 +129,8 @@ impl Engine {
             .map(|c| {
                 let mut fan = Fan::new(c);
                 if let Some(i) = old.iter().position(|o| o.id == c.fan) {
-                    let o = old.swap_remove(i);
+                    let mut o = old.swap_remove(i);
+                    fan.ctl.put_requests(o.ctl.take_requests());
                     (fan.good, fan.bad, fan.lost) = (o.good, o.bad, o.lost);
                 }
                 if let Some(&d) = self.written.get(&c.fan) {
@@ -633,5 +634,117 @@ mod profile_switch_tests {
         assert_eq!(hal.restores(), ["f2"]);
         drop(e);
         assert_eq!(hal.restores(), ["f2", "f1"]);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod rereview_tests {
+    use super::*;
+    use thermaliq_hal::{MockHardwareLayer, Tick};
+
+    /// Fans f1, f2 on one curve, full-size ramp steps. `Flat` or `Linear` on cpu.
+    fn profile(linear: bool) -> Profile {
+        let curve = if linear {
+            "type = \"linear\"\nid = \"c\"\nsource = \"cpu\"\nmin_temp = 30.0\nmax_temp = 90.0\nmin_pwm = 20\nmax_pwm = 100\n"
+        } else {
+            "type = \"flat\"\nid = \"c\"\npwm = 30\n"
+        };
+        let mut s = format!("name = \"t\"\n[[curves]]\n{curve}");
+        for f in ["f1", "f2"] {
+            s += &format!(
+                "[[controls]]\nfan = \"{f}\"\ncurve = \"c\"\nstep_up_pct = 100\nstep_down_pct = 100\n"
+            );
+        }
+        Profile::from_toml(&s).unwrap()
+    }
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    fn at(cpu: f32, gpu: f32) -> Tick {
+        Tick::Temps(vec![
+            ("cpu".into(), SensorKind::Cpu, cpu),
+            ("gpu".into(), SensorKind::Gpu, gpu),
+        ])
+    }
+
+    fn gpu_only(t: f32) -> Tick {
+        Tick::Temps(vec![("gpu".into(), SensorKind::Gpu, t)])
+    }
+
+    fn rig(linear: bool, script: Vec<Tick>) -> (Arc<MockHardwareLayer>, Engine) {
+        let hal = Arc::new(MockHardwareLayer::new(&["f1", "f2"], script));
+        (hal.clone(), Engine::new(hal, &profile(linear)))
+    }
+
+    fn last_writes(hal: &MockHardwareLayer, n: usize) -> Vec<u8> {
+        let w = hal.writes();
+        w[w.len() - n..].iter().map(|(_, d)| *d).collect()
+    }
+
+    // Re-review 1
+    #[test]
+    fn latch_survives_a_profile_switch_below_the_trip_threshold() {
+        let (hal, mut e) = rig(false, vec![at(97.0, 40.0), at(90.0, 40.0)]);
+        e.tick(secs(0));
+        e.tick(secs(1)); // 90 °C: latched, not re-tripped
+        e.set_profile(&profile(false));
+        e.tick(secs(2));
+        assert!(e.latched());
+        assert_eq!(last_writes(&hal, 2), [100, 100]);
+    }
+
+    // Re-review 2
+    #[test]
+    fn override_survives_a_profile_switch() {
+        let (hal, mut e) = rig(false, vec![at(40.0, 40.0)]);
+        e.tick(secs(0));
+        e.submit("f1", Source::Override, 80, Some(secs(99)))
+            .unwrap();
+        e.tick(secs(1));
+        assert_eq!(last_writes(&hal, 2), [80, 30]);
+        e.set_profile(&profile(false));
+        e.tick(secs(2));
+        assert_eq!(last_writes(&hal, 2), [80, 30]);
+    }
+
+    // Re-review 3
+    #[test]
+    fn lost_sensor_state_survives_a_profile_switch() {
+        let (hal, mut e) = rig(true, vec![at(40.0, 40.0), gpu_only(40.0)]);
+        for t in 0..=3 {
+            e.tick(secs(t));
+        }
+        assert_eq!(last_writes(&hal, 2), [100, 100], "lost after 3 ticks");
+        e.set_profile(&profile(true));
+        let before = hal.writes().len();
+        e.tick(secs(4));
+        e.tick(secs(5));
+        assert_eq!(hal.writes().len(), before + 4);
+        assert_eq!(last_writes(&hal, 4), [100; 4]);
+    }
+
+    // Re-review 4
+    #[test]
+    fn release_forgets_the_old_watch_list() {
+        let script = vec![
+            at(97.0, 40.0),
+            at(60.0, 40.0),
+            at(60.0, 40.0),
+            gpu_only(40.0),
+            gpu_only(91.0),
+            gpu_only(40.0),
+            gpu_only(40.0),
+        ];
+        let (_, mut e) = rig(false, script);
+        let mut latched = vec![];
+        for t in [0, 1, 31, 32, 33, 34, 64] {
+            e.tick(secs(t));
+            latched.push(e.latched());
+        }
+        // trip; cool; released; (cpu gone, not latched); gpu trips; still hot-ish; released
+        assert_eq!(latched, [true, true, false, false, true, true, false]);
     }
 }
