@@ -156,6 +156,9 @@ pub struct Status {
     pub degraded: bool,
     /// CPU/GPU sensors the latch is waiting on to cool down or come back.
     pub waiting_on: Vec<String>,
+    /// Optional sensor sources (e.g. "hwinfo") that failed on the last tick and are missing
+    /// from the snapshot. Not a safety state: required hardware is fine.
+    pub unavailable_sources: Vec<String>,
 }
 
 /// The one snapshot per tick, shared. API reads use this, never the hardware (SPEC §5).
@@ -208,6 +211,7 @@ impl Daemon {
             std::thread::spawn(move || {
                 let run = catch_unwind(AssertUnwindSafe(|| {
                     // The engine is dropped when this closure ends or unwinds, which hands the fans back (S5).
+                    let sources = hal.clone();
                     let mut engine = Engine::new(hal, &active);
                     let began = Instant::now();
                     let (mut ticks, mut snapshot_age) = (0u64, 0u64);
@@ -238,6 +242,7 @@ impl Daemon {
                             latched: engine.latched(),
                             degraded: engine.degraded(),
                             waiting_on: engine.latch_waiting_on().to_vec(),
+                            unavailable_sources: sources.unavailable_sources(),
                         };
                         {
                             let mut c = cache.write().unwrap_or_else(PoisonError::into_inner);
@@ -497,6 +502,38 @@ mod tests {
             "not a health claim"
         );
         assert!(d.shutdown().is_err());
+    }
+
+    #[test]
+    fn status_names_the_optional_sources_that_are_down() {
+        struct Down(Arc<MockHardwareLayer>);
+        impl HardwareLayer for Down {
+            fn snapshot(&self) -> Result<HardwareSnapshot, HalError> {
+                self.0.snapshot()
+            }
+            fn set_fan_duty(&self, fan: &str, duty: u8) -> Result<(), HalError> {
+                self.0.set_fan_duty(fan, duty)
+            }
+            fn restore_auto(&self, fan: &str) -> Result<(), HalError> {
+                self.0.restore_auto(fan)
+            }
+            fn capabilities(&self) -> Capabilities {
+                self.0.capabilities()
+            }
+            fn unavailable_sources(&self) -> Vec<String> {
+                vec!["hwinfo".into()]
+            }
+        }
+        let mock = Arc::new(MockHardwareLayer::new(&["f1"], vec![at(40.0)]));
+        let active = Profile::from_toml(FLAT).unwrap();
+        let d = Daemon::start(Arc::new(Down(mock)), &active, vec![], db(), fast());
+        wait_until(|| d.cache().ticks > 0);
+        let c = d.cache();
+        assert_eq!(c.status.unavailable_sources, ["hwinfo"]);
+        assert!(
+            !c.status.degraded,
+            "an optional source is not a safety state"
+        );
     }
 
     #[test]

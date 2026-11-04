@@ -213,6 +213,7 @@ fn status_json(c: &Cache) -> Value {
         "latched": c.status.latched,
         "degraded": c.status.degraded,
         "waiting_on": c.status.waiting_on,
+        "unavailable_sources": c.status.unavailable_sources,
         "snapshot_age": c.snapshot_age,
         "active_profile": c.active_profile,
         "ticks": c.ticks,
@@ -347,6 +348,7 @@ fn frame(c: &Cache) -> Message {
         "latched": c.status.latched,
         "degraded": c.status.degraded,
         "waiting_on": c.status.waiting_on,
+        "unavailable_sources": c.status.unavailable_sources,
     });
     v["sensors"] = json!(c.snapshot.sensors);
     v["fans"] = json!(c.snapshot.fans);
@@ -583,6 +585,22 @@ mod tests {
         assert_eq!(v["waiting_on"], json!([]));
         assert_eq!(v["snapshot_age"], 0);
         assert_eq!(v["active_profile"], "flat");
+    }
+
+    #[test]
+    fn status_and_stream_frames_show_the_unavailable_sources() {
+        let mut c = Cache::default();
+        c.status.unavailable_sources = vec!["hwinfo".into()];
+        assert_eq!(status_json(&c)["unavailable_sources"], json!(["hwinfo"]));
+        let Message::Text(t) = frame(&c) else {
+            panic!("frame is text")
+        };
+        let v: Value = serde_json::from_str(t.as_str()).unwrap();
+        assert_eq!(v["status"]["unavailable_sources"], json!(["hwinfo"]));
+        assert_eq!(
+            status_json(&Cache::default())["unavailable_sources"],
+            json!([])
+        );
     }
 
     #[tokio::test]
