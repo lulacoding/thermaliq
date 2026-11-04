@@ -1,8 +1,8 @@
 use crate::{CurveEngine, FanControl, SensorEngine, Source, Temps};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use thermaliq_common::{Profile, SensorKind, SensorReading};
+use thermaliq_common::{Control, Profile, SensorKind, SensorReading};
 use thermaliq_hal::HardwareLayer;
 
 /// SPEC S2 thresholds (°C) and hold time.
@@ -15,10 +15,12 @@ const RELEASE_HOLD: Duration = Duration::from_secs(30);
 const FAULT_TICKS: u8 = 3;
 
 /// S2: trips on a hot CPU or GPU; releases after 30 s continuously cool.
-/// A NaN reading is neither hot nor cool, so it can't release the latch.
+/// A NaN reading or a missing CPU/GPU sensor (one seen while hot) is not cool, so it can't release the latch.
 #[derive(Default)]
 struct Latch {
     on: bool,
+    /// CPU/GPU sensor ids seen while hot; all must be present and cool to release.
+    watch: BTreeSet<String>,
     cool_since: Option<Duration>,
 }
 
@@ -36,12 +38,23 @@ impl Latch {
             && of(SensorKind::Gpu).all(|t| t < GPU_RELEASE);
         if hot {
             self.on = true;
+            self.watch.extend(
+                sensors
+                    .iter()
+                    .filter(|s| matches!(s.kind, SensorKind::Cpu | SensorKind::Gpu))
+                    .map(|s| s.id.clone()),
+            );
         }
-        if !self.on || !cool {
+        let all_present = self
+            .watch
+            .iter()
+            .all(|id| sensors.iter().any(|s| &s.id == id));
+        if !self.on || !cool || !all_present {
             self.cool_since = None;
-        } else if now - *self.cool_since.get_or_insert(now) >= RELEASE_HOLD {
+        } else if now.saturating_sub(*self.cool_since.get_or_insert(now)) >= RELEASE_HOLD {
             self.on = false;
             self.cool_since = None;
+            self.watch.clear();
         }
         self.on
     }
@@ -55,6 +68,22 @@ struct Fan {
     good: u8,
     bad: u8,
     lost: bool,
+    /// Ramp state taken from the hardware or the last write.
+    seeded: bool,
+}
+
+impl Fan {
+    fn new(c: &Control) -> Self {
+        Self {
+            id: c.fan.clone(),
+            curve: c.curve.clone(),
+            ctl: FanControl::new(c),
+            good: 0,
+            bad: 0,
+            lost: false,
+            seeded: false,
+        }
+    }
 }
 
 /// The control loop for one profile. The only thing that writes to fans (S1).
@@ -68,7 +97,8 @@ pub struct Engine {
     touched: BTreeSet<String>,
     latch: Latch,
     snapshot_fails: u8,
-    seeded: bool,
+    /// Last duty each fan accepted, to seed ramping across a profile switch.
+    written: HashMap<String, u8>,
 }
 
 impl Engine {
@@ -76,24 +106,44 @@ impl Engine {
         Self {
             sensors: SensorEngine::new(profile),
             curves: CurveEngine::new(profile),
-            fans: profile
-                .controls
-                .iter()
-                .map(|c| Fan {
-                    id: c.fan.clone(),
-                    curve: c.curve.clone(),
-                    ctl: FanControl::new(c),
-                    good: 0,
-                    bad: 0,
-                    lost: false,
-                })
-                .collect(),
+            fans: profile.controls.iter().map(Fan::new).collect(),
             controllable: hal.capabilities().controllable_fans.into_iter().collect(),
             hal,
             touched: BTreeSet::new(),
             latch: Latch::default(),
             snapshot_fails: 0,
-            seeded: false,
+            written: HashMap::new(),
+        }
+    }
+
+    /// Swap to another profile without leaving the control loop: the latch, S3/S4 counters
+    /// and ramp state carry over, and kept fans are not handed back. Fans the new
+    /// profile drops are restored. Pending Override/Agent requests are not carried over.
+    pub fn set_profile(&mut self, profile: &Profile) {
+        self.sensors = SensorEngine::new(profile);
+        self.curves = CurveEngine::new(profile);
+        let mut old = std::mem::take(&mut self.fans);
+        self.fans = profile
+            .controls
+            .iter()
+            .map(|c| {
+                let mut fan = Fan::new(c);
+                if let Some(i) = old.iter().position(|o| o.id == c.fan) {
+                    let o = old.swap_remove(i);
+                    (fan.good, fan.bad, fan.lost) = (o.good, o.bad, o.lost);
+                }
+                if let Some(&d) = self.written.get(&c.fan) {
+                    fan.ctl.seed(d, d > 0);
+                    fan.seeded = true;
+                }
+                fan
+            })
+            .collect();
+        for gone in old {
+            self.written.remove(&gone.id);
+            if self.touched.remove(&gone.id) {
+                let _ = self.hal.restore_auto(&gone.id);
+            }
         }
     }
 
@@ -130,12 +180,10 @@ impl Engine {
             return;
         };
         self.snapshot_fails = 0;
-        if !self.seeded {
-            self.seeded = true;
-            for f in &mut self.fans {
-                if let Some(r) = snap.fans.iter().find(|r| r.id == f.id) {
-                    f.ctl.seed(r.duty_percent, r.rpm > 0);
-                }
+        for f in self.fans.iter_mut().filter(|f| !f.seeded) {
+            if let Some(r) = snap.fans.iter().find(|r| r.id == f.id) {
+                f.ctl.seed(r.duty_percent, r.rpm > 0);
+                f.seeded = true;
             }
         }
         if self.latch.update(&snap.sensors, now) {
@@ -184,6 +232,7 @@ impl Engine {
         for id in ids {
             if let Some(f) = self.fans.iter_mut().find(|f| f.id == id) {
                 f.ctl.seed(100, true);
+                f.seeded = true;
             }
             self.write(&id, 100);
         }
@@ -194,7 +243,10 @@ impl Engine {
     fn write(&mut self, fan: &str, duty: u8) {
         if self.controllable.contains(fan) {
             self.touched.insert(fan.to_string());
-            let _ = self.hal.set_fan_duty(fan, duty.min(100));
+            let duty = duty.min(100);
+            if self.hal.set_fan_duty(fan, duty).is_ok() {
+                self.written.insert(fan.to_string(), duty);
+            }
         }
     }
 }
@@ -398,5 +450,188 @@ step_down_pct = 100
         e.tick(secs(0));
         assert!(hal.writes().iter().all(|(_, d)| *d <= 100));
         assert_eq!(hal.writes()[0], ("f1".into(), 100));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod review_tests {
+    use super::*;
+    use thermaliq_hal::{MockHardwareLayer, Tick};
+
+    const PROFILE: &str = r#"
+name = "t"
+[[curves]]
+type = "flat"
+id = "c"
+pwm = 30
+[[controls]]
+fan = "f1"
+curve = "c"
+step_up_pct = 100
+step_down_pct = 100
+[[controls]]
+fan = "f2"
+curve = "c"
+step_up_pct = 100
+step_down_pct = 100
+"#;
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    fn at(cpu: f32, gpu: f32) -> Tick {
+        Tick::Temps(vec![
+            ("cpu".into(), SensorKind::Cpu, cpu),
+            ("gpu".into(), SensorKind::Gpu, gpu),
+        ])
+    }
+
+    fn rig(hal: MockHardwareLayer) -> (Arc<MockHardwareLayer>, Engine) {
+        let hal = Arc::new(hal);
+        let e = Engine::new(hal.clone(), &Profile::from_toml(PROFILE).unwrap());
+        (hal, e)
+    }
+
+    fn run(e: &mut Engine, from: u64, to: u64) {
+        for t in from..=to {
+            e.tick(secs(t));
+        }
+    }
+
+    // Item 1
+    #[test]
+    fn latch_does_not_release_when_the_cpu_sensor_disappears() {
+        let gone = Tick::Temps(vec![("gpu".into(), SensorKind::Gpu, 40.0)]);
+        let (hal, mut e) = rig(MockHardwareLayer::new(
+            &["f1", "f2"],
+            vec![at(97.0, 40.0), gone],
+        ));
+        run(&mut e, 0, 100);
+        assert!(e.latched());
+        assert!(hal.writes().iter().all(|(_, d)| *d == 100));
+    }
+
+    #[test]
+    fn latch_releases_once_the_tripping_sensor_is_back_and_cool_for_30s() {
+        let gone = Tick::Temps(vec![("gpu".into(), SensorKind::Gpu, 40.0)]);
+        let mut script = vec![at(97.0, 40.0)];
+        script.extend(std::iter::repeat_n(gone, 5));
+        script.push(at(60.0, 40.0));
+        let (_, mut e) = rig(MockHardwareLayer::new(&["f1", "f2"], script));
+        run(&mut e, 0, 35); // back from tick 6 on, cool since t=6
+        assert!(
+            e.latched(),
+            "a sensor that just came back isn't 30 s cool yet"
+        );
+        run(&mut e, 36, 36);
+        assert!(!e.latched());
+    }
+
+    // Item 3
+    #[test]
+    fn latch_holds_between_release_and_trip_thresholds() {
+        let (_, mut e) = rig(MockHardwareLayer::new(
+            &["f1", "f2"],
+            vec![at(97.0, 40.0), at(90.0, 40.0)],
+        ));
+        run(&mut e, 0, 60);
+        assert!(e.latched());
+    }
+
+    // Item 4
+    #[test]
+    fn read_only_fan_is_never_written_on_the_normal_path() {
+        let (hal, mut e) =
+            rig(MockHardwareLayer::new(&["f1", "f2"], vec![at(40.0, 40.0)]).read_only("f2"));
+        run(&mut e, 0, 5);
+        assert!(!e.latched());
+        assert!(hal.writes().iter().all(|(f, _)| f == "f1"));
+        assert!(!hal.writes().is_empty());
+        drop(e);
+        assert_eq!(hal.restores(), ["f1"]);
+    }
+
+    // Item 5
+    #[test]
+    fn latch_holds_while_a_reading_is_nan() {
+        let (_, mut e) = rig(MockHardwareLayer::new(
+            &["f1", "f2"],
+            vec![at(97.0, 40.0), at(f32::NAN, 40.0)],
+        ));
+        run(&mut e, 0, 60);
+        assert!(e.latched());
+    }
+
+    // Item 6
+    #[test]
+    fn clock_going_backwards_does_not_panic() {
+        let (_, mut e) = rig(MockHardwareLayer::new(
+            &["f1", "f2"],
+            vec![at(97.0, 40.0), at(60.0, 40.0)],
+        ));
+        e.tick(secs(100));
+        e.tick(secs(110)); // cool_since = 110
+        e.tick(secs(50));
+        assert!(e.latched());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod profile_switch_tests {
+    use super::*;
+    use thermaliq_hal::{MockHardwareLayer, Tick};
+
+    fn profile(pwm: u8, fans: &[&str]) -> Profile {
+        let mut s = format!("name = \"t\"\n[[curves]]\ntype = \"flat\"\nid = \"c\"\npwm = {pwm}\n");
+        for f in fans {
+            s += &format!("[[controls]]\nfan = \"{f}\"\ncurve = \"c\"\nstep_up_pct = 10\nstep_down_pct = 100\n");
+        }
+        Profile::from_toml(&s).unwrap()
+    }
+
+    fn rig(cpu: f32) -> (Arc<MockHardwareLayer>, Engine) {
+        let hal = Arc::new(MockHardwareLayer::new(
+            &["f1", "f2"],
+            vec![Tick::Temps(vec![("cpu".into(), SensorKind::Cpu, cpu)])],
+        ));
+        (hal.clone(), Engine::new(hal, &profile(30, &["f1", "f2"])))
+    }
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    #[test]
+    fn switching_profile_while_latched_stays_at_100_and_hands_nothing_back() {
+        let (hal, mut e) = rig(97.0);
+        e.tick(secs(0));
+        e.set_profile(&profile(30, &["f1", "f2"]));
+        e.tick(secs(1));
+        assert!(e.latched());
+        assert!(hal.writes().iter().all(|(_, d)| *d == 100));
+        assert!(hal.restores().is_empty());
+    }
+
+    #[test]
+    fn switching_profile_keeps_ramp_and_restores_only_dropped_fans() {
+        let (hal, mut e) = rig(40.0);
+        e.tick(secs(0)); // first snapshot seeds at duty 0, writes 10
+        for t in 1..=2 {
+            e.tick(secs(t)); // 20, 30
+        }
+        e.set_profile(&profile(80, &["f1"]));
+        e.tick(secs(3));
+        let w = hal.writes();
+        assert_eq!(
+            w.last().unwrap(),
+            &("f1".to_string(), 40),
+            "ramps on, no jump to 80"
+        );
+        assert_eq!(hal.restores(), ["f2"]);
+        drop(e);
+        assert_eq!(hal.restores(), ["f2", "f1"]);
     }
 }
