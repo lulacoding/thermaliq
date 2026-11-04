@@ -134,7 +134,7 @@ mod tests {
         let bytes = fs::read(&out).unwrap();
         fs::remove_file(&out).unwrap();
         let units: Vec<u16> = bytes
-            .chunks_exact(2)
+            .chunks(2)
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         let text = String::from_utf16_lossy(&units);
