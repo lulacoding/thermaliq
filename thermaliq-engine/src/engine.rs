@@ -214,6 +214,19 @@ impl Engine {
         Ok(f.ctl.withdraw(Source::Override))
     }
 
+    /// Why an override on this fan is not (yet) what the hardware gets: safety (S2–S4) wins.
+    pub fn override_blocked_by(&self, fan: &str) -> Option<&'static str> {
+        if self.latch.on {
+            Some("latched")
+        } else if self.degraded() {
+            Some("degraded")
+        } else if self.fans.iter().any(|f| f.id == fan && f.lost) {
+            Some("sensor_lost")
+        } else {
+            None
+        }
+    }
+
     /// True if the active profile controls this fan and the hardware lets us write to it.
     pub fn can_control(&self, fan: &str) -> bool {
         self.controllable.contains(fan) && self.fans.iter().any(|f| f.id == fan)
@@ -920,6 +933,39 @@ mod command_tests {
         let (_, mut e) = rig();
         assert_eq!(e.cancel_override("f1"), Ok(false));
         assert!(e.cancel_override("nope").is_err());
+    }
+
+    fn blocked(linear: bool, script: Vec<Tick>, ticks: u64) -> Option<&'static str> {
+        let curve = if linear {
+            "type = \"linear\"\nid = \"c\"\nsource = \"cpu\"\nmin_temp = 30.0\nmax_temp = 90.0\nmin_pwm = 20\nmax_pwm = 100\n"
+        } else {
+            "type = \"flat\"\nid = \"c\"\npwm = 30\n"
+        };
+        let p = Profile::from_toml(&format!(
+            "name = \"t\"\n[[curves]]\n{curve}[[controls]]\nfan = \"f1\"\ncurve = \"c\"\nstep_up_pct = 100\nstep_down_pct = 100\n"
+        ))
+        .unwrap();
+        let mut e = Engine::new(Arc::new(MockHardwareLayer::new(&["f1"], script)), &p);
+        for t in 0..ticks {
+            e.tick(secs(t));
+        }
+        e.override_blocked_by("f1")
+    }
+
+    #[test]
+    fn an_override_is_in_effect_unless_safety_overrides_it() {
+        let at = |c: f32| Tick::Temps(vec![("cpu".into(), SensorKind::Cpu, c)]);
+        let gpu_only = Tick::Temps(vec![("gpu".into(), SensorKind::Gpu, 40.0)]);
+        assert_eq!(blocked(false, vec![at(40.0)], 2), None);
+        assert_eq!(blocked(false, vec![at(97.0)], 2), Some("latched"));
+        assert_eq!(
+            blocked(true, vec![at(40.0), gpu_only], 5),
+            Some("sensor_lost")
+        );
+        assert_eq!(
+            blocked(false, vec![at(40.0), Tick::Fail], 5),
+            Some("degraded")
+        );
     }
 
     #[test]

@@ -40,9 +40,17 @@ pub struct ApiState {
     dir: Arc<PathBuf>,
     /// `save_config` writes a fixed temp name, so saves go one at a time.
     config_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The port we are served on; only `Host: <loopback name>:<port>` is accepted.
+    port: u16,
 }
 
 impl ApiState {
+    /// `ApiServer::start` sets this itself; tests that skip the server set it here.
+    pub fn on_port(mut self, port: u16) -> Self {
+        self.port = port;
+        self
+    }
+
     pub fn new(
         handle: Handle,
         profiles: Vec<Profile>,
@@ -57,6 +65,7 @@ impl ApiState {
             token: token.into(),
             dir: Arc::new(dir),
             config_lock: Arc::default(),
+            port: 0,
         }
     }
 }
@@ -113,10 +122,61 @@ pub fn router(state: ApiState) -> Router {
         .route("/profiles", get(profiles))
         .route("/config", get(get_config))
         .route("/history/sensors/{id}", get(history_sensor))
-        .route("/ws", get(ws))
+        .route(
+            "/ws",
+            get(ws).route_layer(middleware::from_fn(require_ws_origin)),
+        )
         .merge(protected)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_loopback_host,
+        ))
         .layer(cors)
         .with_state(state)
+}
+
+// ---- browser guards ----
+
+/// DNS rebinding: a page on `evil.example` that resolves to 127.0.0.1 is same-origin for the
+/// browser, so CORS never applies. Its `Host` still says `evil.example`, so refuse that.
+async fn require_loopback_host(
+    State(state): State<ApiState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .map(str::to_ascii_lowercase);
+    let port = state.port;
+    let ok = host.is_some_and(|h| {
+        ["127.0.0.1", "localhost", "[::1]"]
+            .iter()
+            .any(|name| h == format!("{name}:{port}"))
+    });
+    if ok {
+        next.run(req).await
+    } else {
+        ApiError(
+            StatusCode::MISDIRECTED_REQUEST,
+            "unexpected Host header".into(),
+        )
+        .into_response()
+    }
+}
+
+/// Browsers do not apply CORS to WebSockets. No `Origin` means a native client (CLI).
+async fn require_ws_origin(req: Request, next: Next) -> Response {
+    let allowed = match req.headers().get(header::ORIGIN) {
+        None => true,
+        Some(o) => ALLOWED_ORIGINS.iter().any(|a| o.as_bytes() == a.as_bytes()),
+    };
+    if allowed {
+        next.run(req).await
+    } else {
+        ApiError(StatusCode::FORBIDDEN, "origin not allowed".into()).into_response()
+    }
 }
 
 // ---- auth ----
@@ -228,10 +288,11 @@ async fn set_override(
 ) -> ApiResult {
     let (duty, dur) = clamp_override(b.duty, b.seconds)
         .ok_or_else(|| ApiError(StatusCode::BAD_REQUEST, "seconds must be > 0".into()))?;
-    s.handle.set_override(&fan, b.duty, b.seconds).await?;
-    Ok(Json(
-        json!({"fan": fan, "duty": duty, "seconds": dur.as_secs()}),
-    ))
+    let blocked = s.handle.set_override(&fan, b.duty, b.seconds).await?;
+    Ok(Json(json!({
+        "fan": fan, "duty": duty, "seconds": dur.as_secs(),
+        "in_effect": blocked.is_none(), "reason": blocked,
+    })))
 }
 
 async fn cancel_override(State(s): State<ApiState>, Path(fan): Path<String>) -> ApiResult {
@@ -250,6 +311,13 @@ async fn get_config(State(s): State<ApiState>) -> ApiResult {
 
 /// Saves `config.toml`. The running daemon keeps its current settings until it restarts.
 async fn put_config(State(s): State<ApiState>, Json(cfg): Json<DaemonConfig>) -> ApiResult {
+    if !s.profiles.iter().any(|p| p.name == cfg.default_profile) {
+        let m = format!(
+            "default_profile '{}' is not a known profile",
+            cfg.default_profile
+        );
+        return Err(ApiError(StatusCode::BAD_REQUEST, m));
+    }
     let _one_at_a_time = s.config_lock.lock().await;
     let dir = s.dir.clone();
     let saved = tokio::task::spawn_blocking(move || {
@@ -317,7 +385,7 @@ pub struct ApiServer {
 
 impl ApiServer {
     /// `port` 0 picks a free one (tests).
-    pub fn start(state: ApiState, port: u16) -> io::Result<Self> {
+    pub fn start(mut state: ApiState, port: u16) -> io::Result<Self> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("thermaliq-api")
@@ -325,6 +393,7 @@ impl ApiServer {
             .build()?;
         let listener = rt.block_on(TcpListener::bind((Ipv4Addr::LOCALHOST, port)))?;
         let addr = listener.local_addr()?;
+        state.port = addr.port();
         let (stop, stopped) = oneshot::channel::<()>();
         let task = rt.spawn(async move {
             let _ = axum::serve(listener, router(state))
@@ -390,6 +459,19 @@ mod tests {
 
     const FLAT: &str = "name = \"flat\"\n[[curves]]\ntype = \"flat\"\nid = \"c\"\npwm = 30\n[[controls]]\nfan = \"f1\"\ncurve = \"c\"\nstep_up_pct = 100\nstep_down_pct = 100\n";
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const PORT: u16 = 7272;
+
+    /// The real router, but a request with no `Host` gets a good one (oneshot sets none).
+    fn router(state: ApiState) -> Router {
+        async fn add_host(mut req: Request<Body>) -> Request<Body> {
+            if !req.headers().contains_key("host") {
+                req.headers_mut()
+                    .insert("host", HeaderValue::from_static("127.0.0.1:7272"));
+            }
+            req
+        }
+        super::router(state).layer(middleware::map_request(add_host))
+    }
 
     struct Rig {
         daemon: Daemon,
@@ -423,7 +505,8 @@ mod tests {
             db.clone(),
             TOKEN.into(),
             dir.path().into(),
-        );
+        )
+        .on_port(PORT);
         Rig {
             daemon,
             hal,
@@ -636,8 +719,32 @@ mod tests {
         )
         .await;
         assert_eq!(code, StatusCode::OK);
-        assert_eq!(v, json!({"fan": "f1", "duty": 100, "seconds": 300}));
+        assert_eq!(
+            v,
+            json!({"fan": "f1", "duty": 100, "seconds": 300, "in_effect": true, "reason": null})
+        );
         until(|| last_write(&r) == Some(("f1".into(), 100))).await;
+    }
+
+    #[tokio::test]
+    async fn an_override_under_a_latch_says_it_is_not_in_effect() {
+        let r = rig(vec![at(97.0)]);
+        until(|| r.daemon.cache().status.latched).await;
+        let (code, v) = call(
+            &r,
+            "POST",
+            "/fans/f1/override",
+            Some(TOKEN),
+            Some(json!({"duty": 10, "seconds": 60})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["in_effect"], false);
+        assert_eq!(v["reason"], "latched");
+        assert!(
+            r.hal.writes().iter().all(|(_, d)| *d == 100),
+            "safety holds 100"
+        );
     }
 
     #[tokio::test]
@@ -746,7 +853,7 @@ mod tests {
     #[tokio::test]
     async fn put_config_saves_it_to_disk_and_says_a_restart_is_needed() {
         let r = rig(vec![at(40.0)]);
-        let body = json!({"api_port": 9100, "polling_interval_ms": 500, "log_level": "debug", "default_profile": "silent"});
+        let body = json!({"api_port": 9100, "polling_interval_ms": 500, "log_level": "debug", "default_profile": "sixty"});
         let (code, v) = call(&r, "PUT", "/config", Some(TOKEN), Some(body)).await;
         assert_eq!(code, StatusCode::OK);
         assert_eq!(v["restart_required"], true);
@@ -754,7 +861,7 @@ mod tests {
         let saved = load_config(r.dir.path()).unwrap();
         assert_eq!(saved.api_port, 9100);
         assert_eq!(saved.polling_interval_ms, 500);
-        assert_eq!(saved.default_profile, "silent");
+        assert_eq!(saved.default_profile, "sixty");
     }
 
     #[tokio::test]
@@ -763,9 +870,10 @@ mod tests {
         save_config(r.dir.path(), &DaemonConfig::default()).unwrap();
         let before = std::fs::read(r.dir.path().join("config.toml")).unwrap();
         for bad in [
-            json!({"polling_interval_ms": 60000}),
-            json!({"api_port": 0}),
+            json!({"polling_interval_ms": 60000, "default_profile": "flat"}),
+            json!({"api_port": 0, "default_profile": "flat"}),
             json!({"default_profile": ""}),
+            json!({"default_profile": "no-such-profile"}),
         ] {
             let (code, _) = call(&r, "PUT", "/config", Some(TOKEN), Some(bad)).await;
             assert_eq!(code, StatusCode::BAD_REQUEST);
@@ -788,7 +896,9 @@ mod tests {
                     let req = Request::put("/config")
                         .header("authorization", format!("Bearer {TOKEN}"))
                         .header("content-type", "application/json")
-                        .body(Body::from(json!({"api_port": 9000 + i}).to_string()))
+                        .body(Body::from(
+                            json!({"api_port": 9000 + i, "default_profile": "flat"}).to_string(),
+                        ))
                         .unwrap();
                     router(state).oneshot(req).await.unwrap().status()
                 })
@@ -903,6 +1013,132 @@ mod tests {
         assert!(res.headers().get("access-control-allow-origin").is_none());
     }
 
+    // ---- DNS rebinding and cross-site WebSocket ----
+
+    async fn with_host(r: &Rig, method: &str, uri: &str, host: Option<&str>) -> StatusCode {
+        let mut req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .header("content-type", "application/json");
+        if let Some(h) = host {
+            req = req.header("host", h);
+        }
+        // `super::router`: no Host is added for us.
+        let res = super::router(r.state.clone())
+            .oneshot(req.body(Body::from("{}")).unwrap())
+            .await
+            .unwrap();
+        res.status()
+    }
+
+    #[tokio::test]
+    async fn a_foreign_host_is_refused_on_every_read_and_mutation_and_the_websocket() {
+        let r = rig(vec![at(40.0)]);
+        let bad = [
+            "evil.example",
+            "evil.example:7272",
+            "127.0.0.1:9999",
+            "127.0.0.1",
+            "127.0.0.1.evil.example:7272",
+            "localhost.evil.example:7272",
+            "",
+        ];
+        for host in bad {
+            for (m, u) in [
+                ("GET", "/status"),
+                ("GET", "/sensors"),
+                ("GET", "/fans"),
+                ("GET", "/profiles"),
+                ("GET", "/config"),
+                ("GET", "/history/sensors/cpu"),
+                ("GET", "/ws"),
+                ("POST", "/profiles/active"),
+                ("POST", "/fans/f1/override"),
+                ("DELETE", "/fans/f1/override"),
+                ("PUT", "/config"),
+            ] {
+                let code = with_host(&r, m, u, Some(host)).await;
+                assert_eq!(
+                    code,
+                    StatusCode::MISDIRECTED_REQUEST,
+                    "{m} {u} Host: {host:?}"
+                );
+            }
+        }
+        let code = with_host(&r, "GET", "/status", None).await;
+        assert_eq!(code, StatusCode::MISDIRECTED_REQUEST, "no Host at all");
+        assert!(!r.dir.path().join("config.toml").exists());
+    }
+
+    #[tokio::test]
+    async fn the_loopback_host_names_with_our_port_pass() {
+        let r = rig(vec![at(40.0)]);
+        for host in [
+            "127.0.0.1:7272",
+            "localhost:7272",
+            "[::1]:7272",
+            "LocalHost:7272",
+        ] {
+            assert_eq!(
+                with_host(&r, "GET", "/status", Some(host)).await,
+                StatusCode::OK,
+                "{host}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_websocket_from_a_foreign_origin_is_403_before_the_upgrade() {
+        let r = rig(vec![at(40.0)]);
+        for origin in ["http://evil.example", "https://tauri.localhost", "null"] {
+            let req = Request::get("/ws")
+                .header("origin", origin)
+                .body(Body::empty())
+                .unwrap();
+            let res = router(r.state.clone()).oneshot(req).await.unwrap();
+            assert_eq!(res.status(), StatusCode::FORBIDDEN, "{origin}");
+        }
+    }
+
+    /// Opens `/ws` on a real server, optionally with an `Origin`; returns the first frame or the HTTP status.
+    fn ws_handshake(origin: Option<&str>) -> Result<Value, u16> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use tokio_tungstenite::tungstenite::Error;
+        let r = rig(vec![at(40.0)]);
+        let server = ApiServer::start(r.state.clone(), 0).unwrap();
+        let mut req = format!("ws://{}/ws", server.local_addr())
+            .into_client_request()
+            .unwrap();
+        if let Some(o) = origin {
+            req.headers_mut().insert("origin", o.parse().unwrap());
+        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let out = rt.block_on(async {
+            match tokio_tungstenite::connect_async(req).await {
+                Ok((mut ws, _)) => {
+                    let m = ws.next().await.unwrap().unwrap();
+                    Ok(serde_json::from_str(m.to_text().unwrap()).unwrap())
+                }
+                Err(Error::Http(res)) => Err(res.status().as_u16()),
+                Err(e) => panic!("{e}"),
+            }
+        });
+        server.shutdown();
+        out
+    }
+
+    #[test]
+    fn websocket_accepts_no_origin_and_the_two_tauri_origins_only() {
+        assert!(ws_handshake(None).is_ok(), "native clients send no Origin");
+        assert!(ws_handshake(Some("tauri://localhost")).is_ok());
+        assert!(ws_handshake(Some("http://tauri.localhost")).is_ok());
+        assert_eq!(ws_handshake(Some("http://evil.example")).unwrap_err(), 403);
+    }
+
     // ---- real server: bind address, websocket ----
 
     #[test]
@@ -914,8 +1150,10 @@ mod tests {
         assert_ne!(addr.port(), 0);
         let mut c = std::net::TcpStream::connect(addr).unwrap();
         use std::io::{Read, Write};
-        c.write_all(b"GET /status HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
-            .unwrap();
+        c.write_all(
+            format!("GET /status HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes(),
+        )
+        .unwrap();
         let mut out = String::new();
         c.read_to_string(&mut out).unwrap();
         assert!(out.starts_with("HTTP/1.1 200"), "{out}");

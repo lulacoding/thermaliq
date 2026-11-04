@@ -32,7 +32,9 @@ pub enum CommandError {
     Rejected(String),
 }
 
-type Reply = oneshot::Sender<Result<(), CommandError>>;
+/// `Ok(Some(reason))`: done, but a safety rule (S2–S4) currently overrides it. Only overrides use it.
+type Done = Result<Option<&'static str>, CommandError>;
+type Reply = oneshot::Sender<Done>;
 
 enum Cmd {
     SetProfile(Profile, Reply),
@@ -61,13 +63,14 @@ fn apply(engine: &mut Engine, began: Instant, cache: &RwLock<Cache>, cmd: Cmd) {
                 .write()
                 .unwrap_or_else(PoisonError::into_inner)
                 .active_profile = p.name;
-            (Ok(()), reply)
+            (Ok(None), reply)
         }
         Cmd::Override(fan, duty, dur, reply) => {
             let r = if engine.can_control(&fan) {
                 engine
                     .submit(&fan, Source::Override, duty, Some(began.elapsed() + dur))
                     .map_err(CommandError::Rejected)
+                    .map(|()| engine.override_blocked_by(&fan))
             } else {
                 Err(CommandError::Rejected(format!(
                     "fan '{fan}' is not controlled by the active profile, or is read-only"
@@ -77,7 +80,7 @@ fn apply(engine: &mut Engine, began: Instant, cache: &RwLock<Cache>, cmd: Cmd) {
         }
         Cmd::Cancel(fan, reply) => {
             let r = match engine.cancel_override(&fan) {
-                Ok(true) => Ok(()),
+                Ok(true) => Ok(None),
                 Ok(false) => Err(CommandError::NotFound(format!(
                     "fan '{fan}' has no active override"
                 ))),
@@ -110,7 +113,7 @@ impl Handle {
             .clone()
     }
 
-    async fn ask(&self, make: impl FnOnce(Reply) -> Cmd) -> Result<(), CommandError> {
+    async fn ask(&self, make: impl FnOnce(Reply) -> Cmd) -> Done {
         let (reply, answer) = oneshot::channel();
         self.tx
             .send(Msg::Cmd(make(reply)))
@@ -122,23 +125,19 @@ impl Handle {
     }
 
     pub async fn set_profile(&self, profile: Profile) -> Result<(), CommandError> {
-        self.ask(|r| Cmd::SetProfile(profile, r)).await
+        self.ask(|r| Cmd::SetProfile(profile, r)).await.map(drop)
     }
 
     /// `duty` is clamped to 0–100 and `seconds` capped at 300; 0 seconds is rejected.
-    pub async fn set_override(
-        &self,
-        fan: &str,
-        duty: i64,
-        seconds: u64,
-    ) -> Result<(), CommandError> {
+    /// `Ok(Some(reason))`: stored, but safety holds the fan right now ("latched", "degraded", "sensor_lost").
+    pub async fn set_override(&self, fan: &str, duty: i64, seconds: u64) -> Done {
         let (duty, dur) = clamp_override(duty, seconds)
             .ok_or_else(|| CommandError::Rejected("an override needs seconds > 0".into()))?;
         self.ask(|r| Cmd::Override(fan.into(), duty, dur, r)).await
     }
 
     pub async fn cancel_override(&self, fan: &str) -> Result<(), CommandError> {
-        self.ask(|r| Cmd::Cancel(fan.into(), r)).await
+        self.ask(|r| Cmd::Cancel(fan.into(), r)).await.map(drop)
     }
 }
 
@@ -731,21 +730,46 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn a_flood_of_commands_does_not_starve_ticks() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_continuous_flood_of_commands_does_not_starve_ticks() {
         let (_hal, d) = start(vec![at(40.0)], vec![], &db(), fast());
         let h = d.handle();
+        wait_until(|| d.cache().ticks > 0);
         let before = d.cache().ticks;
-        let flood: Vec<_> = (0..500)
+        // Flood for 20 tick periods (the tick is 5 ms), so the queue never drains in one window.
+        let end = Instant::now() + 20 * fast().tick;
+        // Producers don't wait for replies, so the queue is never empty while they run.
+        let flood: Vec<_> = (0..4)
             .map(|_| {
-                let h = h.clone();
-                tokio::spawn(async move { h.cancel_override("f1").await })
+                let tx = h.tx.clone();
+                std::thread::spawn(move || {
+                    while Instant::now() < end {
+                        let (reply, _) = oneshot::channel();
+                        let _ = tx.send(Msg::Cmd(Cmd::Cancel("f1".into(), reply)));
+                    }
+                })
             })
             .collect();
         for f in flood {
-            let _ = f.await;
+            f.join().unwrap();
         }
-        assert!(d.cache().ticks > before, "ticks kept running");
+        let rose = d.cache().ticks - before;
+        assert!(rose >= 3, "only {rose} ticks ran during the flood");
+        d.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_override_reports_whether_it_is_in_effect() {
+        let (_hal, d) = start(vec![at(40.0)], vec![], &db(), fast());
+        wait_until(|| d.cache().ticks > 0);
+        assert_eq!(d.handle().set_override("f1", 50, 60).await, Ok(None));
+        d.shutdown().unwrap();
+        let (_hal, d) = start(vec![at(97.0)], vec![], &db(), fast());
+        wait_until(|| d.cache().status.latched);
+        assert_eq!(
+            d.handle().set_override("f1", 50, 60).await,
+            Ok(Some("latched"))
+        );
         d.shutdown().unwrap();
     }
 
