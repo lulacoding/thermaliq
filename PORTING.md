@@ -41,12 +41,12 @@ Stop and talk these through with Sam (in claude.ai) before any code for the modu
 - [x] **M10 NVIDIA backend** — port + fix · v0: `thermaliq-hal/src/windows.rs` (`nvml_*`) · fix: load + init once; `restore_auto` = default fan speed; every HAL call has a timeout (~2 s) and returns an error instead of blocking, else a stuck `snapshot()`/`set_fan_duty()` hangs shutdown and S5 (M8a review)
 - [x] **M11 HWiNFO sensor source (optional)** — port · v0: `thermaliq-hal/src/windows.rs` (`Hwinfo*`) · keep its tests (#42, hardware-tested and approved)
 
-> **G1** on the Windows PC (SPEC §8).
+- [x] **G1 Safety gate** (SPEC §8) — passed on the Windows PC, RTX 4060, 2026-11-04: `scripts/g1.ps1`, all 9 steps; reviewed and approved on PR #43.
 
 ## Phase 3 — Windows motherboard fans
 
 - [ ] **M12 LHM bridge** — new · .NET sidecar on LibreHardwareMonitorLib + PawnIO, JSON over a named pipe, 5 s watchdog (S6) · test: protocol tests; watchdog restores auto; every bridge call has a timeout (~2 s) and errors instead of blocking, else shutdown hangs (M8a review)
-- [ ] **M13 Stable fan IDs + first-run mapping** — new · v0 lesson: HWiNFO IDs shift with sensor index · test: IDs survive reorder; bundled-profile role IDs (`cpu_package`, `chassis1`, ...) map to real hardware IDs; NVIDIA ids (`nvml_gpu{index}_...`, M10) depend on NVML enumeration order, so key them on the GPU UUID (M10 review)
+- [ ] **M13 Stable fan IDs + first-run mapping** — new · v0 lesson: HWiNFO IDs shift with sensor index · test: IDs survive reorder; bundled-profile role IDs (`cpu_package`, `chassis1`, ...) map to real hardware IDs; NVIDIA ids (`nvml_gpu{index}_...`, M10) depend on NVML enumeration order, so key them on the GPU UUID (M10 review); first-run mapping must make a bundled profile drive the real fan (G1 needed a temporary profile); switch g1.ps1 to the mapped profile
 
 > **G3** on the Windows PC.
 
