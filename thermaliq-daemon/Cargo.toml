@@ -8,6 +8,11 @@ license.workspace = true
 thermaliq-common = { path = "../thermaliq-common" }
 thermaliq-hal = { path = "../thermaliq-hal" }
 thermaliq-engine = { path = "../thermaliq-engine" }
+toml = "1.1.8"
+getrandom = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true
