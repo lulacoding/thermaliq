@@ -31,6 +31,7 @@ All of this happens inside the SPEC §3 safety rules, which the agent can never 
 | Tauri UI, `tq` CLI, HTTP API + WebSocket | |
 | LLM profile generation (one OpenAI-compatible provider) | Multiple LLM providers |
 | Agent (§7): setup, live optimiser with a learned thermal model, Jev-style decision provider, learning | Agent-only curve types in profiles (the agent writes normal curves) |
+| Setup load generator, fan health alerts, "why is it loud?", tray pause, acoustic calibration (§7.6) | Weekly report, one-click hardware report, call mode (quiet when Discord/Zoom open) |
 
 Anything not in the left column does not get code, stubs, enum variants, UI, or docs claiming it exists.
 
@@ -101,7 +102,7 @@ Decided in the agent brainstorm (Sam, 2026-11-04). Research: `docs/dev/research/
 
 1. Discover every fan and pump (M10–M13 backends).
 2. Calibrate each fan at priority 2 (time-limited): start %, stop %, max RPM. Pumps are measured, never stopped.
-3. Map fans to components: raise one fan at a time under a steady load and watch which temperatures drop. A clear result is applied. An unclear one is asked of the decision model, then of the user if the model isn't confident.
+3. Map fans to components: raise one fan at a time under a steady load (the built-in load generator, §7.6) and watch which temperatures drop. A clear result is applied. An unclear one is asked of the decision model, then of the user if the model isn't confident.
 4. Write a starting profile per workload from the mapping, and record a baseline for the thermal model.
 
 ### 7.2 Runtime
@@ -135,6 +136,14 @@ Retrain the classifier and the thermal models on history. Search curve changes p
 - Live optimiser: in mock-hardware tests, it never lowers a fan whose temperature is over target or predicted over target, and never goes past the 15-point limit.
 - Gaming cost: the local CPU decision model's FPS cost in a real game must be < 2% (average FPS, same scene, with and without it). If it fails, the local model doesn't run while a game is in the foreground, and its calls queue until the game closes.
 - Latency: the fast layer takes < 1 ms per tick. Slow-layer timing is logged per provider.
+
+### 7.6 Launch features (Sam, 2026-11-04)
+
+- **Load generator (setup):** steady CPU and GPU load, for mapping and calibration only. Each run lasts at most 60 s, and the user can cancel it any time. It stops at once if the S2 latch fires or any temperature reaches its target + 5 °C. It never runs without the user starting setup.
+- **Fan health and dust alerts:** from history, at the same duty and load. A fan's RPM dropping ≥ 15% over 30 days → "fan may be failing". A component running ≥ 5 °C hotter than its baseline over 30 days → "clean filters or dust". These are alerts only (M16). They never change control.
+- **"Why is it loud?":** every fan shows its current reason, built from templates over the deciding source (latch, override, agent with reason and confidence, profile curve) and its inputs. No LLM. API: part of `/fans`.
+- **Tray icon:** shows the state (safe / agent active / latched / degraded). One click pauses the agent: its requests are withdrawn, and the profile runs as if the agent were off. Pausing works even when the UI is closed.
+- **Acoustic calibration (optional, needs a mic, user opt-in):** during setup, sweep each fan's RPM and measure the noise level in dB. The agent's "quiet" then uses the measured dB, and it avoids RPM bands with resonance or whine. Audio is processed in memory on the PC and never stored or sent. Only the RPM → dB table is saved.
 
 ## 8. Gates (real hardware, run by Sam on the Windows PC)
 
