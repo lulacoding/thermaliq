@@ -2,7 +2,9 @@
 //! and the history thread. Only `thermaliq-engine` writes to fans.
 
 use crate::history::{recorded_sensor_ids, HistoryDb};
+use std::collections::HashMap;
 use std::fs;
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::path::Path;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
@@ -24,6 +26,8 @@ pub struct Options {
 /// What `/status` reports (SPEC S2, S4).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Status {
+    /// False once the engine thread has stopped or panicked; everything else is then stale.
+    pub engine_running: bool,
     pub latched: bool,
     pub degraded: bool,
     /// CPU/GPU sensors the latch is waiting on to cool down or come back.
@@ -37,6 +41,8 @@ pub struct Cache {
     pub status: Status,
     /// Ticks run so far; 0 means nothing has been read yet.
     pub ticks: u64,
+    /// Ticks since `snapshot` was read from the hardware; 0 = fresh (S4 starts at 3).
+    pub snapshot_age: u64,
 }
 
 type HistoryTick = (i64, Vec<SensorReading>, Vec<FanReading>);
@@ -60,48 +66,72 @@ impl Daemon {
         opts: Options,
     ) -> Self {
         saved.push(active.clone());
-        let cache = Arc::new(RwLock::new(Cache::default()));
+        let cache = Arc::new(RwLock::new(Cache {
+            status: Status {
+                engine_running: true,
+                ..Status::default()
+            },
+            ..Cache::default()
+        }));
         let (stop, stopped) = mpsc::channel::<()>();
         let (tx, rx) = mpsc::sync_channel::<HistoryTick>(HISTORY_QUEUE);
         let history = std::thread::spawn(move || history_loop(&rx, &history, opts.prune_every));
         let engine = {
             let (cache, active, tick) = (cache.clone(), active.clone(), opts.tick);
             std::thread::spawn(move || {
-                // Dropped when this closure ends or unwinds, which hands the fans back (S5).
-                let mut engine = Engine::new(hal, &active);
-                let began = Instant::now();
-                let mut ticks = 0u64;
-                loop {
-                    let t0 = Instant::now();
-                    engine.tick(t0 - began);
-                    ticks += 1;
-                    let snapshot = engine.last_snapshot().cloned().unwrap_or_default();
-                    if engine.snapshot_fresh() {
-                        let sensors = recorded_sensor_ids(&saved, &snapshot);
-                        let sensors = snapshot
-                            .sensors
-                            .iter()
-                            .filter(|s| sensors.contains(&s.id))
-                            .cloned()
-                            .collect();
-                        // A full queue drops this tick's history rather than stall the engine.
-                        let _ = tx.try_send((unix_now(), sensors, snapshot.fans.clone()));
+                let run = catch_unwind(AssertUnwindSafe(|| {
+                    // The engine is dropped when this closure ends or unwinds, which hands the fans back (S5).
+                    let mut engine = Engine::new(hal, &active);
+                    let began = Instant::now();
+                    let (mut ticks, mut snapshot_age) = (0u64, 0u64);
+                    loop {
+                        let t0 = Instant::now();
+                        engine.tick(t0 - began);
+                        ticks += 1;
+                        let snapshot = engine.last_snapshot().cloned().unwrap_or_default();
+                        snapshot_age = if engine.snapshot_fresh() {
+                            0
+                        } else {
+                            snapshot_age + 1
+                        };
+                        if engine.snapshot_fresh() {
+                            let sensors = recorded_sensor_ids(&saved, &snapshot);
+                            let sensors = snapshot
+                                .sensors
+                                .iter()
+                                .filter(|s| sensors.contains(&s.id))
+                                .cloned()
+                                .collect();
+                            // A full queue drops this tick's history rather than stall the engine.
+                            let _ = tx.try_send((unix_now(), sensors, snapshot.fans.clone()));
+                        }
+                        let status = Status {
+                            engine_running: true,
+                            latched: engine.latched(),
+                            degraded: engine.degraded(),
+                            waiting_on: engine.latch_waiting_on().to_vec(),
+                        };
+                        *cache.write().unwrap_or_else(PoisonError::into_inner) = Cache {
+                            snapshot,
+                            status,
+                            ticks,
+                            snapshot_age,
+                        };
+                        // Any message, or the Daemon dropping its sender, means stop.
+                        let wait = tick.saturating_sub(t0.elapsed());
+                        if !matches!(stopped.recv_timeout(wait), Err(RecvTimeoutError::Timeout)) {
+                            break;
+                        }
                     }
-                    let status = Status {
-                        latched: engine.latched(),
-                        degraded: engine.degraded(),
-                        waiting_on: engine.latch_waiting_on().to_vec(),
-                    };
-                    *cache.write().unwrap_or_else(PoisonError::into_inner) = Cache {
-                        snapshot,
-                        status,
-                        ticks,
-                    };
-                    // Any message, or the Daemon dropping its sender, means stop.
-                    let wait = tick.saturating_sub(t0.elapsed());
-                    if !matches!(stopped.recv_timeout(wait), Err(RecvTimeoutError::Timeout)) {
-                        break;
-                    }
+                }));
+                // The engine is gone and the fans are handed back; don't keep claiming it runs.
+                cache
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .status
+                    .engine_running = false;
+                if let Err(panic) = run {
+                    resume_unwind(panic); // so shutdown() reports it
                 }
             })
         };
@@ -196,6 +226,7 @@ pub fn load_profiles(dir: &Path) -> (Vec<Profile>, Vec<String>) {
         }
     };
     files.sort();
+    let mut saved_from: HashMap<String, String> = HashMap::new();
     for path in files
         .iter()
         .filter(|p| p.extension().is_some_and(|x| x == "toml"))
@@ -206,6 +237,12 @@ pub fn load_profiles(dir: &Path) -> (Vec<Profile>, Vec<String>) {
             .and_then(|s| Profile::from_toml(&s).map_err(|e| e.to_string()))
         {
             Ok(p) => {
+                if let Some(earlier) = saved_from.insert(p.name.clone(), shown.to_string()) {
+                    skipped.push(format!(
+                        "{earlier}: overridden by {shown} (both are named '{}')",
+                        p.name
+                    ));
+                }
                 profiles.retain(|b| b.name != p.name);
                 profiles.push(p);
             }
@@ -308,6 +345,12 @@ mod tests {
         let d = Daemon::start(hal, &active, vec![], db(), fast());
         wait_until(|| !mock.restores().is_empty());
         assert_eq!(mock.restores(), ["f1"]);
+        wait_until(|| !d.cache().status.engine_running);
+        let c = d.cache();
+        assert!(
+            !c.status.latched && !c.status.degraded,
+            "not a health claim"
+        );
         assert!(d.shutdown().is_err());
     }
 
@@ -318,7 +361,32 @@ mod tests {
         let c = d.cache();
         assert_eq!(c.snapshot.sensors[0].id, "cpu");
         assert_eq!(c.snapshot.fans.len(), 2);
-        assert_eq!(c.status, Status::default());
+        let running = Status {
+            engine_running: true,
+            ..Status::default()
+        };
+        assert_eq!(c.status, running);
+        assert_eq!(c.snapshot_age, 0);
+        d.shutdown().unwrap();
+    }
+
+    #[test]
+    fn engine_running_is_true_from_start_and_false_after_a_clean_stop() {
+        let (_hal, d) = start(vec![at(40.0)], vec![], &db(), fast());
+        assert!(d.cache().status.engine_running);
+        let cache = d.cache.clone();
+        d.shutdown().unwrap();
+        assert!(!cache.read().unwrap().status.engine_running);
+    }
+
+    #[test]
+    fn a_failing_snapshot_ages_the_cache_but_keeps_the_old_values() {
+        let (_hal, d) = start(vec![at(40.0), Tick::Fail], vec![], &db(), fast());
+        wait_until(|| d.cache().snapshot_age >= 2);
+        let c = d.cache();
+        assert_eq!(c.snapshot.sensors[0].temp_celsius, 40.0);
+        let age = c.snapshot_age;
+        wait_until(|| d.cache().snapshot_age > age);
         d.shutdown().unwrap();
     }
 
@@ -422,6 +490,36 @@ mod tests {
         assert!(names.contains(&"balanced"), "bundled profiles are included");
         assert_eq!(skipped.len(), 1);
         assert!(skipped[0].contains("bad.toml"), "{skipped:?}");
+    }
+
+    #[test]
+    fn load_profiles_reports_a_saved_profile_overridden_by_a_later_same_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("profiles");
+        fs::create_dir(&p).unwrap();
+        fs::write(p.join("a.toml"), FLAT).unwrap();
+        fs::write(p.join("b.toml"), FLAT).unwrap();
+        let (profiles, skipped) = load_profiles(dir.path());
+        assert_eq!(profiles.iter().filter(|p| p.name == "flat").count(), 1);
+        assert_eq!(skipped.len(), 1);
+        assert!(
+            skipped[0].contains("a.toml") && skipped[0].contains("b.toml"),
+            "{skipped:?}"
+        );
+    }
+
+    #[test]
+    fn a_saved_profile_replacing_a_bundled_one_is_not_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("profiles");
+        fs::create_dir(&p).unwrap();
+        fs::write(
+            p.join("x.toml"),
+            FLAT.replacen("\"flat\"", "\"balanced\"", 1),
+        )
+        .unwrap();
+        let (_, skipped) = load_profiles(dir.path());
+        assert!(skipped.is_empty(), "{skipped:?}");
     }
 
     #[test]
