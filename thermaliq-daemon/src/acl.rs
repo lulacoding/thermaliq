@@ -108,6 +108,24 @@ mod tests {
         fn ace(&self, sid: &str) -> &Ace {
             self.aces.iter().find(|a| a.sid == sid).unwrap()
         }
+        /// For assertion messages.
+        fn show(&self) -> String {
+            let aces: Vec<String> = self
+                .aces
+                .iter()
+                .map(|a| format!("{}:{}:{}:{:#x}", a.kind, a.flags, a.sid, a.mask))
+                .collect();
+            format!("protected={} {}", self.protected, aces.join(" "))
+        }
+    }
+
+    /// SDDL writes the built-in Administrator account (RID 500, the CI runner's user) as `LA`.
+    fn sddl_name(sid: &str) -> String {
+        if sid.ends_with("-500") {
+            "LA".into()
+        } else {
+            sid.into()
+        }
     }
 
     fn mask(rights: &str) -> u32 {
@@ -229,7 +247,7 @@ mod tests {
         };
         let d = dacl(&dir);
         assert!(d.protected, "inheritance must be broken");
-        assert_eq!(d.sids(), BTreeSet::from(["SY", "BA", "BU"]));
+        assert_eq!(d.sids(), BTreeSet::from(["SY", "BA", "BU"]), "{}", d.show());
         assert!(d
             .aces
             .iter()
@@ -248,8 +266,14 @@ mod tests {
             return;
         };
         let t = dacl(&dir.join("token.txt"));
+        let sid = sddl_name(&sid);
         assert!(t.protected);
-        assert_eq!(t.sids(), BTreeSet::from(["SY", "BA", sid.as_str()]));
+        assert_eq!(
+            t.sids(),
+            BTreeSet::from(["SY", "BA", sid.as_str()]),
+            "{}",
+            t.show()
+        );
         assert!(t.aces.iter().all(|a| !a.flags.contains("ID")));
         let me = t.ace(&sid).mask;
         assert_ne!(me & READ_DATA, 0);
@@ -270,7 +294,7 @@ mod tests {
             return;
         };
         let c = dacl(&dir.join("config.toml"));
-        assert_eq!(c.sids(), BTreeSet::from(["SY", "BA", "BU"]));
+        assert_eq!(c.sids(), BTreeSet::from(["SY", "BA", "BU"]), "{}", c.show());
         assert!(
             c.aces.iter().all(|a| a.flags.contains("ID")),
             "inherited from the dir"
@@ -286,11 +310,14 @@ mod tests {
         let token = fs::read_to_string(dir.join("token.txt")).unwrap();
         lock_data_dir(&dir, &sid).unwrap();
         assert_eq!(fs::read_to_string(dir.join("token.txt")).unwrap(), token);
+        let (t, d, sid) = (dacl(&dir.join("token.txt")), dacl(&dir), sddl_name(&sid));
         assert_eq!(
-            dacl(&dir.join("token.txt")).sids(),
-            BTreeSet::from(["SY", "BA", sid.as_str()])
+            t.sids(),
+            BTreeSet::from(["SY", "BA", sid.as_str()]),
+            "{}",
+            t.show()
         );
-        assert_eq!(dacl(&dir).sids(), BTreeSet::from(["SY", "BA", "BU"]));
+        assert_eq!(d.sids(), BTreeSet::from(["SY", "BA", "BU"]), "{}", d.show());
     }
 
     #[test]
