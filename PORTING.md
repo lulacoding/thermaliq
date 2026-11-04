@@ -37,7 +37,7 @@ Stop and talk these through with Sam (in claude.ai) before any code for the modu
 - [x] **M8 HTTP API + WebSocket** — port router/auth/ws, rewrite handlers · v0: `thermaliq-daemon/src/api/*` · test: every mutation rejects missing token; no handler returns success without effect; reads use the snapshot cache (M8a #38 + M8b #39, reviewed, CI-green)
 - [x] **M9 Windows service** — port, add graceful stop · v0: `thermaliq-daemon/src/service.rs` · test (Windows CI): stop path calls engine shutdown, not `abort()`; data dir `ThermalIQ\` has inheritance broken (SYSTEM + Administrators full, Users read-only), so a standard user cannot drop a config.toml or profile the service loads; token.txt readable only by users allowed to control fans (M6 review); service stop must finish within the SCM timeout even if a HAL call is stuck (M8a review)
 - [x] **M10 NVIDIA backend** — port + fix · v0: `thermaliq-hal/src/windows.rs` (`nvml_*`) · fix: load + init once; `restore_auto` = default fan speed; every HAL call has a timeout (~2 s) and returns an error instead of blocking, else a stuck `snapshot()`/`set_fan_duty()` hangs shutdown and S5 (M8a review)
-- [ ] **M11 HWiNFO sensor source (optional)** — port · v0: `thermaliq-hal/src/windows.rs` (`Hwinfo*`) · keep its tests
+- [x] **M11 HWiNFO sensor source (optional)** — port · v0: `thermaliq-hal/src/windows.rs` (`Hwinfo*`) · keep its tests (#42, hardware-tested and approved)
 
 > **G1** on the Windows PC (SPEC §8).
 
