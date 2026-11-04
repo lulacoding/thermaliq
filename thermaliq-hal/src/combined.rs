@@ -4,26 +4,68 @@ use crate::{Capabilities, HalError, HardwareLayer};
 use std::sync::Arc;
 use thermaliq_common::HardwareSnapshot;
 
-pub struct CombinedHardwareLayer;
+use std::collections::HashMap;
+
+pub struct CombinedHardwareLayer {
+    backends: Vec<Arc<dyn HardwareLayer>>,
+    /// Controllable fan id -> index of the backend that owns it.
+    owner: HashMap<String, usize>,
+}
 
 impl CombinedHardwareLayer {
-    pub fn new(_backends: Vec<Arc<dyn HardwareLayer>>) -> Result<Self, HalError> {
-        Err(HalError("not implemented".into()))
+    /// Errors if no backend is given or two backends claim the same controllable fan.
+    pub fn new(backends: Vec<Arc<dyn HardwareLayer>>) -> Result<Self, HalError> {
+        if backends.is_empty() {
+            return Err(HalError("no hardware backends".into()));
+        }
+        let mut owner = HashMap::new();
+        for (i, b) in backends.iter().enumerate() {
+            for fan in b.capabilities().controllable_fans {
+                if owner.insert(fan.clone(), i).is_some() {
+                    return Err(HalError(format!("fan '{fan}' is claimed by two backends")));
+                }
+            }
+        }
+        Ok(Self { backends, owner })
+    }
+
+    fn owner_of(&self, fan: &str) -> Result<&dyn HardwareLayer, HalError> {
+        self.owner
+            .get(fan)
+            .map(|&i| self.backends[i].as_ref())
+            .ok_or_else(|| HalError(format!("no backend controls fan '{fan}'")))
     }
 }
 
 impl HardwareLayer for CombinedHardwareLayer {
+    /// Any backend failing fails the snapshot: a missing backend would silently drop its
+    /// sensors, and S4 wants a failed read to be loud.
     fn snapshot(&self) -> Result<HardwareSnapshot, HalError> {
-        Err(HalError("not implemented".into()))
+        let mut all = HardwareSnapshot::default();
+        for b in &self.backends {
+            let s = b.snapshot()?;
+            all.sensors.extend(s.sensors);
+            all.fans.extend(s.fans);
+        }
+        Ok(all)
     }
-    fn set_fan_duty(&self, _: &str, _: u8) -> Result<(), HalError> {
-        Err(HalError("not implemented".into()))
+
+    fn set_fan_duty(&self, fan: &str, duty: u8) -> Result<(), HalError> {
+        self.owner_of(fan)?.set_fan_duty(fan, duty)
     }
-    fn restore_auto(&self, _: &str) -> Result<(), HalError> {
-        Err(HalError("not implemented".into()))
+
+    fn restore_auto(&self, fan: &str) -> Result<(), HalError> {
+        self.owner_of(fan)?.restore_auto(fan)
     }
+
     fn capabilities(&self) -> Capabilities {
-        Capabilities::default()
+        Capabilities {
+            controllable_fans: self
+                .backends
+                .iter()
+                .flat_map(|b| b.capabilities().controllable_fans)
+                .collect(),
+        }
     }
 }
 

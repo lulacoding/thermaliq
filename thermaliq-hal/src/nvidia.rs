@@ -1,8 +1,10 @@
 //! NVIDIA GPU backend over NVML (SPEC §2, M10).
 
 use crate::{Capabilities, HalError, HardwareLayer};
-use std::time::Duration;
-use thermaliq_common::HardwareSnapshot;
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::thread;
+use std::time::{Duration, Instant};
+use thermaliq_common::{FanReading, HardwareSnapshot, SensorKind, SensorReading};
 
 /// Every HAL call returns within this, success or error (PORTING M10).
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(2);
@@ -21,29 +23,214 @@ pub trait Nvml: Send + 'static {
     fn set_default_fan(&mut self, gpu: u32, fan: u32) -> Result<(), String>;
 }
 
-pub struct Nvidia;
+/// Loading `nvml.dll` and `nvmlInit` can be slow on a cold start; this is not a per-tick call.
+const INIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+type Job = Box<dyn FnOnce(&mut dyn Nvml) + Send>;
+
+/// NVML runs on one worker thread that owns the library, so it is loaded and initialised
+/// once, and a wedged driver call only stalls that thread: callers give up at the deadline.
+pub struct Nvidia {
+    jobs: Sender<Job>,
+    timeout: Duration,
+    /// (fan id, gpu index, fan index) for every fan found at startup.
+    fans: Vec<(String, u32, u32)>,
+}
+
+fn fan_id(gpu: u32, fan: u32) -> String {
+    format!("nvml_gpu{gpu}_fan{fan}")
+}
+
+fn enumerate(api: &mut dyn Nvml) -> Result<Vec<(String, u32, u32)>, String> {
+    let mut fans = Vec::new();
+    for gpu in 0..api.gpu_count()? {
+        for fan in 0..api.fan_count(gpu)? {
+            fans.push((fan_id(gpu, fan), gpu, fan));
+        }
+    }
+    Ok(fans)
+}
+
+fn read_all(api: &mut dyn Nvml) -> Result<HardwareSnapshot, String> {
+    let mut snap = HardwareSnapshot::default();
+    for gpu in 0..api.gpu_count()? {
+        snap.sensors.push(SensorReading {
+            id: format!("nvml_gpu{gpu}_temp"),
+            label: format!("GPU {gpu}"),
+            kind: SensorKind::Gpu,
+            temp_celsius: api.temperature(gpu)? as f32,
+        });
+        for fan in 0..api.fan_count(gpu)? {
+            snap.fans.push(FanReading {
+                id: fan_id(gpu, fan),
+                label: format!("GPU {gpu} fan {fan}"),
+                // Older drivers have no RPM query; the duty is still real.
+                rpm: api.fan_rpm(gpu, fan).unwrap_or(0),
+                duty_percent: api.fan_percent(gpu, fan)?.min(100) as u8,
+            });
+        }
+    }
+    Ok(snap)
+}
 
 impl Nvidia {
+    /// `make` runs on the worker thread, once. `timeout` bounds every later call.
     pub fn with_api(
-        _make: impl FnOnce() -> Result<Box<dyn Nvml>, String> + Send + 'static,
-        _timeout: Duration,
+        make: impl FnOnce() -> Result<Box<dyn Nvml>, String> + Send + 'static,
+        timeout: Duration,
     ) -> Result<Self, HalError> {
-        Err(HalError("not implemented".into()))
+        let (jobs, queue) = mpsc::channel::<Job>();
+        let (ready, started) = mpsc::channel();
+        thread::Builder::new()
+            .name("nvml".into())
+            .spawn(move || {
+                let mut api = match make() {
+                    Ok(api) => api,
+                    Err(e) => return drop(ready.send(Err(e))),
+                };
+                let _ = ready.send(Ok(()));
+                // Ends when `Nvidia` is dropped (the sender goes away).
+                for job in queue {
+                    job(api.as_mut());
+                }
+            })
+            .map_err(|e| HalError(format!("cannot start the NVML thread: {e}")))?;
+        match started.recv_timeout(INIT_TIMEOUT) {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(HalError(e)),
+            Err(_) => return Err(HalError("NVML did not initialise in time".into())),
+        }
+        let mut nvidia = Self {
+            jobs,
+            timeout,
+            fans: Vec::new(),
+        };
+        nvidia.fans = nvidia.call(true, enumerate)?;
+        Ok(nvidia)
+    }
+
+    /// Runs `f` on the worker and waits up to the timeout. A job still queued after its
+    /// deadline is skipped unless `late_ok`: a late write would act on a stale decision,
+    /// but a late hand-back is still wanted.
+    fn call<T: Send + 'static>(
+        &self,
+        late_ok: bool,
+        f: impl FnOnce(&mut dyn Nvml) -> Result<T, String> + Send + 'static,
+    ) -> Result<T, HalError> {
+        let deadline = Instant::now() + self.timeout;
+        let (reply, answer) = mpsc::channel();
+        let job: Job = Box::new(move |api| {
+            if late_ok || Instant::now() < deadline {
+                let _ = reply.send(f(api));
+            }
+        });
+        self.jobs
+            .send(job)
+            .map_err(|_| HalError("the NVML thread has stopped".into()))?;
+        match answer.recv_timeout(self.timeout) {
+            Ok(r) => r.map_err(HalError),
+            Err(RecvTimeoutError::Timeout) => Err(HalError(format!(
+                "NVML call timed out after {:?}",
+                self.timeout
+            ))),
+            Err(RecvTimeoutError::Disconnected) => {
+                Err(HalError("the NVML thread stopped during the call".into()))
+            }
+        }
+    }
+
+    fn find(&self, fan: &str) -> Result<(u32, u32), HalError> {
+        self.fans
+            .iter()
+            .find(|(id, ..)| id == fan)
+            .map(|&(_, gpu, idx)| (gpu, idx))
+            .ok_or_else(|| HalError(format!("unknown NVIDIA fan '{fan}'")))
     }
 }
 
 impl HardwareLayer for Nvidia {
     fn snapshot(&self) -> Result<HardwareSnapshot, HalError> {
-        Err(HalError("not implemented".into()))
+        self.call(true, read_all)
     }
-    fn set_fan_duty(&self, _: &str, _: u8) -> Result<(), HalError> {
-        Err(HalError("not implemented".into()))
+
+    fn set_fan_duty(&self, fan: &str, duty: u8) -> Result<(), HalError> {
+        let (gpu, idx) = self.find(fan)?;
+        let percent = u32::from(duty.min(100));
+        self.call(false, move |api| api.set_fan_percent(gpu, idx, percent))
     }
-    fn restore_auto(&self, _: &str) -> Result<(), HalError> {
-        Err(HalError("not implemented".into()))
+
+    fn restore_auto(&self, fan: &str) -> Result<(), HalError> {
+        let (gpu, idx) = self.find(fan)?;
+        self.call(true, move |api| api.set_default_fan(gpu, idx))
     }
+
     fn capabilities(&self) -> Capabilities {
-        Capabilities::default()
+        Capabilities {
+            controllable_fans: self.fans.iter().map(|(id, ..)| id.clone()).collect(),
+        }
+    }
+}
+
+#[cfg(windows)]
+mod real {
+    use super::*;
+    use nvml_wrapper::enum_wrappers::device::TemperatureSensor;
+    use nvml_wrapper::error::NvmlError;
+
+    /// The real library, through nvml-wrapper's safe API (no `unsafe` in this crate).
+    struct RealNvml(nvml_wrapper::Nvml);
+
+    fn msg(e: NvmlError) -> String {
+        format!("NVML: {e}")
+    }
+
+    impl RealNvml {
+        fn device(&self, gpu: u32) -> Result<nvml_wrapper::Device<'_>, String> {
+            self.0.device_by_index(gpu).map_err(msg)
+        }
+    }
+
+    impl Nvml for RealNvml {
+        fn gpu_count(&mut self) -> Result<u32, String> {
+            self.0.device_count().map_err(msg)
+        }
+        fn temperature(&mut self, gpu: u32) -> Result<u32, String> {
+            self.device(gpu)?
+                .temperature(TemperatureSensor::Gpu)
+                .map_err(msg)
+        }
+        fn fan_count(&mut self, gpu: u32) -> Result<u32, String> {
+            match self.device(gpu)?.num_fans() {
+                Err(NvmlError::NotSupported) => Ok(0),
+                r => r.map_err(msg),
+            }
+        }
+        fn fan_percent(&mut self, gpu: u32, fan: u32) -> Result<u32, String> {
+            self.device(gpu)?.fan_speed(fan).map_err(msg)
+        }
+        fn fan_rpm(&mut self, gpu: u32, fan: u32) -> Result<u32, String> {
+            self.device(gpu)?.fan_speed_rpm(fan).map_err(msg)
+        }
+        fn set_fan_percent(&mut self, gpu: u32, fan: u32, percent: u32) -> Result<(), String> {
+            self.device(gpu)?.set_fan_speed(fan, percent).map_err(msg)
+        }
+        fn set_default_fan(&mut self, gpu: u32, fan: u32) -> Result<(), String> {
+            self.device(gpu)?.set_default_fan_speed(fan).map_err(msg)
+        }
+    }
+
+    impl Nvidia {
+        /// Loads `nvml.dll` and calls `nvmlInit` once, on the worker thread.
+        pub fn new() -> Result<Self, HalError> {
+            Self::with_api(
+                || {
+                    let nvml = nvml_wrapper::Nvml::init()
+                        .map_err(|e| format!("cannot load or initialise NVML: {e}"))?;
+                    Ok(Box::new(RealNvml(nvml)))
+                },
+                CALL_TIMEOUT,
+            )
+        }
     }
 }
 
@@ -339,6 +526,57 @@ mod tests {
         fake.hang(false);
         n.snapshot().unwrap();
         assert_eq!(fake.calls("default"), ["default 0 0"]);
+    }
+
+    /// Hands the fan back even if an assertion in the hardware test fails.
+    #[cfg(windows)]
+    struct Restore<'a>(&'a Nvidia, String);
+    #[cfg(windows)]
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.restore_auto(&self.1);
+        }
+    }
+
+    /// Real GPU. Run: `cargo test -p thermaliq-hal -- --ignored nvidia`. Needs an elevated
+    /// shell, and spins the first controllable fan to 60 % for 5 s.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs an NVIDIA GPU with a controllable fan and admin rights"]
+    fn nvidia_hardware_reads_writes_and_restores_a_real_fan() {
+        use nvml_wrapper::enums::device::FanControlPolicy;
+
+        let hw = Nvidia::new().unwrap();
+        let snap = hw.snapshot().unwrap();
+        let gpu = snap.sensors.iter().find(|s| s.kind == SensorKind::Gpu);
+        let temp = gpu.expect("no GPU temperature").temp_celsius;
+        assert!((10.0..110.0).contains(&temp), "implausible GPU temp {temp}");
+        let id = hw.capabilities().controllable_fans.remove(0);
+        let duty = |hw: &Nvidia| {
+            let fans = hw.snapshot().unwrap().fans;
+            fans.iter().find(|f| f.id == id).unwrap().duty_percent
+        };
+        let before = duty(&hw);
+        let _restore = Restore(&hw, id.clone());
+
+        hw.set_fan_duty(&id, 60).unwrap();
+        std::thread::sleep(Duration::from_secs(5));
+        let during = duty(&hw);
+        println!("{id}: {before} % -> {during} % (asked for 60)");
+        assert!(
+            during.abs_diff(60) <= 2,
+            "fan did not move to 60 %: {during}"
+        );
+
+        hw.restore_auto(&id).unwrap();
+        let (g, f) = id
+            .trim_start_matches("nvml_gpu")
+            .split_once("_fan")
+            .unwrap();
+        let nvml = nvml_wrapper::Nvml::init().unwrap();
+        let dev = nvml.device_by_index(g.parse().unwrap()).unwrap();
+        let policy = dev.fan_control_policy(f.parse().unwrap()).unwrap();
+        assert_eq!(policy, FanControlPolicy::TemperatureContinousSw);
     }
 
     #[test]
