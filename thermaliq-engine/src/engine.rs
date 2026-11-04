@@ -2,7 +2,7 @@ use crate::{CurveEngine, FanControl, SensorEngine, Source, Temps};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use thermaliq_common::{Control, HardwareSnapshot, Profile, SensorKind, SensorReading};
+use thermaliq_common::{Control, FanKind, HardwareSnapshot, Profile, SensorKind, SensorReading};
 use thermaliq_hal::HardwareLayer;
 
 /// SPEC S2 thresholds (°C) and hold time.
@@ -13,6 +13,9 @@ const GPU_RELEASE: f32 = 80.0;
 const RELEASE_HOLD: Duration = Duration::from_secs(30);
 /// SPEC S3/S4: consecutive ticks before a fault is acted on.
 const FAULT_TICKS: u8 = 3;
+/// A pump is never written below this (SPEC §7: never stop a pump).
+/// shortcut: one fixed floor for every pump; take it from the pump's calibration (M20a) when that exists.
+const PUMP_MIN_DUTY: u8 = 20;
 
 /// S2: trips on a hot CPU or GPU; releases after 30 s continuously cool.
 /// A NaN reading or a missing CPU/GPU sensor (one seen while hot) is not cool, so it can't release the latch.
@@ -119,6 +122,8 @@ pub struct Engine {
     written: HashMap<String, u8>,
     /// The snapshot the last successful tick used, for the daemon's shared cache.
     last: Option<HardwareSnapshot>,
+    /// Fans the last snapshot reported as pumps: never written 0 (SPEC §7).
+    pumps: HashSet<String>,
 }
 
 impl Engine {
@@ -134,6 +139,23 @@ impl Engine {
             snapshot_fails: 0,
             written: HashMap::new(),
             last: None,
+            pumps: HashSet::new(),
+        }
+    }
+
+    /// Rejects a profile that puts 0-RPM (`stop_percent`) on a fan the last snapshot called a
+    /// pump. With no snapshot yet nothing is known; `write` still never stops a pump.
+    pub fn check_profile(&self, profile: &Profile) -> Result<(), String> {
+        match profile
+            .controls
+            .iter()
+            .find(|c| c.stop_percent.is_some() && self.pumps.contains(&c.fan))
+        {
+            Some(c) => Err(format!(
+                "fan '{}' is a pump and cannot use 0-RPM (stop_percent)",
+                c.fan
+            )),
+            None => Ok(()),
         }
     }
 
@@ -243,6 +265,12 @@ impl Engine {
         };
         self.snapshot_fails = 0;
         self.last = Some(snap.clone());
+        self.pumps = snap
+            .fans
+            .iter()
+            .filter(|f| f.kind == FanKind::Pump)
+            .map(|f| f.id.clone())
+            .collect();
         for f in self.fans.iter_mut().filter(|f| !f.seeded) {
             if let Some(r) = snap.fans.iter().find(|r| r.id == f.id) {
                 f.ctl.seed(r.duty_percent, r.rpm > 0);
@@ -308,7 +336,10 @@ impl Engine {
     fn write(&mut self, fan: &str, duty: u8) {
         if self.controllable.contains(fan) {
             self.touched.insert(fan.to_string());
-            let duty = duty.min(100);
+            let mut duty = duty.min(100);
+            if self.pumps.contains(fan) {
+                duty = duty.max(PUMP_MIN_DUTY);
+            }
             if self.hal.set_fan_duty(fan, duty).is_ok() {
                 self.written.insert(fan.to_string(), duty);
             }
@@ -374,6 +405,54 @@ step_down_pct = 100
     fn last_writes(hal: &MockHardwareLayer, n: usize) -> Vec<u8> {
         let w = hal.writes();
         w[w.len() - n..].iter().map(|(_, d)| *d).collect()
+    }
+
+    /// PROFILE with 0-RPM (stop at 30, start above 40) on both fans.
+    fn zero_rpm_profile() -> Profile {
+        let p = PROFILE.replace(
+            "step_down_pct = 100\n",
+            "step_down_pct = 100\nstart_percent = 40\nstop_percent = 30\n",
+        );
+        Profile::from_toml(&p).unwrap()
+    }
+
+    fn pump_rig(script: Vec<Tick>) -> (Arc<MockHardwareLayer>, Engine) {
+        let hal = Arc::new(MockHardwareLayer::new(&["f1", "f2"], script).pump("f2"));
+        let e = Engine::new(hal.clone(), &zero_rpm_profile());
+        (hal, e)
+    }
+
+    #[test]
+    fn a_pump_is_never_written_zero_even_when_its_profile_says_0_rpm() {
+        let (hal, mut e) = pump_rig(vec![at(30.0, 30.0)]);
+        for t in 0..5 {
+            e.tick(secs(t));
+        }
+        let duty = |fan: &str| -> Vec<u8> {
+            hal.writes()
+                .iter()
+                .filter(|(f, _)| f == fan)
+                .map(|&(_, d)| d)
+                .collect()
+        };
+        assert!(duty("f1").contains(&0), "the plain fan does stop");
+        assert!(duty("f2").iter().all(|&d| d > 0), "{:?}", duty("f2"));
+    }
+
+    #[test]
+    fn check_profile_rejects_0_rpm_on_a_pump_and_accepts_it_on_a_fan() {
+        let (_, mut e) = pump_rig(vec![at(30.0, 30.0)]);
+        let p = zero_rpm_profile();
+        assert!(
+            e.check_profile(&p).is_ok(),
+            "no snapshot yet: nothing known"
+        );
+        e.tick(secs(0));
+        let err = e.check_profile(&p).unwrap_err();
+        assert!(err.contains("f2") && !err.contains("f1"), "{err}");
+        assert!(e
+            .check_profile(&Profile::from_toml(PROFILE).unwrap())
+            .is_ok());
     }
 
     #[test]

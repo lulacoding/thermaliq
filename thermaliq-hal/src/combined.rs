@@ -69,6 +69,7 @@ impl HardwareLayer for CombinedHardwareLayer {
             let s = b.snapshot()?;
             all.sensors.extend(s.sensors);
             all.fans.extend(s.fans);
+            all.metrics.extend(s.metrics);
         }
         let mut down = Vec::new();
         for (name, b) in &self.optional {
@@ -76,6 +77,7 @@ impl HardwareLayer for CombinedHardwareLayer {
                 Ok(s) => {
                     all.sensors.extend(s.sensors);
                     all.fans.extend(s.fans);
+                    all.metrics.extend(s.metrics);
                 }
                 Err(_) => down.push(name.clone()),
             }
@@ -134,6 +136,33 @@ mod tests {
         let b = mock(&["b1"], "cpu", SensorKind::Cpu);
         let c = CombinedHardwareLayer::new(vec![a.clone(), b.clone()]).unwrap();
         (a, b, c)
+    }
+
+    #[test]
+    fn snapshot_merges_metrics_and_fan_kinds_from_required_and_optional_backends() {
+        use thermaliq_common::{FanKind, MetricKind, MetricReading};
+        let m = |id: &str| {
+            vec![MetricReading {
+                id: id.into(),
+                kind: MetricKind::CpuLoad,
+                value: 1.0,
+            }]
+        };
+        let req = mock(&["p"], "gpu", SensorKind::Gpu);
+        let req = Arc::new(Arc::into_inner(req).unwrap().pump("p").metrics(m("a")));
+        let opt = Arc::new(
+            Arc::into_inner(mock(&[], "hw", SensorKind::Cpu))
+                .unwrap()
+                .metrics(m("b")),
+        );
+        let c = CombinedHardwareLayer::new(vec![req])
+            .unwrap()
+            .with_optional("hwinfo", opt)
+            .unwrap();
+        let snap = c.snapshot().unwrap();
+        let ids: Vec<_> = snap.metrics.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["a", "b"]);
+        assert_eq!(snap.fans[0].kind, FanKind::Pump);
     }
 
     #[test]

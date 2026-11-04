@@ -4,7 +4,9 @@ use crate::{Capabilities, HalError, HardwareLayer};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
-use thermaliq_common::{FanReading, HardwareSnapshot, SensorKind, SensorReading};
+use thermaliq_common::{
+    FanKind, FanReading, HardwareSnapshot, MetricKind, MetricReading, SensorKind, SensorReading,
+};
 
 /// Every HAL call returns within this, success or error (PORTING M10).
 #[cfg(windows)]
@@ -15,6 +17,14 @@ pub trait Nvml: Send + 'static {
     fn gpu_count(&mut self) -> Result<u32, String>;
     /// GPU core temperature in °C.
     fn temperature(&mut self, gpu: u32) -> Result<u32, String>;
+    /// GPU core load in %.
+    fn utilization(&mut self, gpu: u32) -> Result<u32, String>;
+    /// Board power draw in milliwatts.
+    fn power_mw(&mut self, gpu: u32) -> Result<u32, String>;
+    /// Graphics clock in MHz.
+    fn graphics_clock(&mut self, gpu: u32) -> Result<u32, String>;
+    /// NVML's current clock-throttle-reason bitmask (0 = not throttled).
+    fn throttle_reasons(&mut self, gpu: u32) -> Result<u64, String>;
     /// 0 for a GPU without controllable fans.
     fn fan_count(&mut self, gpu: u32) -> Result<u32, String>;
     fn fan_percent(&mut self, gpu: u32, fan: u32) -> Result<u32, String>;
@@ -61,6 +71,38 @@ fn read_all(api: &mut dyn Nvml) -> Result<HardwareSnapshot, String> {
             kind: SensorKind::Gpu,
             temp_celsius: api.temperature(gpu)? as f32,
         });
+        // A metric NVML can't give, or gives out of range, is left out, never reported as 0.
+        let metrics = [
+            (
+                "load",
+                MetricKind::GpuLoad,
+                api.utilization(gpu).map(f64::from),
+            ),
+            (
+                "power",
+                MetricKind::GpuPower,
+                api.power_mw(gpu).map(|mw| f64::from(mw) / 1000.0),
+            ),
+            (
+                "clock",
+                MetricKind::GpuClock,
+                api.graphics_clock(gpu).map(f64::from),
+            ),
+            (
+                "throttle",
+                MetricKind::GpuThrottle,
+                api.throttle_reasons(gpu).map(|b| b as f64),
+            ),
+        ];
+        for (name, kind, value) in metrics {
+            if let Some(value) = value.ok().filter(|&v| kind.is_valid(v)) {
+                snap.metrics.push(MetricReading {
+                    id: format!("nvml_gpu{gpu}_{name}"),
+                    kind,
+                    value,
+                });
+            }
+        }
         for fan in 0..api.fan_count(gpu)? {
             snap.fans.push(FanReading {
                 id: fan_id(gpu, fan),
@@ -68,6 +110,7 @@ fn read_all(api: &mut dyn Nvml) -> Result<HardwareSnapshot, String> {
                 // Older drivers have no RPM query; the duty is still real.
                 rpm: api.fan_rpm(gpu, fan).unwrap_or(0),
                 duty_percent: api.fan_percent(gpu, fan)?.min(100) as u8,
+                kind: FanKind::Fan,
             });
         }
     }
@@ -175,7 +218,7 @@ impl HardwareLayer for Nvidia {
 #[cfg(windows)]
 mod real {
     use super::*;
-    use nvml_wrapper::enum_wrappers::device::TemperatureSensor;
+    use nvml_wrapper::enum_wrappers::device::{Clock, TemperatureSensor};
     use nvml_wrapper::error::NvmlError;
 
     /// The real library, through nvml-wrapper's safe API (no `unsafe` in this crate).
@@ -199,6 +242,22 @@ mod real {
             self.device(gpu)?
                 .temperature(TemperatureSensor::Gpu)
                 .map_err(msg)
+        }
+        fn utilization(&mut self, gpu: u32) -> Result<u32, String> {
+            Ok(self.device(gpu)?.utilization_rates().map_err(msg)?.gpu)
+        }
+        fn power_mw(&mut self, gpu: u32) -> Result<u32, String> {
+            self.device(gpu)?.power_usage().map_err(msg)
+        }
+        fn graphics_clock(&mut self, gpu: u32) -> Result<u32, String> {
+            self.device(gpu)?.clock_info(Clock::Graphics).map_err(msg)
+        }
+        fn throttle_reasons(&mut self, gpu: u32) -> Result<u64, String> {
+            Ok(self
+                .device(gpu)?
+                .current_throttle_reasons()
+                .map_err(msg)?
+                .bits())
         }
         fn fan_count(&mut self, gpu: u32) -> Result<u32, String> {
             match self.device(gpu)?.num_fans() {
@@ -253,6 +312,10 @@ mod tests {
     struct Gpu {
         temp: u32,
         fans: Vec<Fan>,
+        load: u32,
+        power_mw: u32,
+        clock: u32,
+        throttle: u64,
     }
     #[derive(Default)]
     struct World {
@@ -275,6 +338,10 @@ mod tests {
                     .map(|(temp, fans)| Gpu {
                         temp: *temp,
                         fans: fans.iter().map(|&(duty, rpm)| Fan { duty, rpm }).collect(),
+                        load: 37,
+                        power_mw: 120_500,
+                        clock: 1800,
+                        throttle: 4,
                     })
                     .collect(),
                 ..World::default()
@@ -318,6 +385,22 @@ mod tests {
         fn temperature(&mut self, gpu: u32) -> Result<u32, String> {
             self.enter("temp", gpu.to_string())?;
             Ok(self.w().gpus[gpu as usize].temp)
+        }
+        fn utilization(&mut self, gpu: u32) -> Result<u32, String> {
+            self.enter("load", gpu.to_string())?;
+            Ok(self.w().gpus[gpu as usize].load)
+        }
+        fn power_mw(&mut self, gpu: u32) -> Result<u32, String> {
+            self.enter("power", gpu.to_string())?;
+            Ok(self.w().gpus[gpu as usize].power_mw)
+        }
+        fn graphics_clock(&mut self, gpu: u32) -> Result<u32, String> {
+            self.enter("clock", gpu.to_string())?;
+            Ok(self.w().gpus[gpu as usize].clock)
+        }
+        fn throttle_reasons(&mut self, gpu: u32) -> Result<u64, String> {
+            self.enter("throttle", gpu.to_string())?;
+            Ok(self.w().gpus[gpu as usize].throttle)
         }
         fn fan_count(&mut self, gpu: u32) -> Result<u32, String> {
             self.enter("fans", gpu.to_string())?;
@@ -379,6 +462,62 @@ mod tests {
                 ("nvml_gpu1_fan1", 50, 1500)
             ]
         );
+    }
+
+    fn metrics(snap: &HardwareSnapshot) -> Vec<(&str, f64)> {
+        snap.metrics
+            .iter()
+            .map(|m| (m.id.as_str(), m.value))
+            .collect()
+    }
+
+    #[test]
+    fn snapshot_has_load_power_clock_and_throttle_per_gpu() {
+        let snap = nvidia(&Fake::new(&[(55, &[(30, 900)])]))
+            .snapshot()
+            .unwrap();
+        assert_eq!(
+            metrics(&snap),
+            [
+                ("nvml_gpu0_load", 37.0),
+                ("nvml_gpu0_power", 120.5),
+                ("nvml_gpu0_clock", 1800.0),
+                ("nvml_gpu0_throttle", 4.0)
+            ]
+        );
+        let kinds: Vec<_> = snap.metrics.iter().map(|m| m.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                MetricKind::GpuLoad,
+                MetricKind::GpuPower,
+                MetricKind::GpuClock,
+                MetricKind::GpuThrottle
+            ]
+        );
+        assert!(snap.fans.iter().all(|f| f.kind == FanKind::Fan));
+    }
+
+    #[test]
+    fn a_metric_that_fails_is_skipped_not_zeroed_and_the_rest_survive() {
+        let fake = Fake::new(&[(55, &[(30, 900)])]);
+        fake.fail("power");
+        fake.fail("throttle");
+        let snap = nvidia(&fake).snapshot().unwrap();
+        assert_eq!(
+            metrics(&snap),
+            [("nvml_gpu0_load", 37.0), ("nvml_gpu0_clock", 1800.0)]
+        );
+        assert_eq!(snap.sensors.len(), 1);
+        assert_eq!(snap.fans.len(), 1);
+    }
+
+    #[test]
+    fn an_out_of_range_load_is_skipped() {
+        let fake = Fake::new(&[(55, &[])]);
+        fake.w().gpus[0].load = 101;
+        let snap = nvidia(&fake).snapshot().unwrap();
+        assert!(!metrics(&snap).iter().any(|(id, _)| id.ends_with("load")));
     }
 
     #[test]

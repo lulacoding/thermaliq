@@ -5,8 +5,8 @@ use rusqlite::{params, Connection};
 use std::collections::HashSet;
 use std::path::Path;
 use thermaliq_common::{
-    Curve, CustomSensor, FanReading, HardwareSnapshot, Profile, SensorKind, SensorReading,
-    MAX_VALID_TEMP_C, MIN_VALID_TEMP_C,
+    Curve, CustomSensor, FanReading, HardwareSnapshot, MetricReading, Profile, SensorKind,
+    SensorReading, MAX_VALID_TEMP_C, MIN_VALID_TEMP_C,
 };
 
 const DAY: i64 = 86_400;
@@ -65,7 +65,15 @@ CREATE TABLE IF NOT EXISTS fan_readings (
     recorded_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_fan_readings ON fan_readings(fan_id, recorded_at);
-CREATE INDEX IF NOT EXISTS idx_fan_time ON fan_readings(recorded_at);";
+CREATE INDEX IF NOT EXISTS idx_fan_time ON fan_readings(recorded_at);
+CREATE TABLE IF NOT EXISTS metric_readings (
+    id INTEGER PRIMARY KEY,
+    metric_id TEXT NOT NULL,
+    value REAL NOT NULL,
+    recorded_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_metric_readings ON metric_readings(metric_id, recorded_at);
+CREATE INDEX IF NOT EXISTS idx_metric_time ON metric_readings(recorded_at);";
 
 pub struct HistoryDb(Connection);
 
@@ -88,12 +96,14 @@ impl HistoryDb {
 
     /// Writes every reading of one tick atomically: all rows land or none do.
     /// Sensor readings that aren't a finite, plausible temperature are skipped so one
-    /// broken sensor can't cost the tick.
+    /// broken sensor can't cost the tick. Metrics that fail `MetricKind::is_valid` are skipped
+    /// the same way (never stored as 0).
     pub fn record_tick(
         &mut self,
         now: i64,
         sensors: &[SensorReading],
         fans: &[FanReading],
+        metrics: &[MetricReading],
     ) -> rusqlite::Result<()> {
         let tx = self.0.transaction()?;
         {
@@ -112,6 +122,12 @@ impl HistoryDb {
             for r in fans {
                 ins.execute(params![r.id, r.rpm, r.duty_percent, now])?;
             }
+            let mut ins = tx.prepare_cached(
+                "INSERT INTO metric_readings(metric_id, value, recorded_at) VALUES (?1, ?2, ?3)",
+            )?;
+            for r in metrics.iter().filter(|r| r.kind.is_valid(r.value)) {
+                ins.execute(params![r.id, r.value, now])?;
+            }
         }
         tx.commit()
     }
@@ -129,6 +145,7 @@ impl HistoryDb {
                 "fan_id",
                 "CAST(ROUND(AVG(rpm)) AS INTEGER) AS rpm, CAST(ROUND(AVG(duty_percent)) AS INTEGER) AS duty_percent",
             ),
+            ("metric_readings", "metric_id", "AVG(value) AS value"),
         ] {
             tx.execute(&format!("DELETE FROM {table} WHERE recorded_at < ?1"), [keep])?;
             tx.execute_batch(&format!(
@@ -151,6 +168,15 @@ impl HistoryDb {
         rows.collect()
     }
 
+    /// `(recorded_at, value)` oldest first.
+    pub fn metric_rows(&self, id: &str) -> rusqlite::Result<Vec<(i64, f64)>> {
+        let mut q = self.0.prepare(
+            "SELECT recorded_at, value FROM metric_readings WHERE metric_id = ?1 ORDER BY recorded_at, id",
+        )?;
+        let rows = q.query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect()
+    }
+
     /// `(recorded_at, rpm, duty_percent)` oldest first.
     pub fn fan_rows(&self, id: &str) -> rusqlite::Result<Vec<(i64, u32, u8)>> {
         let mut q = self.0.prepare(
@@ -165,7 +191,7 @@ impl HistoryDb {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use thermaliq_common::{HardwareSnapshot, Profile, SensorKind};
+    use thermaliq_common::{HardwareSnapshot, MetricKind, Profile, SensorKind};
 
     const NOW: i64 = 100 * DAY;
 
@@ -184,13 +210,64 @@ mod tests {
             label: id.into(),
             rpm,
             duty_percent: duty,
+            kind: thermaliq_common::FanKind::Fan,
         }
+    }
+
+    fn m(id: &str, kind: MetricKind, value: f64) -> MetricReading {
+        MetricReading {
+            id: id.into(),
+            kind,
+            value,
+        }
+    }
+
+    #[test]
+    fn metrics_round_trip_skip_invalid_ones_and_downsample() {
+        let mut db = HistoryDb::in_memory().unwrap();
+        let bad = [f64::NAN, f64::INFINITY, -3.0];
+        let tick = |t: i64, load: f64| {
+            let mut v = vec![m("load", MetricKind::GpuLoad, load)];
+            v.extend(bad.iter().map(|&b| m("power", MetricKind::GpuPower, b)));
+            v.push(m("over", MetricKind::CpuLoad, 101.0));
+            (t, v)
+        };
+        let (t, v) = tick(NOW, 50.0);
+        db.record_tick(t, &[], &[], &v).unwrap();
+        assert_eq!(db.metric_rows("load").unwrap(), vec![(NOW, 50.0)]);
+        assert!(
+            db.metric_rows("power").unwrap().is_empty(),
+            "never stored as 0"
+        );
+        assert!(db.metric_rows("over").unwrap().is_empty());
+        let base = NOW - 10 * DAY;
+        for i in 0..60 {
+            db.record_tick(
+                base + i,
+                &[],
+                &[],
+                &[m("old", MetricKind::GpuLoad, (i % 2) as f64 * 10.0)],
+            )
+            .unwrap();
+        }
+        db.prune(NOW).unwrap();
+        assert_eq!(db.metric_rows("old").unwrap(), vec![(base, 5.0)]);
+        assert_eq!(db.metric_rows("load").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_failed_tick_stores_no_metrics_either() {
+        let mut db = HistoryDb::in_memory().unwrap();
+        db.0.execute("DROP TABLE fan_readings", []).unwrap();
+        let load = [m("load", MetricKind::GpuLoad, 1.0)];
+        assert!(db.record_tick(NOW, &[], &[f("a", 1, 1)], &load).is_err());
+        assert!(db.metric_rows("load").unwrap().is_empty());
     }
 
     #[test]
     fn tick_round_trips_sensors_and_fans() {
         let mut db = HistoryDb::in_memory().unwrap();
-        db.record_tick(NOW, &[s("cpu", 50.5)], &[f("fan1", 1200, 40)])
+        db.record_tick(NOW, &[s("cpu", 50.5)], &[f("fan1", 1200, 40)], &[])
             .unwrap();
         assert_eq!(db.sensor_rows("cpu").unwrap(), vec![(NOW, 50.5)]);
         assert_eq!(db.fan_rows("fan1").unwrap(), vec![(NOW, 1200, 40)]);
@@ -201,7 +278,7 @@ mod tests {
         let mut db = HistoryDb::in_memory().unwrap();
         db.0.execute("DROP TABLE fan_readings", []).unwrap();
         assert!(db
-            .record_tick(NOW, &[s("a", 40.0)], &[f("fan1", 1000, 30)])
+            .record_tick(NOW, &[s("a", 40.0)], &[f("fan1", 1000, 30)], &[])
             .is_err());
         assert!(db.sensor_rows("a").unwrap().is_empty());
     }
@@ -216,7 +293,8 @@ mod tests {
             s("hot", 500.0),
             s("b", 41.0),
         ];
-        db.record_tick(NOW, &ticks, &[f("fan1", 1000, 30)]).unwrap();
+        db.record_tick(NOW, &ticks, &[f("fan1", 1000, 30)], &[])
+            .unwrap();
         assert_eq!(db.sensor_rows("a").unwrap(), vec![(NOW, 40.0)]);
         assert_eq!(db.sensor_rows("b").unwrap(), vec![(NOW, 41.0)]);
         for id in ["nan", "inf", "hot"] {
@@ -233,6 +311,7 @@ mod tests {
                 NOW - 23 * 3600 + i,
                 &[s("cpu", 50.0)],
                 &[f("fan1", 1000, 30)],
+                &[],
             )
             .unwrap();
         }
@@ -246,7 +325,8 @@ mod tests {
         let mut db = HistoryDb::in_memory().unwrap();
         let bucket = NOW - DAY; // minute-aligned
         for (off, t) in [(10, 30.0), (20, 30.0), (40, 60.0)] {
-            db.record_tick(bucket + off, &[s("cpu", t)], &[]).unwrap();
+            db.record_tick(bucket + off, &[s("cpu", t)], &[], &[])
+                .unwrap();
         }
         db.prune(NOW + 30).unwrap(); // cutoff falls mid-bucket
         db.prune(NOW + 120).unwrap();
@@ -295,6 +375,7 @@ mod tests {
                 named("mb_alert"),
             ],
             fans: vec![],
+            ..Default::default()
         };
         let got = recorded_sensor_ids(&[active, other], &snap);
         let want: HashSet<String> = ["cpu0", "gpu0", "mb_curve", "mb_custom", "mb_alert"]
@@ -310,6 +391,7 @@ mod tests {
         let snap = HardwareSnapshot {
             sensors: vec![s("cpu0", 40.0), other],
             fans: vec![],
+            ..Default::default()
         };
         let got = recorded_sensor_ids(&[], &snap);
         assert_eq!(got, HashSet::from(["cpu0".to_string()]));
@@ -322,6 +404,7 @@ mod tests {
         let snap = HardwareSnapshot {
             sensors: vec![s("cpu0", 40.0), s("cpu1", 41.0), gpu],
             fans: vec![],
+            ..Default::default()
         };
         assert_eq!(recorded_sensor_ids(&[], &snap).len(), 3);
     }
@@ -350,7 +433,7 @@ mod tests {
                 db.0.query_row("PRAGMA journal_mode", [], |r| r.get(0))
                     .unwrap();
             assert_eq!(mode, "wal");
-            db.record_tick(NOW, &[s("cpu", 50.0)], &[f("fan1", 1000, 30)])
+            db.record_tick(NOW, &[s("cpu", 50.0)], &[f("fan1", 1000, 30)], &[])
                 .unwrap();
         }
         let db = HistoryDb::open(&path).unwrap();
@@ -367,6 +450,7 @@ mod tests {
                 base + i,
                 &[s("cpu", 40.0 + (i % 2) as f32 * 10.0)],
                 &[f("fan1", 1000 + i as u32, 30)],
+                &[],
             )
             .unwrap();
         }
@@ -380,10 +464,20 @@ mod tests {
     #[test]
     fn prune_drops_older_than_ninety_days() {
         let mut db = HistoryDb::in_memory().unwrap();
-        db.record_tick(NOW - 91 * DAY, &[s("cpu", 50.0)], &[f("fan1", 1000, 30)])
-            .unwrap();
-        db.record_tick(NOW - 89 * DAY, &[s("cpu", 51.0)], &[f("fan1", 1000, 30)])
-            .unwrap();
+        db.record_tick(
+            NOW - 91 * DAY,
+            &[s("cpu", 50.0)],
+            &[f("fan1", 1000, 30)],
+            &[],
+        )
+        .unwrap();
+        db.record_tick(
+            NOW - 89 * DAY,
+            &[s("cpu", 51.0)],
+            &[f("fan1", 1000, 30)],
+            &[],
+        )
+        .unwrap();
         db.prune(NOW).unwrap();
         assert_eq!(db.sensor_rows("cpu").unwrap(), vec![(NOW - 89 * DAY, 51.0)]);
         assert_eq!(db.fan_rows("fan1").unwrap().len(), 1);

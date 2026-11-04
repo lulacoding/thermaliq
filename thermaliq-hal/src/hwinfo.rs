@@ -5,7 +5,7 @@
 
 use crate::{Capabilities, HalError, HardwareLayer};
 use std::fmt;
-use thermaliq_common::{HardwareSnapshot, SensorKind};
+use thermaliq_common::{HardwareSnapshot, MetricKind, MetricReading, SensorKind};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HwinfoError {
@@ -60,6 +60,9 @@ const MAX_ELEMENT: u32 = 4096;
 const SENSOR: usize = 264;
 const READING: usize = 316;
 const READING_TYPE_TEMP: u32 = 1;
+const READING_TYPE_POWER: u32 = 5;
+const READING_TYPE_CLOCK: u32 = 6;
+const READING_TYPE_USAGE: u32 = 7;
 /// HWiNFO polls every 2 s by default; a poll time this old means it has stopped.
 const STALE_SECS: i64 = 30;
 
@@ -210,6 +213,32 @@ pub(crate) fn parse(buf: &[u8], now: i64) -> Result<HardwareSnapshot, HwinfoErro
         let Some(group) = u32_at(r, 4).and_then(|i| sensors.get(i as usize)) else {
             continue;
         };
+        let name = text(&group[8..136]);
+        if let (Some(ty), Some(rid)) = (u32_at(r, 0), u32_at(r, 8)) {
+            // HWiNFO's own label (not the user-renamed one) and unit pick the metric.
+            let unit = r[268..284].split(|&c| c == 0).next().unwrap_or_default();
+            let metric = match (ty, text(&r[12..140]).as_str(), unit) {
+                (READING_TYPE_USAGE, "Total CPU Usage", b"%") => Some(MetricKind::CpuLoad),
+                (READING_TYPE_POWER, "CPU Package Power", b"W") => Some(MetricKind::CpuPower),
+                (READING_TYPE_CLOCK, "Average Effective Clock", b"MHz") => {
+                    Some(MetricKind::CpuClock)
+                }
+                _ => None,
+            };
+            if let Some(kind) = metric {
+                let value = f64::from_le_bytes(r[284..292].try_into().unwrap_or_default());
+                if kind_of(&name) == SensorKind::Cpu && kind.is_valid(value) {
+                    if let (Some(sid), Some(inst)) = (u32_at(group, 0), u32_at(group, 4)) {
+                        snap.metrics.push(MetricReading {
+                            id: format!("hwinfo_{sid:08x}_{inst}_{rid:08x}"),
+                            kind,
+                            value,
+                        });
+                    }
+                }
+                continue;
+            }
+        }
         let raw = f64::from_le_bytes(r[284..292].try_into().unwrap_or_default());
         // The unit is C or F depending on HWiNFO's settings; the degree sign is UTF-8 or
         // Windows-1252. Anything else is not a temperature we understand.
@@ -236,7 +265,6 @@ pub(crate) fn parse(buf: &[u8], now: i64) -> Result<HardwareSnapshot, HwinfoErro
         else {
             continue;
         };
-        let name = text(&group[8..136]);
         snap.sensors.push(thermaliq_common::SensorReading {
             id: format!("hwinfo_{sensor_id:08x}_{inst}_{reading_id:08x}"),
             label: format!("{label} ({name})"),
@@ -262,6 +290,9 @@ mod tests {
     const READING: usize = 316;
     const TEMP: u32 = 1;
     const FAN: u32 = 3;
+    const POWER: u32 = 5;
+    const CLOCK: u32 = 6;
+    const USAGE: u32 = 7;
 
     /// (sensor_id, inst, group name, readings as (type, label, value)).
     type Group = (u32, u32, &'static str, Vec<(u32, &'static str, f64)>);
@@ -304,7 +335,14 @@ mod tests {
                 b[r + 4..r + 8].copy_from_slice(&(gi as u32).to_le_bytes());
                 b[r + 8..r + 12].copy_from_slice(&(0x100 + ri as u32).to_le_bytes());
                 put(&mut b, r + 12, label);
-                put(&mut b, r + 268, "\u{b0}C");
+                let unit = match *ty {
+                    POWER => "W",
+                    CLOCK => "MHz",
+                    USAGE => "%",
+                    FAN => "RPM",
+                    _ => "\u{b0}C",
+                };
+                put(&mut b, r + 268, unit);
                 b[r + 284..r + 292].copy_from_slice(&v.to_le_bytes());
                 r += READING;
             }
@@ -344,6 +382,65 @@ mod tests {
     }
 
     const NOW: i64 = 1_800_000_000;
+
+    fn cpu_group(readings: Vec<(u32, &'static str, f64)>) -> Vec<Group> {
+        vec![(0xF000_0000, 0, "CPU [#0]: Intel Core i7-12700K", readings)]
+    }
+
+    fn metrics(groups: &[Group]) -> Vec<(String, MetricKind, f64)> {
+        let snap = parse(&build(NOW, groups), NOW).unwrap();
+        snap.metrics
+            .into_iter()
+            .map(|m| (m.id, m.kind, m.value))
+            .collect()
+    }
+
+    #[test]
+    fn parses_cpu_load_power_and_clock() {
+        let got = metrics(&cpu_group(vec![
+            (USAGE, "Total CPU Usage", 23.5),
+            (POWER, "CPU Package Power", 65.0),
+            (CLOCK, "Average Effective Clock", 4700.0),
+            (USAGE, "Core 0 T0 Usage", 99.0),
+        ]));
+        assert_eq!(
+            got,
+            [
+                (
+                    "hwinfo_f0000000_0_00000100".into(),
+                    MetricKind::CpuLoad,
+                    23.5
+                ),
+                (
+                    "hwinfo_f0000000_0_00000101".into(),
+                    MetricKind::CpuPower,
+                    65.0
+                ),
+                (
+                    "hwinfo_f0000000_0_00000102".into(),
+                    MetricKind::CpuClock,
+                    4700.0
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn bad_metric_values_are_skipped_not_zeroed() {
+        for bad in [f64::NAN, f64::INFINITY, -1.0] {
+            assert!(metrics(&cpu_group(vec![(POWER, "CPU Package Power", bad)])).is_empty());
+        }
+        assert!(metrics(&cpu_group(vec![(USAGE, "Total CPU Usage", 120.0)])).is_empty());
+    }
+
+    #[test]
+    fn metrics_outside_the_cpu_group_or_in_another_unit_are_ignored() {
+        let mut gpu = machine();
+        gpu[1].3.push((USAGE, "Total CPU Usage", 50.0));
+        assert!(metrics(&gpu).is_empty());
+        // A power reading typed as a temperature is a temperature, never a metric.
+        assert!(metrics(&cpu_group(vec![(TEMP, "CPU Package Power", 65.0)])).is_empty());
+    }
 
     #[test]
     fn signature_is_hwis() {
