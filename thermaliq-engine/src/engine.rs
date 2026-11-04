@@ -207,6 +207,18 @@ impl Engine {
             .submit(source, duty, expires_at)
     }
 
+    /// Drops the manual override on a fan. `Ok(false)`: it had none.
+    pub fn cancel_override(&mut self, fan: &str) -> Result<bool, String> {
+        let f = self.fans.iter_mut().find(|f| f.id == fan);
+        let f = f.ok_or_else(|| format!("no control for fan '{fan}'"))?;
+        Ok(f.ctl.withdraw(Source::Override))
+    }
+
+    /// True if the active profile controls this fan and the hardware lets us write to it.
+    pub fn can_control(&self, fan: &str) -> bool {
+        self.controllable.contains(fan) && self.fans.iter().any(|f| f.id == fan)
+    }
+
     /// One control step. `now` is monotonic time since the engine started.
     pub fn tick(&mut self, now: Duration) {
         let Ok(snap) = self.hal.snapshot() else {
@@ -253,7 +265,9 @@ impl Engine {
                         // Profile never needs an expiry, so submit cannot fail.
                         let _ = f.ctl.submit(Source::Profile, d, None);
                     }
-                    None => f.ctl.withdraw(Source::Profile),
+                    None => {
+                        f.ctl.withdraw(Source::Profile);
+                    }
                 }
                 f.ctl.tick(now)
             };
@@ -866,5 +880,53 @@ mod status_tests {
         e.tick(secs(31));
         assert!(!e.latched());
         assert!(e.latch_waiting_on().is_empty());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod command_tests {
+    use super::*;
+    use thermaliq_hal::{MockHardwareLayer, Tick};
+
+    fn rig() -> (Arc<MockHardwareLayer>, Engine) {
+        let p = Profile::from_toml(
+            "name = \"t\"\n[[curves]]\ntype = \"flat\"\nid = \"c\"\npwm = 30\n[[controls]]\nfan = \"f1\"\ncurve = \"c\"\nstep_up_pct = 100\nstep_down_pct = 100\n",
+        )
+        .unwrap();
+        let script = vec![Tick::Temps(vec![("cpu".into(), SensorKind::Cpu, 40.0)])];
+        let hal = Arc::new(MockHardwareLayer::new(&["f1", "f2"], script).read_only("f2"));
+        (hal.clone(), Engine::new(hal, &p))
+    }
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    #[test]
+    fn cancelling_an_override_returns_the_fan_to_the_profile() {
+        let (hal, mut e) = rig();
+        e.submit("f1", Source::Override, 80, Some(secs(99)))
+            .unwrap();
+        e.tick(secs(0));
+        assert_eq!(e.cancel_override("f1"), Ok(true));
+        e.tick(secs(1));
+        let w = hal.writes();
+        assert_eq!(w.last().unwrap(), &("f1".to_string(), 30));
+    }
+
+    #[test]
+    fn cancel_says_when_there_was_nothing_to_cancel_or_no_such_fan() {
+        let (_, mut e) = rig();
+        assert_eq!(e.cancel_override("f1"), Ok(false));
+        assert!(e.cancel_override("nope").is_err());
+    }
+
+    #[test]
+    fn can_control_is_false_for_read_only_and_unknown_fans() {
+        let (_, e) = rig();
+        assert!(e.can_control("f1"));
+        assert!(!e.can_control("f2"), "read-only");
+        assert!(!e.can_control("nope"));
     }
 }

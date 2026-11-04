@@ -86,8 +86,11 @@ impl FanControl {
     }
 
     /// Drops a source's request, e.g. an app closed or its curve has no valid input.
-    pub fn withdraw(&mut self, source: Source) {
+    /// Returns whether there was one.
+    pub fn withdraw(&mut self, source: Source) -> bool {
+        let before = self.requests.len();
         self.requests.retain(|r| r.source != source);
+        self.requests.len() != before
     }
 
     /// Start ramping from the fan's real state (first snapshot) instead of jumping.
