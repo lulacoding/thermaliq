@@ -10,7 +10,6 @@ Rewrite this file at the end of every session. Keep it under 15 lines.
 - **Later (calibration):** an Override below `min_pwm` is floored, so a calibration sweep can't measure low duties; decide when calibration gets a module.
 - **M3 shape:** `SensorEngine::new(&Profile).evaluate(&Temps, now) -> Temps`; `CurveEngine::duty(curve_id, &Temps, now) -> Option<u8>` (`None` = input invalid).
 - **M2 shape:** `HardwareLayer` is sync; `MockHardwareLayer::new(fan_ids, Vec<Tick>)` with `read_only`, `fail_writes`, `fail_restores`.
-- **Open:** bundled profile IDs are role IDs; M13 maps them to real hardware.
-- **Left out earlier:** schedule (M15), agent/LLM settings (M19/M20), paths (M6).
+- **Open:** bundled profile IDs are role IDs (M13 maps them). Left out earlier: schedule (M15), agent/LLM (M19/M20), paths (M6).
 - **Decided (SPEC §10):** 3 agent modes, Windows-only v2.0, HWiNFO optional, OpenRouter default.
 - **Dev machine:** Windows PC (primary). Mac secondary. Setup: `scripts/dev-setup.ps1` / `.sh`.
