@@ -8,6 +8,8 @@ $root = Split-Path $PSScriptRoot -Parent
 $exe = Join-Path $root 'target\debug\thermaliq-daemon.exe'
 $dir = Join-Path $env:ProgramData 'ThermalIQ'
 $inject = Join-Path $dir 'inject_cpu_temp.txt'
+$profile_ = Join-Path $dir 'profiles\g1.toml'
+$cfgBak = Join-Path $dir 'config.toml.g1bak'
 $api = 'http://127.0.0.1:7272'
 $svcKey = 'HKLM:\SYSTEM\CurrentControlSet\Services\ThermalIQ'
 
@@ -48,11 +50,12 @@ public static class Nvml {
 
 function Wait-Until([scriptblock]$Cond, [double]$Seconds, [string]$What) {
     $end = [DateTime]::UtcNow.AddSeconds($Seconds)
+    $last = ''
     while ([DateTime]::UtcNow -lt $end) {
-        try { if (& $Cond) { return } } catch { }
+        try { if (& $Cond) { return }; $last = 'condition false' } catch { $last = $_.Exception.Message }
         Start-Sleep -Milliseconds 250
     }
-    throw "timed out after ${Seconds}s waiting for $What"
+    throw "timed out after ${Seconds}s waiting for $What (last: $last)"
 }
 function Get-Status { Invoke-RestMethod "$api/status" -TimeoutSec 2 }
 function Get-GpuFans { @(Invoke-RestMethod "$api/fans" -TimeoutSec 2 | Where-Object { $_.id -like 'nvml_*' }) }
@@ -62,6 +65,7 @@ function Test-AllManual { $a = [Nvml]::Auto(); $a.Count -gt 0 -and -not ($a -con
 function Test-AllAuto { $a = [Nvml]::Auto(); $a.Count -gt 0 -and -not ($a -contains $false) }
 function Wait-Controlled { Wait-Until { (Get-Status).engine_running -and (Get-GpuFans).Count -gt 0 -and (Test-AllManual) } 15 'the engine to take manual control of the GPU fan' }
 
+$script:wroteCfg = $false
 $script:failed = $false
 $script:results = @()
 function Step([string]$Name, [scriptblock]$Body) {
@@ -79,6 +83,25 @@ try {
     Step 'install and start the service' {
         & $exe install-service
         if ($LASTEXITCODE -ne 0) { throw 'install-service failed (an existing ThermalIQ install may need uninstall-service first)' }
+        # The bundled profiles use role IDs (gpu1, chassis1) that M13's first-run mapping will
+        # translate; until then nothing would drive the real fan. Use a flat 40% profile on it.
+        $cfg = Join-Path $dir 'config.toml'
+        if (Test-Path $cfg) { Copy-Item $cfg $cfgBak -Force }
+        New-Item -ItemType Directory -Force (Join-Path $dir 'profiles') | Out-Null
+        Set-Content -Path $profile_ -Encoding ascii -Value @'
+name = "g1"
+[[curves]]
+type = "flat"
+id = "c"
+pwm = 40
+[[controls]]
+fan = "nvml_gpu0_fan0"
+curve = "c"
+step_up_pct = 100
+step_down_pct = 100
+'@
+        $script:wroteCfg = $true
+        Set-Content -Path $cfg -Encoding ascii -Value "default_profile = `"g1`"`n"
         Set-Injection ''   # armed, not injecting
         Set-ItemProperty -Path $svcKey -Name Environment -Type MultiString -Value @("THERMALIQ_INJECT_CPU_TEMP=$inject")
         Start-Service ThermalIQ
@@ -142,7 +165,11 @@ try {
 finally {
     # Whatever happened: no service, no injection, and the fan back on the driver's own curve.
     if (Test-Path $exe) { try { & $exe uninstall-service 2>$null | Out-Null } catch { } }
-    Remove-Item $inject -ErrorAction SilentlyContinue
+    Remove-Item $inject, $profile_ -ErrorAction SilentlyContinue
+    if ($script:wroteCfg) {   # only undo our own config.toml
+        if (Test-Path $cfgBak) { Move-Item $cfgBak (Join-Path $dir 'config.toml') -Force }
+        else { Remove-Item (Join-Path $dir 'config.toml') -ErrorAction SilentlyContinue }
+    }
     try {
         [Nvml]::RestoreAll()
         if (Test-AllAuto) { Write-Host 'fan: automatic' } else { Write-Host 'FAN NOT AUTOMATIC: set it back in your GPU tool' -ForegroundColor Red; $script:failed = $true }
