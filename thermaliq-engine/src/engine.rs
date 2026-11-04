@@ -2,7 +2,7 @@ use crate::{CurveEngine, FanControl, SensorEngine, Source, Temps};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use thermaliq_common::{Control, Profile, SensorKind, SensorReading};
+use thermaliq_common::{Control, HardwareSnapshot, Profile, SensorKind, SensorReading};
 use thermaliq_hal::HardwareLayer;
 
 /// SPEC S2 thresholds (°C) and hold time.
@@ -22,6 +22,8 @@ struct Latch {
     /// CPU/GPU sensor ids seen while hot; all must be present and cool to release.
     watch: BTreeSet<String>,
     cool_since: Option<Duration>,
+    /// Watched sensors that are missing, invalid or still above their release threshold.
+    waiting: Vec<String>,
 }
 
 impl Latch {
@@ -56,6 +58,22 @@ impl Latch {
             self.cool_since = None;
             self.watch.clear();
         }
+        self.waiting = if self.on {
+            let blocked = |id: &&String| match sensors.iter().find(|s| &s.id == *id) {
+                Some(s) => {
+                    let release = if s.kind == SensorKind::Gpu {
+                        GPU_RELEASE
+                    } else {
+                        CPU_RELEASE
+                    };
+                    s.temp_celsius.is_nan() || s.temp_celsius >= release
+                }
+                None => true,
+            };
+            self.watch.iter().filter(blocked).cloned().collect()
+        } else {
+            Vec::new()
+        };
         self.on
     }
 }
@@ -99,6 +117,8 @@ pub struct Engine {
     snapshot_fails: u8,
     /// Last duty each fan accepted, to seed ramping across a profile switch.
     written: HashMap<String, u8>,
+    /// The snapshot the last successful tick used, for the daemon's shared cache.
+    last: Option<HardwareSnapshot>,
 }
 
 impl Engine {
@@ -113,6 +133,7 @@ impl Engine {
             latch: Latch::default(),
             snapshot_fails: 0,
             written: HashMap::new(),
+            last: None,
         }
     }
 
@@ -157,6 +178,21 @@ impl Engine {
         self.latch.on
     }
 
+    /// While latched: the CPU/GPU sensors that are missing, invalid or still too hot to release.
+    pub fn latch_waiting_on(&self) -> &[String] {
+        &self.latch.waiting
+    }
+
+    /// The snapshot the last successful tick used; kept across failed ticks.
+    pub fn last_snapshot(&self) -> Option<&HardwareSnapshot> {
+        self.last.as_ref()
+    }
+
+    /// False when the latest tick's snapshot failed, so `last_snapshot` is old data.
+    pub fn snapshot_fresh(&self) -> bool {
+        self.snapshot_fails == 0
+    }
+
     /// Route a request to a fan's `FanControl` (M4 priority rules apply).
     pub fn submit(
         &mut self,
@@ -181,6 +217,7 @@ impl Engine {
             return;
         };
         self.snapshot_fails = 0;
+        self.last = Some(snap.clone());
         for f in self.fans.iter_mut().filter(|f| !f.seeded) {
             if let Some(r) = snap.fans.iter().find(|r| r.id == f.id) {
                 f.ctl.seed(r.duty_percent, r.rpm > 0);
@@ -746,5 +783,88 @@ mod rereview_tests {
         }
         // trip; cool; released; (cpu gone, not latched); gpu trips; still hot-ish; released
         assert_eq!(latched, [true, true, false, false, true, true, false]);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod status_tests {
+    use super::*;
+    use thermaliq_hal::{MockHardwareLayer, Tick};
+
+    fn rig(script: Vec<Tick>) -> Engine {
+        let p = Profile::from_toml(
+            "name = \"t\"\n[[curves]]\ntype = \"flat\"\nid = \"c\"\npwm = 30\n[[controls]]\nfan = \"f1\"\ncurve = \"c\"\nstep_up_pct = 100\nstep_down_pct = 100\n",
+        )
+        .unwrap();
+        Engine::new(Arc::new(MockHardwareLayer::new(&["f1"], script)), &p)
+    }
+
+    fn at(cpu: f32, gpu: f32) -> Tick {
+        Tick::Temps(vec![
+            ("cpu".into(), SensorKind::Cpu, cpu),
+            ("gpu".into(), SensorKind::Gpu, gpu),
+        ])
+    }
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    #[test]
+    fn last_snapshot_is_the_one_the_tick_used() {
+        let mut e = rig(vec![at(40.0, 41.0)]);
+        assert!(e.last_snapshot().is_none());
+        e.tick(secs(0));
+        let s = e.last_snapshot().unwrap();
+        assert_eq!(s.sensors.len(), 2);
+        assert_eq!(s.sensors[0].temp_celsius, 40.0);
+    }
+
+    #[test]
+    fn a_failed_snapshot_keeps_the_previous_one() {
+        let mut e = rig(vec![at(40.0, 41.0), Tick::Fail]);
+        e.tick(secs(0));
+        assert!(e.snapshot_fresh());
+        e.tick(secs(1));
+        assert_eq!(e.last_snapshot().unwrap().sensors[0].temp_celsius, 40.0);
+        assert!(!e.snapshot_fresh(), "stale: must not be recorded as new");
+    }
+
+    #[test]
+    fn latch_waits_on_the_hot_sensor_until_it_is_cool() {
+        let mut e = rig(vec![at(97.0, 40.0), at(90.0, 40.0), at(60.0, 40.0)]);
+        assert!(e.latch_waiting_on().is_empty());
+        e.tick(secs(0));
+        assert_eq!(e.latch_waiting_on(), ["cpu"]);
+        e.tick(secs(1));
+        assert_eq!(e.latch_waiting_on(), ["cpu"], "90 °C is above release");
+        e.tick(secs(2));
+        assert!(
+            e.latch_waiting_on().is_empty(),
+            "cool, only the hold is left"
+        );
+        assert!(e.latched());
+    }
+
+    #[test]
+    fn latch_waits_on_a_sensor_that_went_missing_or_nan() {
+        let gone = Tick::Temps(vec![("gpu".into(), SensorKind::Gpu, 40.0)]);
+        let mut e = rig(vec![at(97.0, 40.0), gone, at(f32::NAN, 40.0)]);
+        e.tick(secs(0));
+        e.tick(secs(1));
+        assert_eq!(e.latch_waiting_on(), ["cpu"], "missing");
+        e.tick(secs(2));
+        assert_eq!(e.latch_waiting_on(), ["cpu"], "NaN");
+    }
+
+    #[test]
+    fn waiting_list_is_empty_after_release() {
+        let mut e = rig(vec![at(97.0, 40.0), at(60.0, 40.0)]);
+        e.tick(secs(0));
+        e.tick(secs(1));
+        e.tick(secs(31));
+        assert!(!e.latched());
+        assert!(e.latch_waiting_on().is_empty());
     }
 }

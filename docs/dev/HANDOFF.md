@@ -2,14 +2,14 @@
 
 Rewrite this file at the end of every session. Keep it under 15 lines.
 
-- **Last session:** 2026-11-04 — M6 ticked (PR #35). M7 (PR #36) review applied (24 h raw, bad readings skipped, recorded set, indexes). NOT ticked: needs re-review + CI.
-- **Next:** review the M7 PR, tick M7, then M8. Daemon: never call `std::process::exit` while an `Engine` is alive (skips Drop = S5); keep `panic = "unwind"`.
-- **M7 shape:** `thermaliq-daemon/src/history.rs`: `HistoryDb::{open, in_memory}`, `record_tick(now, &[SensorReading], &[FanReading])` (one transaction; skips non-finite/out-of-range temps), `prune(now)` (>90d dropped, >24h averaged to 1/min), `sensor_rows`/`fan_rows`, `recorded_sensor_ids(&[Profile], &snapshot)`. Timestamps passed in (unix secs).
-- **M7 risk:** M8 must load ALL saved profiles, filter the snapshot with `recorded_sensor_ids` before `record_tick`, run `prune` hourly, and wrap `HistoryDb` in a Mutex. v0 calibration table not ported.
-- **M6 shape:** `thermaliq-daemon/src/store.rs`: `data_dir()` (env `THERMALIQ_DATA_DIR`, else `%ProgramData%\ThermalIQ`), `write_atomic`, `load_config`, `save_config`, `load_or_create_token`. No token compare yet (M8). Writes use a fixed `.tmp` name: serialize writes in M8. Token file has no ACL yet (M9).
-- **M4/M5 shape:** `Engine::new(Arc<dyn HardwareLayer>, &Profile)`, `set_profile`, `tick(now)`, `submit(fan, Source, duty, expires)`, `degraded()`, `latched()`. Drop = S5. Source: Override > Agent > AppRule > Schedule > Profile.
-- **0-RPM (SPEC §4):** stop at duty `<= stop_percent`; restart only `> start_percent`, then ramp.
-- **Later (calibration):** an Override below `min_pwm` is floored, so a calibration sweep can't measure low duties.
-- **Open:** bundled profile IDs are role IDs (M13 maps them). Schedule (M15), agent/LLM (M19/M20).
+- **Last session:** 2026-11-04 — M8a (daemon wiring) on branch `m8a-daemon-wiring`, PR into v2. NOT ticked: needs fresh-session review + CI. M8 stays unticked until M8b too.
+- **Next:** review the M8a PR, then M8b (HTTP API + WebSocket: port v0 router/auth/ws, rewrite handlers). Never call `std::process::exit` while an `Engine`/`Daemon` is alive (skips Drop = S5); keep `panic = "unwind"`.
+- **M8a shape:** `thermaliq-daemon/src/runtime.rs`: `Daemon::start(hal, &active, saved_profiles, Arc<Mutex<HistoryDb>>, Options{tick, prune_every})`, `cache() -> Cache{snapshot, status: Status{latched, degraded, waiting_on}, ticks}`, `shutdown()` (joins engine thread, then history thread; `Drop` does the same). `load_profiles(dir) -> (profiles, skipped)` = bundled + `<dir>/profiles/*.toml`.
+- **M8a design:** engine thread ticks, then publishes the cache and `try_send`s the tick to a history thread (queue 64, full = drop; engine never waits on the DB). History thread records and prunes every `prune_every`. Only fresh snapshots are recorded. Engine gained `last_snapshot`, `snapshot_fresh`, `latch_waiting_on`.
+- **M8a gaps for M8b:** no command channel yet, so the API can't switch profile or `submit` overrides; add one into the engine thread loop. `saved` profile list is fixed at start (history won't pick up newly saved profiles' sensors until restarted). `main.rs` is still the skeleton (no real HAL until M10; no Ctrl-C/service until M9). DB/prune errors are not logged yet. A panicked engine thread leaves the cache stale; `shutdown()` reports it.
+- **M8b rules:** every mutation needs Bearer (constant-time compare, M6 left it out); reads from `Daemon::cache()`/history Mutex; `save_config` writes serialized by one lock (fixed `.tmp` name); S8: no success without effect.
+- **M6/M7 shape:** `store.rs`: `data_dir()`, `write_atomic`, `load_config`, `save_config`, `load_or_create_token`. `history.rs`: `HistoryDb::{open, in_memory, record_tick, prune, sensor_rows, fan_rows}`, `recorded_sensor_ids`.
+- **M4/M5 shape:** `Engine::new(Arc<dyn HardwareLayer>, &Profile)`, `set_profile`, `tick(now)`, `submit(fan, Source, duty, expires)`. Source: Override > Agent > AppRule > Schedule > Profile.
+- **Later:** an Override below `min_pwm` is floored (calibration). Bundled profile IDs are role IDs (M13). Token file has no ACL yet (M9).
 - **Decided (SPEC §10):** 3 agent modes, Windows-only v2.0, HWiNFO optional, OpenRouter default.
 - **Dev machine:** Windows PC (primary). Mac secondary. Setup: `scripts/dev-setup.ps1` / `.sh`.
