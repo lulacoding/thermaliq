@@ -2,10 +2,10 @@
 
 Rewrite this file at the end of every session. Keep it under 15 lines.
 
-- **Last session:** 2026-11-04 — M5 ticked (PR #34). M6 built on `m6-paths-config-token`, PR into v2; NOT ticked: needs review + CI.
+- **Last session:** 2026-11-04 — M6 review applied on PR #35 (save_config validates; token only created on NotFound/malformed). NOT ticked: needs re-review + CI.
 - **Next:** review the M6 PR, tick M6, then M7. Daemon: never call `std::process::exit` while an `Engine` is alive (skips Drop = S5); keep `panic = "unwind"`.
 - **M6 shape:** `thermaliq-daemon/src/store.rs`: `data_dir()` (env `THERMALIQ_DATA_DIR`, else `%ProgramData%\ThermalIQ`), `write_atomic`, `load_config` (missing = default, invalid = error), `save_config`, `load_or_create_token` (64 hex, malformed is replaced). No token compare yet (M8).
-- **M6 risk:** token file has no ACL. ProgramData is world-readable by default, so any local user can read the token. M9 (service install) must lock the directory down. No 0600 on unix since v2 is Windows-only.
+- **M6 risk:** token file has no ACL yet; M9 must break inheritance on `ThermalIQ` (see PORTING M9). Writes use a fixed `.tmp` name: serialize writes in M8.
 - **M4/M5 shape:** `Engine::new(Arc<dyn HardwareLayer>, &Profile)`, `set_profile`, `tick(now)`, `submit(fan, Source, duty, expires)`, `degraded()`, `latched()`. Drop = S5. Source: Override > Agent > AppRule > Schedule > Profile.
 - **0-RPM (SPEC §4):** stop at duty `<= stop_percent`; restart only `> start_percent`, then ramp.
 - **Later (calibration):** an Override below `min_pwm` is floored, so a calibration sweep can't measure low duties.

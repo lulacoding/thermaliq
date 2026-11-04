@@ -69,17 +69,24 @@ pub fn load_config(dir: &Path) -> io::Result<DaemonConfig> {
 pub fn save_config(dir: &Path, cfg: &DaemonConfig) -> io::Result<()> {
     let s =
         toml::to_string_pretty(cfg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    // load_config must accept whatever we write
+    DaemonConfig::from_toml(&s).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     write_atomic(&dir.join(CONFIG_FILE), s.as_bytes())
 }
 
 /// Reads `token.txt`, or creates it. A malformed token is replaced.
 pub fn load_or_create_token(dir: &Path) -> io::Result<String> {
     let path = dir.join(TOKEN_FILE);
-    if let Ok(s) = fs::read_to_string(&path) {
-        let s = s.trim();
-        if s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Ok(s.to_owned());
+    match fs::read_to_string(&path) {
+        Ok(s) => {
+            let s = s.trim();
+            if s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Ok(s.to_owned());
+            }
         }
+        Err(e) if e.kind() == io::ErrorKind::NotFound || e.kind() == io::ErrorKind::InvalidData => {
+        }
+        Err(e) => return Err(e),
     }
     let mut raw = [0u8; 32];
     getrandom::fill(&mut raw).map_err(|e| io::Error::other(e.to_string()))?;
@@ -175,5 +182,26 @@ mod tests {
                 .trim(),
             t
         );
+    }
+
+    #[test]
+    fn saving_invalid_config_fails_and_leaves_file_untouched() {
+        let d = tempfile::tempdir().unwrap();
+        save_config(d.path(), &DaemonConfig::default()).unwrap();
+        let before = fs::read(d.path().join("config.toml")).unwrap();
+        let bad = DaemonConfig {
+            polling_interval_ms: 60000,
+            ..DaemonConfig::default()
+        };
+        assert!(save_config(d.path(), &bad).is_err());
+        assert_eq!(fs::read(d.path().join("config.toml")).unwrap(), before);
+    }
+
+    #[test]
+    fn unreadable_token_is_an_error_not_a_new_token() {
+        let d = tempfile::tempdir().unwrap();
+        fs::create_dir(d.path().join("token.txt")).unwrap();
+        assert!(load_or_create_token(d.path()).is_err());
+        assert!(d.path().join("token.txt").is_dir());
     }
 }
