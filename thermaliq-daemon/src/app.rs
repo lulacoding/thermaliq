@@ -35,12 +35,28 @@ pub fn hardware() -> Result<Arc<dyn HardwareLayer>, String> {
         let cpu = Tick::Temps(vec![("cpu".into(), SensorKind::Cpu, 45.0)]);
         Ok(Arc::new(MockHardwareLayer::new(&["mock-fan"], vec![cpu])))
     }
-    #[cfg(not(feature = "mock-hardware"))]
-    Err(
-        "no hardware backend in this build (the NVIDIA backend arrives in M10); \
-         refusing to start rather than pretend"
-            .into(),
-    )
+    #[cfg(all(windows, not(feature = "mock-hardware")))]
+    {
+        use thermaliq_hal::{CombinedHardwareLayer, Nvidia};
+        // M11/M12 add their backends here; ones that fail to start are skipped, and with
+        // none left the daemon refuses to start rather than pretend.
+        let mut backends: Vec<Arc<dyn HardwareLayer>> = Vec::new();
+        let mut why = Vec::new();
+        match Nvidia::new() {
+            Ok(n) => backends.push(Arc::new(n)),
+            Err(e) => why.push(format!("NVIDIA: {e}")),
+        }
+        if backends.is_empty() {
+            return Err(format!("no hardware backend started ({})", why.join("; ")));
+        }
+        for w in why {
+            eprintln!("hardware backend unavailable, continuing without it: {w}");
+        }
+        let combined = CombinedHardwareLayer::new(backends).map_err(|e| e.to_string())?;
+        Ok(Arc::new(combined))
+    }
+    #[cfg(all(not(windows), not(feature = "mock-hardware")))]
+    Err("no hardware backend on this OS (v2.0 controls fans on Windows only)".into())
 }
 
 pub fn start(dir: &Path, hal: Arc<dyn HardwareLayer>, token: Token) -> Result<App, String> {
@@ -257,11 +273,23 @@ mod tests {
         hal.0.store(true, Ordering::SeqCst); // let the engine thread finish
     }
 
-    #[cfg(not(feature = "mock-hardware"))]
+    #[cfg(all(not(windows), not(feature = "mock-hardware")))]
     #[test]
-    fn a_normal_build_has_no_backend_and_refuses() {
+    fn a_non_windows_build_has_no_backend_and_refuses() {
         let err = hardware().err().unwrap();
         assert!(err.contains("no hardware backend"), "{err}");
+    }
+
+    /// Windows without a usable NVIDIA GPU (CI) refuses and names the cause; with one, it starts.
+    #[cfg(all(windows, not(feature = "mock-hardware")))]
+    #[test]
+    fn a_windows_build_starts_nvidia_or_refuses_naming_it() {
+        if let Err(e) = hardware() {
+            assert!(
+                e.contains("no hardware backend") && e.contains("NVIDIA"),
+                "{e}"
+            );
+        }
     }
 
     #[cfg(feature = "mock-hardware")]

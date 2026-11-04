@@ -40,7 +40,7 @@ Stop and talk these through with Sam (in claude.ai) before any code for the modu
 ## Phase 3 — Windows motherboard fans
 
 - [ ] **M12 LHM bridge** — new · .NET sidecar on LibreHardwareMonitorLib + PawnIO, JSON over a named pipe, 5 s watchdog (S6) · test: protocol tests; watchdog restores auto; every bridge call has a timeout (~2 s) and errors instead of blocking, else shutdown hangs (M8a review)
-- [ ] **M13 Stable fan IDs + first-run mapping** — new · v0 lesson: HWiNFO IDs shift with sensor index · test: IDs survive reorder; bundled-profile role IDs (`cpu_package`, `chassis1`, ...) map to real hardware IDs
+- [ ] **M13 Stable fan IDs + first-run mapping** — new · v0 lesson: HWiNFO IDs shift with sensor index · test: IDs survive reorder; bundled-profile role IDs (`cpu_package`, `chassis1`, ...) map to real hardware IDs; NVIDIA ids (`nvml_gpu{index}_...`, M10) depend on NVML enumeration order, so key them on the GPU UUID (M10 review)
 
 > **G3** on the Windows PC.
 
