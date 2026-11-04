@@ -10,6 +10,7 @@ thermaliq-hal = { path = "../thermaliq-hal" }
 thermaliq-engine = { path = "../thermaliq-engine" }
 toml = "1.1.8"
 getrandom = "0.3"
+rusqlite = { version = "0.41.1", features = ["bundled"] }
 
 [dev-dependencies]
 tempfile = "3"
