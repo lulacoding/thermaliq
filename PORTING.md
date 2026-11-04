@@ -6,6 +6,16 @@ Actions: **port** = bring the v0 logic across, re-read and re-tested · **rewrit
 
 Tick a box only when its tests pass in CI and a reviewer has signed off (SPEC §9).
 
+## Brainstorm before starting
+
+Stop and talk these through with Sam (in claude.ai) before any code for the module. Claude Code: if the next unticked module is listed here and its box below is unchecked, ask Sam first.
+
+- [ ] **M12 (large):** sidecar .NET vs LHM's built-in web server; shipping .NET (self-contained vs runtime); PawnIO install flow and anti-cheat conflicts; protocol and watchdog. Run a spike on Sam's PC first: prove one case fan moves.
+- [ ] **M13 (medium):** first-run fan identification UX (spin each header, "which fan moved?"); stable ID scheme across hardware changes.
+- [ ] **M18 (medium):** which screens matter; onboarding; keep v0 design or restyle; how a standard-user account gets the token.
+- [ ] **M20 (large):** what the agent decides; approval-mode UX; model choice (local Ollaya + Clef/Strands vs real Jev); privacy of what it sees; how to evaluate decisions; offline behaviour.
+- [ ] **Gaps (small), before Phase 4:** a calibration module (not in this ledger yet); M15's exact profile-arbitration rules; M21 code-signing certificate (cost, SmartScreen).
+
 ## Phase 1 — Safety core
 
 - [x] **M1 Common types + profile/config schema** — rewrite · v0: `thermaliq-common/src/{lib,config}.rs` · test: every bundled profile parses; invalid profiles give a readable error; no `ai/predictive/learning/auto` variants
