@@ -78,7 +78,7 @@ One snapshot per tick, cached and shared. API reads use the cache, never the har
 - API keys in the OS keychain, never in TOML.
 - Every mutating endpoint needs `Authorization: Bearer <token>`. Read-only endpoints may be open. CORS lists the real production origins (including `http://tauri.localhost` on Windows).
 - UI gets the token through a Tauri command, not by reading files from the webview.
-- History: one transaction per tick; raw readings kept 7 days, then downsampled to 1/min for 90 days.
+- History: one transaction per tick. Records: every fan; every CPU/GPU sensor; and every sensor referenced by **any saved profile** (curve sources, custom-sensor sources, alert sensors), not just the active one. Raw readings are kept **24 h**, then downsampled to 1/min until 90 days. Expected size ~300–400 MB.
 
 ## 7. Agent
 

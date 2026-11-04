@@ -2,12 +2,51 @@
 //! then downsampled to 1/min until 90 days. Timestamps are unix seconds, passed in.
 
 use rusqlite::{params, Connection};
+use std::collections::HashSet;
 use std::path::Path;
-use thermaliq_common::{FanReading, SensorReading};
+use thermaliq_common::{
+    Curve, CustomSensor, FanReading, HardwareSnapshot, Profile, SensorKind, SensorReading,
+    MAX_VALID_TEMP_C, MIN_VALID_TEMP_C,
+};
 
 const DAY: i64 = 86_400;
-const RAW_DAYS: i64 = 7;
 const KEEP_DAYS: i64 = 90;
+
+/// Ids of the snapshot sensors to record (SPEC §6): every CPU/GPU sensor plus every
+/// sensor any saved profile references. Ids that name custom sensors aren't in the
+/// snapshot, so they drop out here.
+pub fn recorded_sensor_ids(profiles: &[Profile], snapshot: &HardwareSnapshot) -> HashSet<String> {
+    let mut refs: HashSet<&str> = HashSet::new();
+    for p in profiles {
+        for c in &p.curves {
+            match c {
+                Curve::Linear { source, .. }
+                | Curve::Graph { source, .. }
+                | Curve::Trigger { source, .. } => {
+                    refs.insert(source);
+                }
+                Curve::Flat { .. } | Curve::Mix { .. } | Curve::Sync { .. } => {}
+            }
+        }
+        for s in &p.sensors {
+            match s {
+                CustomSensor::TimeAverage { source, .. } | CustomSensor::Offset { source, .. } => {
+                    refs.insert(source);
+                }
+                CustomSensor::Mix { sources, .. } => {
+                    refs.extend(sources.iter().map(String::as_str))
+                }
+            }
+        }
+        refs.extend(p.alerts.iter().map(|a| a.sensor.as_str()));
+    }
+    snapshot
+        .sensors
+        .iter()
+        .filter(|s| s.kind != SensorKind::Other || refs.contains(s.id.as_str()))
+        .map(|s| s.id.clone())
+        .collect()
+}
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sensor_readings (
@@ -17,6 +56,7 @@ CREATE TABLE IF NOT EXISTS sensor_readings (
     recorded_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_sensor_readings ON sensor_readings(sensor_id, recorded_at);
+CREATE INDEX IF NOT EXISTS idx_sensor_time ON sensor_readings(recorded_at);
 CREATE TABLE IF NOT EXISTS fan_readings (
     id INTEGER PRIMARY KEY,
     fan_id TEXT NOT NULL,
@@ -24,7 +64,8 @@ CREATE TABLE IF NOT EXISTS fan_readings (
     duty_percent INTEGER NOT NULL,
     recorded_at INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_fan_readings ON fan_readings(fan_id, recorded_at);";
+CREATE INDEX IF NOT EXISTS idx_fan_readings ON fan_readings(fan_id, recorded_at);
+CREATE INDEX IF NOT EXISTS idx_fan_time ON fan_readings(recorded_at);";
 
 pub struct HistoryDb(Connection);
 
@@ -46,6 +87,8 @@ impl HistoryDb {
     }
 
     /// Writes every reading of one tick atomically: all rows land or none do.
+    /// Sensor readings that aren't a finite, plausible temperature are skipped so one
+    /// broken sensor can't cost the tick.
     pub fn record_tick(
         &mut self,
         now: i64,
@@ -58,6 +101,9 @@ impl HistoryDb {
                 "INSERT INTO sensor_readings(sensor_id, temp_celsius, recorded_at) VALUES (?1, ?2, ?3)",
             )?;
             for r in sensors {
+                if !(MIN_VALID_TEMP_C..=MAX_VALID_TEMP_C).contains(&r.temp_celsius) {
+                    continue;
+                }
                 ins.execute(params![r.id, r.temp_celsius, now])?;
             }
             let mut ins = tx.prepare_cached(
@@ -70,10 +116,11 @@ impl HistoryDb {
         tx.commit()
     }
 
-    /// Drops rows past 90 days and averages rows past 7 days into one per minute.
+    /// Drops rows past 90 days and averages rows past 24 h into one per minute.
+    /// The raw cutoff is minute-aligned so a bucket is never averaged in two runs.
     /// Idempotent; call it periodically (e.g. hourly).
     pub fn prune(&mut self, now: i64) -> rusqlite::Result<()> {
-        let (raw, keep) = (now - RAW_DAYS * DAY, now - KEEP_DAYS * DAY);
+        let (raw, keep) = ((now - DAY) / 60 * 60, now - KEEP_DAYS * DAY);
         let tx = self.0.transaction()?;
         for (table, key, cols) in [
             ("sensor_readings", "sensor_id", "AVG(temp_celsius) AS temp_celsius"),
@@ -118,9 +165,8 @@ impl HistoryDb {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use thermaliq_common::{FanReading, SensorKind, SensorReading};
+    use thermaliq_common::{HardwareSnapshot, Profile, SensorKind};
 
-    const DAY: i64 = 86_400;
     const NOW: i64 = 100 * DAY;
 
     fn s(id: &str, t: f32) -> SensorReading {
@@ -153,19 +199,42 @@ mod tests {
     #[test]
     fn tick_is_one_transaction() {
         let mut db = HistoryDb::in_memory().unwrap();
-        // NaN binds as NULL and violates NOT NULL on the second sensor.
-        let bad = [s("a", 40.0), s("b", f32::NAN)];
-        assert!(db.record_tick(NOW, &bad, &[f("fan1", 1000, 30)]).is_err());
+        db.0.execute("DROP TABLE fan_readings", []).unwrap();
+        assert!(db
+            .record_tick(NOW, &[s("a", 40.0)], &[f("fan1", 1000, 30)])
+            .is_err());
         assert!(db.sensor_rows("a").unwrap().is_empty());
-        assert!(db.fan_rows("fan1").unwrap().is_empty());
     }
 
     #[test]
-    fn prune_keeps_seven_days_raw() {
+    fn bad_sensor_readings_are_skipped_and_the_rest_saved() {
+        let mut db = HistoryDb::in_memory().unwrap();
+        let ticks = [
+            s("a", 40.0),
+            s("nan", f32::NAN),
+            s("inf", f32::INFINITY),
+            s("hot", 500.0),
+            s("b", 41.0),
+        ];
+        db.record_tick(NOW, &ticks, &[f("fan1", 1000, 30)]).unwrap();
+        assert_eq!(db.sensor_rows("a").unwrap(), vec![(NOW, 40.0)]);
+        assert_eq!(db.sensor_rows("b").unwrap(), vec![(NOW, 41.0)]);
+        for id in ["nan", "inf", "hot"] {
+            assert!(db.sensor_rows(id).unwrap().is_empty());
+        }
+        assert_eq!(db.fan_rows("fan1").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn prune_keeps_24h_raw() {
         let mut db = HistoryDb::in_memory().unwrap();
         for i in 0..5 {
-            db.record_tick(NOW - 6 * DAY + i, &[s("cpu", 50.0)], &[f("fan1", 1000, 30)])
-                .unwrap();
+            db.record_tick(
+                NOW - 23 * 3600 + i,
+                &[s("cpu", 50.0)],
+                &[f("fan1", 1000, 30)],
+            )
+            .unwrap();
         }
         db.prune(NOW).unwrap();
         assert_eq!(db.sensor_rows("cpu").unwrap().len(), 5);
@@ -173,7 +242,124 @@ mod tests {
     }
 
     #[test]
-    fn prune_downsamples_older_than_seven_days_to_one_per_minute() {
+    fn prune_cutoff_is_minute_aligned_so_a_bucket_is_averaged_once() {
+        let mut db = HistoryDb::in_memory().unwrap();
+        let bucket = NOW - DAY; // minute-aligned
+        for (off, t) in [(10, 30.0), (20, 30.0), (40, 60.0)] {
+            db.record_tick(bucket + off, &[s("cpu", t)], &[]).unwrap();
+        }
+        db.prune(NOW + 30).unwrap(); // cutoff falls mid-bucket
+        db.prune(NOW + 120).unwrap();
+        assert_eq!(db.sensor_rows("cpu").unwrap(), vec![(bucket, 40.0)]);
+    }
+
+    #[test]
+    fn recorded_set_is_cpu_gpu_plus_everything_any_profile_references() {
+        let p = |toml: &str| Profile::from_toml(toml).unwrap();
+        let active = p(r#"name = "active"
+            [[curves]]
+            type = "linear"
+            id = "c"
+            source = "mb_curve"
+            min_temp = 30.0
+            max_temp = 70.0
+            min_pwm = 20
+            max_pwm = 100"#);
+        let other = p(r#"name = "other"
+            [[sensors]]
+            type = "offset"
+            id = "custom"
+            source = "mb_custom"
+            offset = 1.0
+            [[alerts]]
+            sensor = "mb_alert"
+            threshold = 80.0
+            severity = "warn"
+            action = { type = "log" }"#);
+        let mut unused = s("mb_unused", 30.0);
+        unused.kind = SensorKind::Other;
+        let named = |id: &str| {
+            let mut r = s(id, 30.0);
+            r.kind = SensorKind::Other;
+            r
+        };
+        let mut gpu = s("gpu0", 40.0);
+        gpu.kind = SensorKind::Gpu;
+        let snap = HardwareSnapshot {
+            sensors: vec![
+                s("cpu0", 40.0),
+                gpu,
+                unused,
+                named("mb_curve"),
+                named("mb_custom"),
+                named("mb_alert"),
+            ],
+            fans: vec![],
+        };
+        let got = recorded_sensor_ids(&[active, other], &snap);
+        let want: HashSet<String> = ["cpu0", "gpu0", "mb_curve", "mb_custom", "mb_alert"]
+            .map(String::from)
+            .into();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn recorded_set_with_no_profiles_is_just_cpu_and_gpu() {
+        let mut other = s("mb", 30.0);
+        other.kind = SensorKind::Other;
+        let snap = HardwareSnapshot {
+            sensors: vec![s("cpu0", 40.0), other],
+            fans: vec![],
+        };
+        let got = recorded_sensor_ids(&[], &snap);
+        assert_eq!(got, HashSet::from(["cpu0".to_string()]));
+    }
+
+    #[test]
+    fn recorded_set_includes_every_cpu_and_gpu_sensor() {
+        let mut gpu = s("gpu0", 40.0);
+        gpu.kind = SensorKind::Gpu;
+        let snap = HardwareSnapshot {
+            sensors: vec![s("cpu0", 40.0), s("cpu1", 41.0), gpu],
+            fans: vec![],
+        };
+        assert_eq!(recorded_sensor_ids(&[], &snap).len(), 3);
+    }
+
+    #[test]
+    fn prune_has_recorded_at_indexes() {
+        let db = HistoryDb::in_memory().unwrap();
+        let n: i64 = db
+            .0
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('idx_sensor_time', 'idx_fan_time')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn file_db_uses_wal_and_keeps_data_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        {
+            let mut db = HistoryDb::open(&path).unwrap();
+            let mode: String =
+                db.0.query_row("PRAGMA journal_mode", [], |r| r.get(0))
+                    .unwrap();
+            assert_eq!(mode, "wal");
+            db.record_tick(NOW, &[s("cpu", 50.0)], &[f("fan1", 1000, 30)])
+                .unwrap();
+        }
+        let db = HistoryDb::open(&path).unwrap();
+        assert_eq!(db.sensor_rows("cpu").unwrap(), vec![(NOW, 50.0)]);
+        assert_eq!(db.fan_rows("fan1").unwrap(), vec![(NOW, 1000, 30)]);
+    }
+
+    #[test]
+    fn prune_downsamples_older_than_24h_to_one_per_minute() {
         let mut db = HistoryDb::in_memory().unwrap();
         let base = NOW - 10 * DAY; // minute-aligned
         for i in 0..60 {
