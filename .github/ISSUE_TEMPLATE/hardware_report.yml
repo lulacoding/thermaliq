@@ -1,0 +1,44 @@
+name: Hardware report
+description: Tell us what works and what doesn't on your machine
+labels: [hardware]
+body:
+  - type: input
+    id: motherboard
+    attributes:
+      label: Motherboard
+      placeholder: "e.g. ASUS ROG STRIX B550-F"
+    validations:
+      required: true
+  - type: input
+    id: cpu
+    attributes:
+      label: CPU
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      placeholder: "e.g. Windows 11 23H2 (build 22631)"
+    validations:
+      required: true
+  - type: textarea
+    id: detected
+    attributes:
+      label: Fans and sensors that show up
+      description: List the fans and temperature sensors ThermalIQ detects.
+    validations:
+      required: true
+  - type: textarea
+    id: failed
+    attributes:
+      label: What failed
+      description: What did you expect, and what happened instead? Include any logs.
+    validations:
+      required: true

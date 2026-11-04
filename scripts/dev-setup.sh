@@ -22,6 +22,6 @@ cd "$(git rev-parse --show-toplevel)"
 
 echo
 echo "Done. Restart Claude Code in this folder."
-echo "Ponytail: accept the plugin prompt on first start, or run:"
+echo "Optional: install Ponytail with:"
 echo "  /plugin marketplace add DietrichGebert/ponytail"
 echo "  /plugin install ponytail@ponytail"
