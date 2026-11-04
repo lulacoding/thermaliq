@@ -13,7 +13,7 @@ Stop and talk these through with Sam (in claude.ai) before any code for the modu
 - [ ] **M12 (large):** sidecar .NET vs LHM's built-in web server; shipping .NET (self-contained vs runtime); PawnIO install flow and anti-cheat conflicts; protocol and watchdog. Run a spike on Sam's PC first: prove one case fan moves.
 - [ ] **M13 (medium):** first-run fan identification UX (spin each header, "which fan moved?"); stable ID scheme across hardware changes.
 - [ ] **M18 (medium):** which screens matter; onboarding; keep v0 design or restyle; how a standard-user account gets the token.
-- [ ] **M20 (large):** what the agent decides; approval-mode UX; model choice (local Ollaya + Clef/Strands vs real Jev); privacy of what it sees; how to evaluate decisions; offline behaviour.
+- [ ] **M20 (large):** **first, fully research and understand Jev**: a non-LLM "System One" decision model (typed probabilistic decisions in one parallel pass, RLCD-calibrated, not text generation). Then research non-LLM alternatives. Start from `docs/dev/research/decision-models.md` and re-check it, since the field is weeks old. The agent must use a decision model, not a chat LLM. Then: what the agent decides; approval-mode UX; model choice (local Strands Decider / Clef-flash via Ollaya, real Jev, or a small trained classifier); GPU contention while gaming; privacy of what it sees; how to evaluate decisions (Brier, accuracy, latency on Sam's PC); offline behaviour.
 - [ ] **Gaps (small), before Phase 4:** a calibration module (not in this ledger yet); M15's exact profile-arbitration rules; M21 code-signing certificate (cost, SmartScreen).
 
 ## Phase 1 — Safety core
