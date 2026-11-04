@@ -11,11 +11,135 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thermaliq_common::{bundled_profiles, FanReading, HardwareSnapshot, Profile, SensorReading};
-use thermaliq_engine::Engine;
+use thermaliq_engine::{Engine, Source};
 use thermaliq_hal::HardwareLayer;
+use tokio::sync::{oneshot, watch};
 
 /// Ticks queued for the history thread before new ones are dropped (the engine never waits).
 const HISTORY_QUEUE: usize = 64;
+/// SPEC §4: a manual override is time-limited.
+const MAX_OVERRIDE: Duration = Duration::from_secs(300);
+/// How long a caller waits for the engine thread to answer a command.
+const COMMAND_WAIT: Duration = Duration::from_secs(5);
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum CommandError {
+    /// The engine thread is gone or did not answer; nothing was done that we know of.
+    Unavailable,
+    /// The target (fan, override) does not exist.
+    NotFound(String),
+    /// The engine refused the request.
+    Rejected(String),
+}
+
+/// `Ok(Some(reason))`: done, but a safety rule (S2–S4) currently overrides it. Only overrides use it.
+type Done = Result<Option<&'static str>, CommandError>;
+type Reply = oneshot::Sender<Done>;
+
+enum Cmd {
+    SetProfile(Profile, Reply),
+    Override(String, u8, Duration, Reply),
+    Cancel(String, Reply),
+}
+
+enum Msg {
+    Stop,
+    Cmd(Cmd),
+}
+
+/// Duty clamped to 0–100, seconds capped at 300. `None`: 0 seconds is not an override.
+pub fn clamp_override(duty: i64, seconds: u64) -> Option<(u8, Duration)> {
+    (seconds > 0).then(|| {
+        let duty = u8::try_from(duty.clamp(0, 100)).unwrap_or(100);
+        (duty, Duration::from_secs(seconds).min(MAX_OVERRIDE))
+    })
+}
+
+fn apply(engine: &mut Engine, began: Instant, cache: &RwLock<Cache>, cmd: Cmd) {
+    let (result, reply) = match cmd {
+        Cmd::SetProfile(p, reply) => {
+            engine.set_profile(&p);
+            cache
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .active_profile = p.name;
+            (Ok(None), reply)
+        }
+        Cmd::Override(fan, duty, dur, reply) => {
+            let r = if engine.can_control(&fan) {
+                engine
+                    .submit(&fan, Source::Override, duty, Some(began.elapsed() + dur))
+                    .map_err(CommandError::Rejected)
+                    .map(|()| engine.override_blocked_by(&fan))
+            } else {
+                Err(CommandError::Rejected(format!(
+                    "fan '{fan}' is not controlled by the active profile, or is read-only"
+                )))
+            };
+            (r, reply)
+        }
+        Cmd::Cancel(fan, reply) => {
+            let r = match engine.cancel_override(&fan) {
+                Ok(true) => Ok(None),
+                Ok(false) => Err(CommandError::NotFound(format!(
+                    "fan '{fan}' has no active override"
+                ))),
+                Err(e) => Err(CommandError::NotFound(e)),
+            };
+            (r, reply)
+        }
+    };
+    let _ = reply.send(result);
+}
+
+/// A cheap, cloneable way for the API to read the cache and talk to the engine thread.
+#[derive(Clone)]
+pub struct Handle {
+    cache: Arc<RwLock<Cache>>,
+    tx: mpsc::Sender<Msg>,
+    ticks: watch::Receiver<u64>,
+}
+
+impl Handle {
+    /// Changes after every tick's cache update; closes when the engine thread ends.
+    pub fn ticks(&self) -> watch::Receiver<u64> {
+        self.ticks.clone()
+    }
+
+    pub fn cache(&self) -> Cache {
+        self.cache
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    async fn ask(&self, make: impl FnOnce(Reply) -> Cmd) -> Done {
+        let (reply, answer) = oneshot::channel();
+        self.tx
+            .send(Msg::Cmd(make(reply)))
+            .map_err(|_| CommandError::Unavailable)?;
+        match tokio::time::timeout(COMMAND_WAIT, answer).await {
+            Ok(Ok(result)) => result,
+            _ => Err(CommandError::Unavailable),
+        }
+    }
+
+    pub async fn set_profile(&self, profile: Profile) -> Result<(), CommandError> {
+        self.ask(|r| Cmd::SetProfile(profile, r)).await.map(drop)
+    }
+
+    /// `duty` is clamped to 0–100 and `seconds` capped at 300; 0 seconds is rejected.
+    /// `Ok(Some(reason))`: stored, but safety holds the fan right now ("latched", "degraded", "sensor_lost").
+    pub async fn set_override(&self, fan: &str, duty: i64, seconds: u64) -> Done {
+        let (duty, dur) = clamp_override(duty, seconds)
+            .ok_or_else(|| CommandError::Rejected("an override needs seconds > 0".into()))?;
+        self.ask(|r| Cmd::Override(fan.into(), duty, dur, r)).await
+    }
+
+    pub async fn cancel_override(&self, fan: &str) -> Result<(), CommandError> {
+        self.ask(|r| Cmd::Cancel(fan.into(), r)).await.map(drop)
+    }
+}
 
 pub struct Options {
     pub tick: Duration,
@@ -43,14 +167,15 @@ pub struct Cache {
     pub ticks: u64,
     /// Ticks since `snapshot` was read from the hardware; 0 = fresh (S4 starts at 3).
     pub snapshot_age: u64,
+    pub active_profile: String,
 }
 
 type HistoryTick = (i64, Vec<SensorReading>, Vec<FanReading>);
 
 pub struct Daemon {
     cache: Arc<RwLock<Cache>>,
-    /// Dropping this stops the engine thread.
-    stop: Option<mpsc::Sender<()>>,
+    tx: mpsc::Sender<Msg>,
+    ticks: watch::Receiver<u64>,
     engine: Option<JoinHandle<()>>,
     history: Option<JoinHandle<()>>,
 }
@@ -71,10 +196,12 @@ impl Daemon {
                 engine_running: true,
                 ..Status::default()
             },
+            active_profile: active.name.clone(),
             ..Cache::default()
         }));
-        let (stop, stopped) = mpsc::channel::<()>();
-        let (tx, rx) = mpsc::sync_channel::<HistoryTick>(HISTORY_QUEUE);
+        let (tx, commands) = mpsc::channel::<Msg>();
+        let (tick_tx, ticks) = watch::channel(0u64);
+        let (history_tx, rx) = mpsc::sync_channel::<HistoryTick>(HISTORY_QUEUE);
         let history = std::thread::spawn(move || history_loop(&rx, &history, opts.prune_every));
         let engine = {
             let (cache, active, tick) = (cache.clone(), active.clone(), opts.tick);
@@ -84,7 +211,7 @@ impl Daemon {
                     let mut engine = Engine::new(hal, &active);
                     let began = Instant::now();
                     let (mut ticks, mut snapshot_age) = (0u64, 0u64);
-                    loop {
+                    'run: loop {
                         let t0 = Instant::now();
                         engine.tick(t0 - began);
                         ticks += 1;
@@ -103,7 +230,8 @@ impl Daemon {
                                 .cloned()
                                 .collect();
                             // A full queue drops this tick's history rather than stall the engine.
-                            let _ = tx.try_send((unix_now(), sensors, snapshot.fans.clone()));
+                            let _ =
+                                history_tx.try_send((unix_now(), sensors, snapshot.fans.clone()));
                         }
                         let status = Status {
                             engine_running: true,
@@ -111,16 +239,27 @@ impl Daemon {
                             degraded: engine.degraded(),
                             waiting_on: engine.latch_waiting_on().to_vec(),
                         };
-                        *cache.write().unwrap_or_else(PoisonError::into_inner) = Cache {
-                            snapshot,
-                            status,
-                            ticks,
-                            snapshot_age,
-                        };
-                        // Any message, or the Daemon dropping its sender, means stop.
-                        let wait = tick.saturating_sub(t0.elapsed());
-                        if !matches!(stopped.recv_timeout(wait), Err(RecvTimeoutError::Timeout)) {
-                            break;
+                        {
+                            let mut c = cache.write().unwrap_or_else(PoisonError::into_inner);
+                            (c.snapshot, c.status) = (snapshot, status);
+                            (c.ticks, c.snapshot_age) = (ticks, snapshot_age);
+                        }
+                        tick_tx.send_replace(ticks);
+                        // Commands run between ticks; past the deadline the next tick comes first.
+                        let deadline = t0 + tick;
+                        loop {
+                            match commands
+                                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                            {
+                                Ok(Msg::Cmd(cmd)) => {
+                                    apply(&mut engine, began, &cache, cmd);
+                                    if Instant::now() >= deadline {
+                                        break;
+                                    }
+                                }
+                                Ok(Msg::Stop) | Err(RecvTimeoutError::Disconnected) => break 'run,
+                                Err(RecvTimeoutError::Timeout) => break,
+                            }
                         }
                     }
                 }));
@@ -137,17 +276,23 @@ impl Daemon {
         };
         Self {
             cache,
-            stop: Some(stop),
+            tx,
+            ticks,
             engine: Some(engine),
             history: Some(history),
         }
     }
 
     pub fn cache(&self) -> Cache {
-        self.cache
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+        self.handle().cache()
+    }
+
+    pub fn handle(&self) -> Handle {
+        Handle {
+            cache: self.cache.clone(),
+            tx: self.tx.clone(),
+            ticks: self.ticks.clone(),
+        }
     }
 
     /// Stops the engine (dropping it hands every touched fan back, S5), then the history
@@ -157,7 +302,7 @@ impl Daemon {
     }
 
     fn join(&mut self) -> Result<(), String> {
-        drop(self.stop.take());
+        let _ = self.tx.send(Msg::Stop);
         let engine = self.engine.take().map(JoinHandle::join);
         let history = self.history.take().map(JoinHandle::join);
         match (engine, history) {
@@ -469,6 +614,162 @@ mod tests {
         };
         let (_hal, d) = start(vec![at(40.0)], vec![], &db, opts);
         wait_until(|| db.lock().unwrap().sensor_rows("old").unwrap().is_empty());
+        d.shutdown().unwrap();
+    }
+
+    fn last_write(hal: &MockHardwareLayer) -> Option<(String, u8)> {
+        hal.writes().last().cloned()
+    }
+
+    #[test]
+    fn override_request_is_clamped_to_duty_0_100_and_300_seconds() {
+        assert_eq!(
+            clamp_override(250, 10_000),
+            Some((100, Duration::from_secs(300)))
+        );
+        assert_eq!(clamp_override(-5, 5), Some((0, Duration::from_secs(5))));
+        assert_eq!(clamp_override(50, 0), None, "an override must expire");
+    }
+
+    #[tokio::test]
+    async fn an_override_reaches_the_hal_clamped() {
+        let (hal, d) = start(vec![at(40.0)], vec![], &db(), fast());
+        d.handle().set_override("f1", 250, 60).await.unwrap();
+        wait_until(|| last_write(&hal) == Some(("f1".into(), 100)));
+        d.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_override_expires_back_to_the_profile() {
+        let (hal, d) = start(vec![at(40.0)], vec![], &db(), fast());
+        d.handle().set_override("f1", 90, 1).await.unwrap();
+        wait_until(|| last_write(&hal) == Some(("f1".into(), 90)));
+        wait_until(|| last_write(&hal) == Some(("f1".into(), 30)));
+        d.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_override_returns_to_the_profile_and_a_second_cancel_is_not_found() {
+        let (hal, d) = start(vec![at(40.0)], vec![], &db(), fast());
+        let h = d.handle();
+        h.set_override("f1", 90, 60).await.unwrap();
+        wait_until(|| last_write(&hal) == Some(("f1".into(), 90)));
+        h.cancel_override("f1").await.unwrap();
+        wait_until(|| last_write(&hal) == Some(("f1".into(), 30)));
+        assert!(matches!(
+            h.cancel_override("f1").await,
+            Err(CommandError::NotFound(_))
+        ));
+        assert!(matches!(
+            h.cancel_override("nope").await,
+            Err(CommandError::NotFound(_))
+        ));
+        d.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_override_the_engine_cannot_apply_is_an_error_and_writes_nothing() {
+        let hal = Arc::new(MockHardwareLayer::new(&["f1", "f2"], vec![at(40.0)]).read_only("f1"));
+        let active = Profile::from_toml(FLAT).unwrap();
+        let d = Daemon::start(hal.clone(), &active, vec![], db(), fast());
+        let h = d.handle();
+        for fan in [
+            "f1", /* read-only */
+            "f2", /* no control */
+            "nope",
+        ] {
+            assert!(
+                matches!(
+                    h.set_override(fan, 50, 60).await,
+                    Err(CommandError::Rejected(_))
+                ),
+                "{fan}"
+            );
+        }
+        assert!(matches!(
+            h.set_override("f1", 50, 0).await,
+            Err(CommandError::Rejected(_))
+        ));
+        d.shutdown().unwrap();
+        assert!(hal.writes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn set_profile_switches_the_running_engine_and_the_reported_name() {
+        let (hal, d) = start(vec![at(40.0)], vec![], &db(), fast());
+        assert_eq!(d.cache().active_profile, "flat");
+        let sixty = FLAT
+            .replace("pwm = 30", "pwm = 60")
+            .replace("name = \"flat\"", "name = \"sixty\"");
+        d.handle()
+            .set_profile(Profile::from_toml(&sixty).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(d.cache().active_profile, "sixty");
+        wait_until(|| last_write(&hal) == Some(("f1".into(), 60)));
+        d.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn commands_after_the_engine_stopped_fail_instead_of_pretending() {
+        let (_hal, d) = start(vec![at(40.0)], vec![], &db(), fast());
+        let h = d.handle();
+        d.shutdown().unwrap();
+        assert!(matches!(
+            h.set_override("f1", 50, 60).await,
+            Err(CommandError::Unavailable)
+        ));
+        assert!(matches!(
+            h.cancel_override("f1").await,
+            Err(CommandError::Unavailable)
+        ));
+        let p = Profile::from_toml(FLAT).unwrap();
+        assert!(matches!(
+            h.set_profile(p).await,
+            Err(CommandError::Unavailable)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_continuous_flood_of_commands_does_not_starve_ticks() {
+        let (_hal, d) = start(vec![at(40.0)], vec![], &db(), fast());
+        let h = d.handle();
+        wait_until(|| d.cache().ticks > 0);
+        let before = d.cache().ticks;
+        // Flood for 20 tick periods (the tick is 5 ms), so the queue never drains in one window.
+        let end = Instant::now() + 20 * fast().tick;
+        // Producers don't wait for replies, so the queue is never empty while they run.
+        let flood: Vec<_> = (0..4)
+            .map(|_| {
+                let tx = h.tx.clone();
+                std::thread::spawn(move || {
+                    while Instant::now() < end {
+                        let (reply, _) = oneshot::channel();
+                        let _ = tx.send(Msg::Cmd(Cmd::Cancel("f1".into(), reply)));
+                    }
+                })
+            })
+            .collect();
+        for f in flood {
+            f.join().unwrap();
+        }
+        let rose = d.cache().ticks - before;
+        assert!(rose >= 3, "only {rose} ticks ran during the flood");
+        d.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_override_reports_whether_it_is_in_effect() {
+        let (_hal, d) = start(vec![at(40.0)], vec![], &db(), fast());
+        wait_until(|| d.cache().ticks > 0);
+        assert_eq!(d.handle().set_override("f1", 50, 60).await, Ok(None));
+        d.shutdown().unwrap();
+        let (_hal, d) = start(vec![at(97.0)], vec![], &db(), fast());
+        wait_until(|| d.cache().status.latched);
+        assert_eq!(
+            d.handle().set_override("f1", 50, 60).await,
+            Ok(Some("latched"))
+        );
         d.shutdown().unwrap();
     }
 
