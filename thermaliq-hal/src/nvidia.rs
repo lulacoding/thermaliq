@@ -540,8 +540,8 @@ mod tests {
     }
 
     /// Real GPU. Run: `cargo test -p thermaliq-hal -- --ignored nvidia --nocapture`. Needs an
-    /// elevated shell; moves the first controllable fan to 75 % (or 35 % if it is above 55 %)
-    /// for 5 s.
+    /// elevated shell; moves the first controllable fan to 75 % (or 35 %), kept
+    /// inside the range the driver allows, for 5 s.
     #[cfg(windows)]
     #[test]
     #[ignore = "needs an NVIDIA GPU with a controllable fan and admin rights"]
@@ -561,12 +561,26 @@ mod tests {
         let before = duty(&hw);
         let _restore = Restore(&hw, id.clone());
 
-        // At least 20 points from where it is now, so a reading at the target proves movement;
-        // both targets stay above the usual ~30 % BIOS floor.
-        let target: u8 = if before < 55 { 75 } else { 35 };
-        assert!(before.abs_diff(target) >= 20);
+        let (g, f) = id
+            .trim_start_matches("nvml_gpu")
+            .split_once("_fan")
+            .unwrap();
+        let nvml = nvml_wrapper::Nvml::init().unwrap();
+        let dev = nvml.device_by_index(g.parse().unwrap()).unwrap();
+        // The driver clamps writes to the range the card allows, so aim inside it.
+        let (min, max) = dev.min_max_fan_speed().unwrap();
+        println!("{id}: driver allows {min}-{max} %, now {before} %");
+        // At least 20 points from where it is now, so a reading at the target proves movement.
+        let target = [75.min(max), 35.max(min)]
+            .into_iter()
+            .find(|t| before.abs_diff(*t as u8) >= 20)
+            .expect("no target 20+ points from the current duty inside the allowed range");
+        let target = target as u8;
         hw.set_fan_duty(&id, target).unwrap();
-        std::thread::sleep(Duration::from_secs(5));
+        for s in 1..=5 {
+            std::thread::sleep(Duration::from_secs(1));
+            println!("  +{s} s: {} %", duty(&hw));
+        }
         let during = duty(&hw);
         println!("{id}: {before} % -> {during} % (asked for {target})");
         assert!(
@@ -575,12 +589,6 @@ mod tests {
         );
 
         hw.restore_auto(&id).unwrap();
-        let (g, f) = id
-            .trim_start_matches("nvml_gpu")
-            .split_once("_fan")
-            .unwrap();
-        let nvml = nvml_wrapper::Nvml::init().unwrap();
-        let dev = nvml.device_by_index(g.parse().unwrap()).unwrap();
         let policy = dev.fan_control_policy(f.parse().unwrap()).unwrap();
         assert_eq!(policy, FanControlPolicy::TemperatureContinousSw);
     }
