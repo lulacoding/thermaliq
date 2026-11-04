@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use thermaliq_common::{FanReading, HardwareSnapshot, SensorKind, SensorReading};
 
 /// Every HAL call returns within this, success or error (PORTING M10).
+#[cfg(windows)]
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The NVML calls this backend needs, so tests can swap in a fake. Indices are NVML's.
@@ -538,8 +539,9 @@ mod tests {
         }
     }
 
-    /// Real GPU. Run: `cargo test -p thermaliq-hal -- --ignored nvidia`. Needs an elevated
-    /// shell, and spins the first controllable fan to 60 % for 5 s.
+    /// Real GPU. Run: `cargo test -p thermaliq-hal -- --ignored nvidia --nocapture`. Needs an
+    /// elevated shell; moves the first controllable fan to 75 % (or 35 % if it is above 55 %)
+    /// for 5 s.
     #[cfg(windows)]
     #[test]
     #[ignore = "needs an NVIDIA GPU with a controllable fan and admin rights"]
@@ -559,13 +561,17 @@ mod tests {
         let before = duty(&hw);
         let _restore = Restore(&hw, id.clone());
 
-        hw.set_fan_duty(&id, 60).unwrap();
+        // At least 20 points from where it is now, so a reading at the target proves movement;
+        // both targets stay above the usual ~30 % BIOS floor.
+        let target: u8 = if before < 55 { 75 } else { 35 };
+        assert!(before.abs_diff(target) >= 20);
+        hw.set_fan_duty(&id, target).unwrap();
         std::thread::sleep(Duration::from_secs(5));
         let during = duty(&hw);
-        println!("{id}: {before} % -> {during} % (asked for 60)");
+        println!("{id}: {before} % -> {during} % (asked for {target})");
         assert!(
-            during.abs_diff(60) <= 2,
-            "fan did not move to 60 %: {during}"
+            during.abs_diff(target) <= 2,
+            "fan did not move to {target} %: {during}"
         );
 
         hw.restore_auto(&id).unwrap();
