@@ -1,12 +1,18 @@
 # ThermalIQ v2 — Spec
 
-Fan control for Windows that is safe first, smart second. One page of truth: if code and this file disagree, this file wins until it is changed on purpose.
+An AI cooling agent for Windows that sets up, runs and improves your PC's cooling on its own, inside hard safety rules. One page of truth: if code and this file disagree, this file wins until it is changed on purpose.
 
 Reference: the v0 code is tagged `v0-archive` (see `PORTING.md`). The audit that led to this rebuild: "ThermalIQ Codebase Audit — Continue, Rewrite, or V2?" (2026-11-04).
 
 ## 1. What v2.0 is
 
-A background service that reads temperatures and drives fans from user-defined curves, with a desktop UI, a CLI, and an optional AI agent that suggests or applies profile changes. Local-first: no cloud, no telemetry.
+**The agent is the product** (decided by Sam, 2026-11-04). ThermalIQ is not a manual fan-control tool with an optional AI add-on. Instead of the user building curves and configuring every system fan, GPU fan, CPU cooler and AIO pump, the agent:
+
+1. **Sets up:** finds every fan and pump, calibrates each one, and works out which fan cools what by spinning each and watching which temperatures change.
+2. **Runs:** a Jev-style decision model (not an LLM) reads the live state every few seconds and picks the right behaviour for the workload.
+3. **Improves over time:** learns from history which settings meet the user's temperature goals with the least noise, per workload, and keeps tuning.
+
+All of this happens inside the SPEC §3 safety rules, which the agent can never override. Manual curves stay available as an advanced option. Underneath is a background service with a desktop UI, a CLI and a local API. Local-first: no cloud, no telemetry. A hosted decision model is only used if the user opts in.
 
 ## 2. Scope
 
@@ -81,6 +87,8 @@ One snapshot per tick, cached and shared. API reads use the cache, never the har
 - History: one transaction per tick. Records: every fan; every CPU/GPU sensor; and every sensor referenced by **any saved profile** (curve sources, custom-sensor sources, alert sensors), not just the active one. Raw readings are kept **24 h**, then downsampled to 1/min until 90 days. Expected size ~300–400 MB.
 
 ## 7. Agent
+
+*Being redesigned in the M20 brainstorm (now first in PORTING's brainstorm list). The lines below are the pre-2026-11-04 draft. The brainstorm replaces them with setup, runtime and learning, and the inputs they need (load %, power, foreground app, as well as temperatures).*
 
 - Modes: **passive** (observe and log), **approval** (propose; you approve or reject each change), **autonomous** (apply within the rate limit).
 - Every 5 s: builds a JSON state (5-min temperature window, slopes, foreground app, active profile) and asks a decision provider two typed questions: workload `[idle, gaming, compiling, encoding, stress]` and action `[none, propose, apply]`, with confidence.
