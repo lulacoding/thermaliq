@@ -1,5 +1,6 @@
 # Gate G1 (SPEC §8), run elevated on the Windows PC with the NVIDIA GPU. Not for CI.
-# Builds the daemon with fault injection (debug only), installs it as the real service, then:
+# Builds the daemon with fault injection (debug only), installs it as the real service with the
+# bundled `balanced` profile (its GPU roles mapped to this PC's first NVIDIA GPU), then:
 # running + GPU fan controlled -> 97 C holds the latch and 100% for 30 s -> latch releases after
 # >= 30 s -> hard kill restarts the service within 5 s and the engine controls the fan again ->
 # stop returns the fan to automatic within 5 s -> uninstall. Always leaves the fan on automatic.
@@ -8,7 +9,8 @@ $root = Split-Path $PSScriptRoot -Parent
 $exe = Join-Path $root 'target\debug\thermaliq-daemon.exe'
 $dir = Join-Path $env:ProgramData 'ThermalIQ'
 $inject = Join-Path $dir 'inject_cpu_temp.txt'
-$profile_ = Join-Path $dir 'profiles\g1.toml'
+$roles = Join-Path $dir 'roles.toml'
+$rolesBak = Join-Path $dir 'roles.toml.g1bak'
 $cfgBak = Join-Path $dir 'config.toml.g1bak'
 $api = 'http://127.0.0.1:7272'
 $svcKey = 'HKLM:\SYSTEM\CurrentControlSet\Services\ThermalIQ'
@@ -83,30 +85,18 @@ try {
     Step 'install and start the service' {
         & $exe install-service
         if ($LASTEXITCODE -ne 0) { throw 'install-service failed (an existing ThermalIQ install may need uninstall-service first)' }
-        # The bundled profiles use role IDs (gpu1, chassis1) that M13's first-run mapping will
-        # translate; until then nothing would drive the real fan. Use a profile on it that follows
-        # the GPU temperature (40-100%), so the agent has a fan it may adjust while G1 runs.
+        # The bundled `balanced` profile names roles (SPEC 5.2). Map the GPU fan and temperature to
+        # this PC's first NVIDIA GPU, as `thermaliq-daemon identify` would, and run that profile.
+        # Its case-fan roles stay unmapped, so those controls are skipped and logged, which is
+        # the behaviour on a PC with only a GPU fan.
+        $uuid = "$(nvidia-smi --query-gpu=uuid --format=csv,noheader | Select-Object -First 1)".Trim()
+        if (-not $uuid) { throw 'nvidia-smi gave no GPU UUID' }
         $cfg = Join-Path $dir 'config.toml'
         if (Test-Path $cfg) { Copy-Item $cfg $cfgBak -Force }
-        New-Item -ItemType Directory -Force (Join-Path $dir 'profiles') | Out-Null
-        Set-Content -Path $profile_ -Encoding ascii -Value @'
-name = "g1"
-[[curves]]
-type = "linear"
-id = "c"
-source = "nvml_gpu0_temp"
-min_temp = 30.0
-max_temp = 90.0
-min_pwm = 40
-max_pwm = 100
-[[controls]]
-fan = "nvml_gpu0_fan0"
-curve = "c"
-step_up_pct = 100
-step_down_pct = 100
-'@
+        if (Test-Path $roles) { Copy-Item $roles $rolesBak -Force }
         $script:wroteCfg = $true
-        Set-Content -Path $cfg -Encoding ascii -Value "default_profile = `"g1`"`n"
+        Set-Content -Path $roles -Encoding ascii -Value "[roles]`ngpu_fan = `"nvml_${uuid}_fan0`"`ngpu_temp = `"nvml_${uuid}_temp`"`n"
+        Set-Content -Path $cfg -Encoding ascii -Value "default_profile = `"balanced`"`n"
         Set-Injection ''   # armed, not injecting
         Set-ItemProperty -Path $svcKey -Name Environment -Type MultiString -Value @("THERMALIQ_INJECT_CPU_TEMP=$inject")
         Start-Service ThermalIQ
@@ -179,10 +169,12 @@ step_down_pct = 100
 finally {
     # Whatever happened: no service, no injection, and the fan back on the driver's own curve.
     if (Test-Path $exe) { try { & $exe uninstall-service 2>$null | Out-Null } catch { } }
-    Remove-Item $inject, $profile_ -ErrorAction SilentlyContinue
-    if ($script:wroteCfg) {   # only undo our own config.toml
+    Remove-Item $inject -ErrorAction SilentlyContinue
+    if ($script:wroteCfg) {   # only undo our own config.toml and roles.toml
         if (Test-Path $cfgBak) { Move-Item $cfgBak (Join-Path $dir 'config.toml') -Force }
         else { Remove-Item (Join-Path $dir 'config.toml') -ErrorAction SilentlyContinue }
+        if (Test-Path $rolesBak) { Move-Item $rolesBak $roles -Force }
+        else { Remove-Item $roles -ErrorAction SilentlyContinue }
     }
     try {
         [Nvml]::RestoreAll()
