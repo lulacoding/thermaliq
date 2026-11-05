@@ -9,10 +9,10 @@ Reference: the v0 code is tagged `v0-archive` (see `PORTING.md`). The audit that
 **The agent is the product** (decided by Sam, 2026-11-04). ThermalIQ is not a manual fan-control tool with an optional AI add-on. Instead of the user building curves and configuring every system fan, GPU fan, CPU cooler and AIO pump, the agent:
 
 1. **Sets up:** finds every fan and pump, calibrates each one, and works out which fan cools what by spinning each and watching which temperatures change.
-2. **Runs:** every second, a small learned model predicts temperatures and adjusts fans to the user's quiet ↔ cool goal, during gaming too. A Jev-style decision model (not an LLM) makes the bigger calls: which profile, whether to accept a learned curve.
+2. **Runs:** every second, a small learned model predicts temperatures and adjusts fans to the user's quiet ↔ cool goal, during gaming too. A Jev-style decision model (not an LLM) makes the bigger calls: which workload a new app is, whether to accept a learned curve.
 3. **Improves over time:** learns from history which settings meet the user's temperature goals with the least noise, per workload, and keeps tuning.
 
-All of this happens inside the SPEC §3 safety rules, which the agent can never override. Manual curves stay available as an advanced option. Underneath is a background service with a desktop UI, a CLI and a local API. Local-first: no cloud, no telemetry. A hosted decision model is only used if the user opts in.
+All of this happens inside the SPEC §3 safety rules, which the agent can never override. Manual curves stay available as an advanced option. Underneath is a background service with a desktop UI, a CLI and a local API. Fan control, safety and the fast layer run entirely on the PC, with no telemetry. The main route for the decision model is hosted Jev with the user's own key, which first-run setup asks for prominently (about 3 cents a day). No key is shipped and there is no ThermalIQ proxy. Without a key, the agent falls back as described in §7.2.
 
 ## 2. Scope
 
@@ -104,6 +104,7 @@ Decided in the agent brainstorm (Sam, 2026-11-04). Research: `docs/dev/research/
 2. Calibrate each fan at priority 2 (time-limited): start %, stop %, max RPM. Pumps are measured, never stopped.
 3. Map fans to components: raise one fan at a time under a steady load (the built-in load generator, §7.6) and watch which temperatures drop. A clear result is applied. An unclear one is asked of the decision model, then of the user if the model isn't confident.
 4. Write a starting profile per workload from the mapping, and record a baseline for the thermal model.
+5. On first run only, ask prominently for the user's OpenRouter or TypeSafe key, and show the cost (about 3 cents a day). Without a key, routing uses the later steps in §7.2.
 
 ### 7.2 Runtime
 
@@ -116,11 +117,15 @@ Decided in the agent brainstorm (Sam, 2026-11-04). Research: `docs/dev/research/
   - *Which fan cools what:* until setup mapping (M20d) exists, a fan cools the component whose temperature sensor its profile curve reads. If the GPU, its load or its power cannot be named unambiguously, or no fan follows it, the agent leaves those fans to their curves.
 
 **Slow layer: every 60 s and whenever the foreground app changes. Decision model, not an LLM.**
-- Typed questions with confidence: the workload for an app not seen before (cached per exe afterwards); which profile to use; whether to accept a learned curve or a new profile.
-- **Provider routing:** hosted Jev when the user has added a key (OS keychain), is online, and gets an answer within 2 s. Otherwise local: an open decision model (Strands Decider / Clef-flash class) behind an Ollaya-compatible endpoint (`TYPESAFE_BASE_URL`). The local model runs on one CPU core at background priority. It is loaded on demand and unloaded after use, so it isn't resident in VRAM. It may use the GPU only while GPU load is < 50%.
-- **Big calls** (accept a learned curve, create a profile): when both providers are available, both answer. Agreement → apply. Disagreement → ask the user.
+- Typed questions with confidence: the workload for an app not seen before (cached per exe afterwards); whether to accept a learned curve or a new profile.
+- **Profile choice is a fixed rule, not a model question:** idle → silent, browsing → efficiency, gaming → gaming, compiling and rendering → performance, other → balanced. A workload answer at or above its confidence threshold selects the profile, and applying it is a slow-layer change (§7.4). Below the threshold, nothing changes and the §7.4 ask applies.
+- **State sent to the model:** centred on the foreground exe: its name plus recent averages of load, power and temperature, not one instant reading. M20c chooses the averaging window.
+- **Provider routing, in order:** (1) hosted Jev, when a key is set, the PC is online and an answer arrives within 2 s; (2) the local model, when the PC is idle; (3) a built-in list of well-known exes, for the workload question only; (4) ask the user.
+- **Keys:** each user brings their own OpenRouter or TypeSafe key, stored in the OS keychain. No key is shipped and there is no ThermalIQ proxy.
+- **Local model:** an open decision model (Strands Decider class; Clef-flash is deferred) behind an Ollaya-compatible endpoint (`TYPESAFE_BASE_URL`). It never runs while a game is in the foreground: if one comes to the foreground during a call, the call stops and the model unloads. When the PC is idle it may use up to half the cores at below-normal priority. M20c defines idle, which must rule out a game it doesn't recognise yet, and how cores are counted. It is loaded on demand and unloaded after use, so it isn't resident in VRAM. It may use the GPU only while GPU load is < 50%.
+- **Big calls** (accept a learned curve, create a profile): when both providers are available, both answer. Agreement → apply. Disagreement → ask the user. With only one provider available, a big call applies only at or above the big-change threshold (§7.4); otherwise it asks.
 - Hosted requests contain numbers and exe names only. The user can turn hosted off at any time.
-- No provider available: the fast layer keeps running, the slow layer's calls queue as questions for the user, and nothing pretends to have decided (S8).
+- Nothing can answer: the fast layer keeps running, the slow layer's calls queue as questions for the user, and nothing pretends to have decided (S8).
 
 ### 7.3 Learning (when the PC is idle)
 
@@ -137,7 +142,7 @@ Retrain the classifier and the thermal models on history. Search curve changes p
 - Decisions: Brier score and accuracy against labelled history and user accept/undo.
 - Thermal model: mean error at 20 s ahead, ≤ 2 °C on held-out history, over windows where no input (load, power, duty) steps during the window. No model can foresee an unmeasured step, like a game starting. Errors over windows with a step are reported separately, not gated. Fitted coefficients must be physically possible (more duty never heats, more power never cools), or the fit is rejected: history is recorded in closed loop, where the curve sets duty from temperature, and that biases a naive fit.
 - Live optimiser: in mock-hardware tests, it never lowers a fan whose temperature is over target or predicted over target, and never goes past the 15-point limit.
-- Gaming cost: the local CPU decision model's FPS cost in a real game must be < 2% (average FPS, same scene, with and without it). If it fails, the local model doesn't run while a game is in the foreground, and its calls queue until the game closes.
+- Gaming cost: no FPS test (Sam, 2026-11-05). The local model never runs while a game is in the foreground, because of its memory use and load time (M20c spike on 16 GB: 7.8 GB, 37 s to first answer). Tests must prove that it doesn't start during a game and stops when one comes to the foreground.
 - Latency: the fast layer takes < 1 ms per tick. Slow-layer timing is logged per provider.
 
 ### 7.6 Launch features (Sam, 2026-11-04)
@@ -163,7 +168,14 @@ A module is done when its tests pass in CI on Windows, macOS and Ubuntu runners 
 Decided 2026-11-04 by Sam:
 
 - Agent modes: 3 — observe, ask, auto. Auto is the default and applies above a confidence threshold, asking below it (agent brainstorm, §7).
-- Agent decision provider: hosted Jev if a key is set and online, local open model otherwise. Both vote on big calls (§7.2).
+- Agent decision provider: changed on 2026-11-05, see below. Both vote on big calls when both are available (§7.2).
 - Linux moves to v2.1. v2.0 is Windows-only. CI still builds and tests on Ubuntu and macOS with mock hardware.
 - HWiNFO stays as an optional extra sensor source once the LHM bridge works.
 - LLM for profile generation: OpenRouter by default; any OpenAI-compatible base URL (e.g. local Ollama) can be configured.
+
+Decided 2026-11-05 by Sam:
+
+- The decision model no longer picks the profile. Profile answers were unreliable in the M20c spike, so a fixed workload → profile rule replaces that question, and the state centres on the exe (§7.2, `docs/dev/research/decision-models.md`).
+- Agent decision provider: hosted Jev is the main route. Order: Jev (key set and online) → local when idle → built-in list of well-known exes → ask the user (§7.2).
+- Keys: each user brings their own OpenRouter or TypeSafe key, stored in the OS keychain. First-run setup asks for it prominently, with the cost (about 3 cents a day). No key is shipped and there is no ThermalIQ proxy.
+- Local model: never runs while a game is in the foreground (7.8 GB, 37 s load in the spike), so the FPS test is skipped. When the PC is idle it may use up to half the cores at below-normal priority. Clef-flash is deferred.
