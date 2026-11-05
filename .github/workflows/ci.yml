@@ -31,6 +31,13 @@ jobs:
       - run: cargo test -p thermaliq-daemon --features mock-hardware
       - run: cargo clippy -p thermaliq-daemon --all-targets --features gate-tests -- -D warnings
       - run: cargo test -p thermaliq-daemon --features gate-tests,mock-hardware
+      - uses: actions/setup-dotnet@v4
+        if: runner.os == 'Windows'
+        with:
+          dotnet-version: 10.0.x
+      - name: LHM bridge tests
+        if: runner.os == 'Windows'
+        run: dotnet test bridges/lhm-bridge/LhmBridge.sln -c Release
       - name: Service smoke test
         if: runner.os == 'Windows'
         shell: pwsh
