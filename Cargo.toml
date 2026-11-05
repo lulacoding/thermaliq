@@ -3,6 +3,7 @@ members = [
     "thermaliq-common",
     "thermaliq-hal",
     "thermaliq-engine",
+    "thermaliq-agent",
     "thermaliq-daemon",
     "thermaliq-cli",
 ]
