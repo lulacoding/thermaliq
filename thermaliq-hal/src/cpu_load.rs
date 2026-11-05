@@ -84,6 +84,9 @@ impl HardwareLayer for CpuLoad {
     }
 }
 
+/// shortcut: with more than 64 logical processors `GetSystemTimes` covers only the calling
+/// thread's processor group, so load is wrong there (e.g. a 64-core/128-thread Threadripper);
+/// upgrade to PDH `\Processor Information(_Total)\% Processor Time` if that ever matters.
 #[cfg(windows)]
 #[allow(unsafe_code)]
 fn system_times() -> Option<Times> {
