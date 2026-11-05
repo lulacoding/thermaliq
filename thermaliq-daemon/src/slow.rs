@@ -102,6 +102,7 @@ pub struct SlowShared {
     view: Arc<Mutex<View>>,
     answers: Arc<Mutex<Vec<(String, Workload)>>>,
     keys: Arc<dyn KeyStore>,
+    hosted_error: Arc<Mutex<Option<String>>>,
 }
 
 impl SlowShared {
@@ -113,7 +114,13 @@ impl SlowShared {
             })),
             answers: Arc::default(),
             keys,
+            hosted_error: Arc::default(),
         }
+    }
+
+    /// Why the last hosted call failed; `None` after a success or before the first call.
+    pub fn hosted_error(&self) -> Arc<Mutex<Option<String>>> {
+        self.hosted_error.clone()
     }
 
     pub fn view(&self) -> View {

@@ -1,5 +1,20 @@
 # M20c checks on the Windows PC
 
+**Results, 2026-11-05, RTX 4060 PC: all passed.**
+
+| Step | Result |
+| --- | --- |
+| 1. Service and helper | `--service` as SYSTEM, `foreground-helper` as the user, `foreground` true |
+| 2. Profiles | Fan followed the rule's profiles on `nvml_gpu0_fan0` |
+| 3. Switch and refusal | Switched to `gaming` within 1 s; bundled `silent` refused: `profile 'silent' does not control fan 'nvml_gpu0_fan0'` |
+| 4. Key and hosted | Stored in SYSTEM's vault; `msinfo32.exe` idle 0.90 and `windowsterminal.exe` idle 0.83 on real states; a wrong key shows `HTTP 401: User not found.` in `hosted_error` |
+| 5. Model and ACL check | `configured` on a real install under `%ProgramFiles%` |
+| 6. Local when idle | 23.2 s to answer, including load; peak 7,480 MB; `BelowNormal`; unloaded. `charmap.exe` idle 0.38, so it asked |
+| 7. Fullscreen and crash | A borderless fullscreen window stopped the model in 1.0 s; hard-killing the service left 0 `ollaya`, and it restarted |
+| 8. G1 | PASS (latch released after 31.3 s, restart 1.6 s, automatic after 0.3 s) |
+
+Not observed: the 6-thread limit itself (set by the code; the run's average was 1.5 cores, mostly loading). These results are from `b5d9ec5` plus the `hosted_error` change.
+
 Do these in order, on branch `m20c-slow-layer`. M20c is ticked only after they pass. These steps control the real GPU fan and spend a little OpenRouter credit. Step 8 removes the service at the end.
 
 Close games and video first. Use an **admin** PowerShell unless a step says otherwise. Apps started from that window run elevated: if one never shows up in the log, open it from the Start menu instead, and tell me, because the helper should be able to read it.
@@ -89,27 +104,32 @@ Restart-Service ThermalIQ
 
 Tests: storing the key in SYSTEM's vault, and hosted on a real exe-centric state. This costs about $0.00002 per new exe.
 
-Run this in the **normal** window where `$env:OPENROUTER_API_KEY` holds your current key. Your profile still sets the old one, so check first by comparing with your OpenRouter page, or set it again. Don't type the key on a command line.
+A PowerShell profile can hold an old key, and `$env:OPENROUTER_API_KEY` may be it. So this asks for the full key without echoing it, checks it with OpenRouter, and stores it only if it's accepted:
 
 ```powershell
 $api = 'http://127.0.0.1:7272'
-$h = @{ Authorization = "Bearer $((Get-Content "$env:ProgramData\ThermalIQ\token.txt" -Raw).Trim())" }
-$b = @{ provider = 'openrouter'; key = $env:OPENROUTER_API_KEY } | ConvertTo-Json
-Invoke-RestMethod "$api/agent/key" -Method Put -Headers $h -ContentType application/json -Body $b
-Start-Process mspaint
+$s = Read-Host -AsSecureString 'OpenRouter key'
+$k = [Net.NetworkCredential]::new('', $s).Password
+try {
+    $info = (Invoke-RestMethod 'https://openrouter.ai/api/v1/key' -Headers @{ Authorization = "Bearer $k" }).data
+    "OpenRouter accepts this key: $($info.label)"
+    $h = @{ Authorization = "Bearer $((Get-Content "$env:ProgramData\ThermalIQ\token.txt" -Raw).Trim())" }
+    Invoke-RestMethod "$api/agent/key" -Method Put -Headers $h -ContentType application/json -Body (@{ provider = 'openrouter'; key = $k } | ConvertTo-Json)
+} catch { "NOT stored: $($_.Exception.Message)" }
+Remove-Variable k, s
+Start-Process winver
 ```
 
-Keep Paint in front for 15 s, then come back:
+Keep the new window in front for 15 s (a newly started app comes to the front; a script can't always bring back one already running), then come back:
 
 ```powershell
 $v = Invoke-RestMethod "$api/agent/decisions" -Headers $h
 $v.hosted_account
+$v.hosted_error
 $v.decisions | Select-Object -Last 3 | Format-Table exe, workload, source, confidence, asked, profile, note
 ```
 
-**Pass:** `hosted_account` is `openrouter`, and `mspaint.exe` has source `hosted`. A confidence under 0.7 shows `asked` as `True`, which is also correct. Tell me the confidences, because they're the first real test of the new state.
-
-If the key step returns 500, the SYSTEM vault refused it. Send me the message.
+**Pass:** `hosted_account` is `openrouter`, `hosted_error` is empty, and the app has source `hosted`. A confidence under 0.7 shows `asked` as `True`, which is also correct. `hosted_error` says why hosted isn't answering, for example `HTTP 401: User not found.` for a wrong key. If the key step returns 500, the SYSTEM vault refused it.
 
 ## 5. Put the Strands model where the service reads it
 

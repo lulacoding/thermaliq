@@ -8,7 +8,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use thermaliq_agent::decision::{Answer, AskError, DecisionProvider, Question};
 
@@ -78,6 +78,7 @@ fn parse_answer(question_id: &str, body: &str) -> Result<Answer, String> {
 /// Reads the key per call, so adding or removing one takes effect at once.
 pub struct HostedProvider {
     keys: Arc<dyn KeyStore>,
+    last_error: Arc<Mutex<Option<String>>>,
     #[cfg(test)]
     test_url: Option<String>,
 }
@@ -86,9 +87,18 @@ impl HostedProvider {
     pub fn new(keys: Arc<dyn KeyStore>) -> Self {
         Self {
             keys,
+            last_error: Arc::default(),
             #[cfg(test)]
             test_url: None,
         }
+    }
+
+    /// Where to keep why the last call failed, for the API (S8: a silent fallback hides a bad
+    /// key). `None` after a success.
+    #[must_use]
+    pub fn reporting_to(mut self, last_error: Arc<Mutex<Option<String>>>) -> Self {
+        self.last_error = last_error;
+        self
     }
 
     #[cfg(test)]
@@ -112,6 +122,20 @@ impl HostedProvider {
 
 impl DecisionProvider for HostedProvider {
     fn ask(&mut self, q: &Question, _: &dyn Fn() -> bool) -> Result<Answer, AskError> {
+        let result = self.call(q);
+        *self
+            .last_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = match &result {
+            Err(AskError::Unavailable(why)) => Some(why.clone()),
+            _ => None,
+        };
+        result
+    }
+}
+
+impl HostedProvider {
+    fn call(&self, q: &Question) -> Result<Answer, AskError> {
         let unavailable = AskError::Unavailable;
         let key = self
             .keys
@@ -130,11 +154,26 @@ impl DecisionProvider for HostedProvider {
             .header("Authorization", format!("Bearer {}", key.secret()))
             .header("Content-Type", "application/json")
             .send(wire_body(q, Some(key.account.model())).to_string())
-            .map_err(|_| unavailable("the request failed".into()))?;
+            // The transport's reason names the host at most: headers aren't part of it.
+            .map_err(|e| unavailable(format!("the request failed: {e}")))?;
         let status = response.status().as_u16();
         if status != 200 {
-            // Not the body: it is the provider's text, and it may echo what we sent.
-            return Err(unavailable(format!("HTTP {status}")));
+            let text = response
+                .body_mut()
+                .with_config()
+                .limit(MAX_BODY)
+                .read_to_string()
+                .unwrap_or_default();
+            // Only its error message, short: it is the provider's text, and may echo what we sent.
+            let message = serde_json::from_str::<Value>(&text)
+                .ok()
+                .and_then(|v| v["error"]["message"].as_str().map(str::to_owned))
+                .map(|m| m.replace(key.secret(), "[key]"))
+                .map(|m| m.chars().take(200).collect::<String>());
+            return Err(unavailable(match message {
+                Some(m) => format!("HTTP {status}: {m}"),
+                None => format!("HTTP {status}"),
+            }));
         }
         let body = response
             .body_mut()
@@ -412,7 +451,6 @@ mod tests {
     use crate::keychain::{Account, Key, MemoryKeys};
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::Mutex;
     use thermaliq_agent::decision::{workload_question, ExeState};
 
     const GOOD: &str = r#"{"model":"m","answers":{"workload":{"type":"choice","choice":"gaming","confidence":0.91,"probabilities":{}}},"usage":{}}"#;
@@ -595,6 +633,87 @@ mod tests {
         };
         assert!(why.contains("401"), "{why}");
         assert!(!why.contains("sk-or-secret"), "{why}");
+    }
+
+    #[test]
+    fn a_rejection_carries_the_providers_own_message_with_the_key_hidden() {
+        let port = free_port();
+        server_on(
+            port,
+            http(
+                "401 Unauthorized",
+                r#"{"error":{"message":"bad key sk-or-secret","code":401}}"#,
+            ),
+            Duration::ZERO,
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        let Err(AskError::Unavailable(why)) =
+            hosted_to(port, keys()).ask(&workload_question(state()), &never)
+        else {
+            panic!("expected a failure");
+        };
+        assert_eq!(why, "HTTP 401: bad key [key]");
+    }
+
+    #[test]
+    fn a_huge_provider_message_is_cut_short() {
+        let msg = "x".repeat(5000);
+        let port = free_port();
+        server_on(
+            port,
+            http("500 Oops", &format!(r#"{{"error":{{"message":"{msg}"}}}}"#)),
+            Duration::ZERO,
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        let Err(AskError::Unavailable(why)) =
+            hosted_to(port, keys()).ask(&workload_question(state()), &never)
+        else {
+            panic!("expected a failure");
+        };
+        assert!(why.len() < 300, "{}", why.len());
+    }
+
+    #[test]
+    fn the_last_failure_is_reported_without_the_key_and_a_success_clears_it() {
+        let status: Arc<Mutex<Option<String>>> = Arc::default();
+        let read = || status.lock().unwrap().clone();
+        let q = workload_question(state());
+
+        let mut none =
+            hosted_to(free_port(), Arc::new(MemoryKeys::default())).reporting_to(status.clone());
+        assert!(none.ask(&q, &never).is_err());
+        assert_eq!(read().as_deref(), Some("no key"));
+
+        let port = free_port();
+        server_on(
+            port,
+            http("401 Unauthorized", r#"{"error":"bad key sk-or-secret"}"#),
+            Duration::ZERO,
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(hosted_to(port, keys())
+            .reporting_to(status.clone())
+            .ask(&q, &never)
+            .is_err());
+        assert_eq!(read().as_deref(), Some("HTTP 401"));
+
+        // nothing listening: the transport's own reason, which must not carry the key
+        assert!(hosted_to(free_port(), keys())
+            .reporting_to(status.clone())
+            .ask(&q, &never)
+            .is_err());
+        let why = read().unwrap();
+        assert!(why.starts_with("the request failed: "), "{why}");
+        assert!(!why.contains("sk-or-secret"), "{why}");
+
+        let port = free_port();
+        server_on(port, http("200 OK", GOOD), Duration::ZERO);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(hosted_to(port, keys())
+            .reporting_to(status.clone())
+            .ask(&q, &never)
+            .is_ok());
+        assert_eq!(read(), None);
     }
 
     #[test]

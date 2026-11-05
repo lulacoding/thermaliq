@@ -357,8 +357,15 @@ async fn agent_decisions(State(s): State<ApiState>) -> ApiResult {
         Ok(None) => Value::Null,
         Err(_) => json!("unreadable"),
     };
+    let hosted_error = s
+        .slow
+        .hosted_error()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
     Ok(Json(json!({
         "hosted_account": hosted,
+        "hosted_error": hosted_error,
         "local": v.local,
         "foreground": v.foreground,
         "crashed": v.crashed,
@@ -759,6 +766,13 @@ mod tests {
         assert_eq!(code, StatusCode::OK);
         assert_eq!(v["hosted_account"], "openrouter");
         assert!(!v.to_string().contains("sk-or-secret"), "{v}");
+        assert_eq!(v["hosted_error"], Value::Null);
+        *r.state.slow.hosted_error().lock().unwrap() = Some("HTTP 401".into());
+        let (_, v) = call(&r, "GET", "/agent/decisions", Some(TOKEN), None).await;
+        assert_eq!(
+            v["hosted_error"], "HTTP 401",
+            "a silent fallback hides a bad key"
+        );
         let (code, _) = call(&r, "DELETE", "/agent/key", Some(TOKEN), None).await;
         assert_eq!(code, StatusCode::OK);
         assert!(r.state.slow.keys().get().unwrap().is_none());

@@ -153,7 +153,9 @@ pub fn start(
         profiles: profiles.clone(),
         history: history.clone(),
         foreground: Arc::new(move || feed.latest()),
-        hosted: Some(Box::new(HostedProvider::new(keys))),
+        hosted: Some(Box::new(
+            HostedProvider::new(keys).reporting_to(shared.hosted_error()),
+        )),
         local: local.map(|l| Box::new(l) as Box<dyn DecisionProvider + Send>),
         shared: shared.clone(),
         period: SlowParts::DEFAULT_PERIOD,

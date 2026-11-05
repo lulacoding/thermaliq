@@ -48,6 +48,9 @@ PC: Ryzen 5 5600 (6 cores, 12 threads), 16 GB RAM, RTX 4060. Python is not insta
 | --- | --- | --- | --- | --- |
 | Jev 1.14 hosted, OpenRouter, from this PC | 560 ms | 615 ms | n/a | n/a |
 | Strands 2B, Ollaya, core 11 at idle priority | 9,460 ms | 9,544 ms | 37,548 ms | 7,766 MB |
+| Strands 2B through the daemon, half the logical processors at below-normal, one call | n/a | n/a | 23.2 s, including load | 7,480 MB |
+
+The last row is from the M20c PC checks (`docs/dev/m20c-pc-checks.md`), on one new exe. Hosted answers on real exe-centric states there were 0.90 and 0.83, both for `idle`; the local answer was 0.38, also `idle`, so it asked.
 
 Not measured: Clef-flash (deferred) and FPS cost (test skipped). Strands 2B is about 17 times slower than hosted Jev at the median.
 
@@ -201,7 +204,7 @@ The service runs the model as SYSTEM, so it only accepts an exe under `%ProgramF
 - FPS test: skipped by Sam's decision above. The steps are in this file's git history (PR #54).
 - Accuracy on ThermalIQ's questions. The script prints each answer and confidence, but nothing is labelled.
 - Latency with the exe-centric, one-question state, and with the local model on half the cores.
-- Running the local model on half the cores, and hosted answers on real exe-centric states. The product side of M20c does both, but neither has run on the PC yet.
+- Scoring answers on exe-centric states. The PC checks ran only a handful, and nothing is labelled.
 
 ## Questions the M20 brainstorm answered (see SPEC §7)
 
