@@ -27,7 +27,11 @@ public sealed class FakeHardware : IFanHardware
         }
     }
 
+    public const string BoardName = "TEST BOARD (Nuvoton NCT6687D)";
+
     public IReadOnlyList<Header> Headers { get; }
+
+    public string Board => BoardName;
 
     public Readings Read() => new([new SensorDto("t", "CPU", "cpu", 50)], [], []);
 

@@ -4,6 +4,7 @@
 //! out-of-scope features (SPEC §2) cannot be configured by accident.
 
 mod config;
+pub mod identity;
 mod profile;
 
 pub use config::{DaemonConfig, LogLevel};

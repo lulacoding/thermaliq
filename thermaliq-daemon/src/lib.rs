@@ -9,6 +9,7 @@ pub mod app;
 pub mod decision_client;
 pub mod foreground;
 pub mod history;
+pub mod identity;
 #[cfg(feature = "gate-tests")]
 pub mod inject;
 pub mod keychain;

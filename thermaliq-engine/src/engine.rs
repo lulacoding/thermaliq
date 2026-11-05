@@ -2,6 +2,7 @@ use crate::{CurveEngine, FanControl, SensorEngine, Source, Temps};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
+use thermaliq_common::identity::{missing_fans, missing_message};
 use thermaliq_common::{
     Control, FanKind, HardwareSnapshot, Profile, SensorKind, SensorReading, AGENT_MAX_LOWER_PCT,
 };
@@ -148,9 +149,25 @@ impl Engine {
         }
     }
 
-    /// Rejects a profile that puts 0-RPM (`stop_percent`) on a fan the last snapshot called a
-    /// pump. With no snapshot yet nothing is known; `write` still never stops a pump.
+    /// Fans the active profile controls that no backend lists (SPEC §5.2). They are inert, so
+    /// the daemon reports them in `degraded_reasons`.
+    pub fn missing_fans(&self) -> Vec<String> {
+        self.fans
+            .iter()
+            .filter(|f| !self.controllable.contains(&f.id))
+            .map(|f| f.id.clone())
+            .collect()
+    }
+
+    /// Rejects a profile that names a fan no backend lists, and one that puts 0-RPM
+    /// (`stop_percent`) on a fan the last snapshot called a pump. With no snapshot yet the pump
+    /// check knows nothing; `write` still never stops a pump.
     pub fn check_profile(&self, profile: &Profile) -> Result<(), String> {
+        let known: Vec<String> = self.controllable.iter().cloned().collect();
+        let missing = missing_fans(profile, &known);
+        if !missing.is_empty() {
+            return Err(missing_message(&profile.name, &missing));
+        }
         match profile
             .controls
             .iter()
@@ -547,6 +564,27 @@ step_down_pct = 100
         assert!(e
             .check_profile(&Profile::from_toml(PROFILE).unwrap())
             .is_ok());
+    }
+
+    #[test]
+    fn a_profile_naming_a_fan_no_backend_lists_is_refused_by_name() {
+        let (_, e) = rig(&["f1", "f2"], vec![at(30.0, 30.0)]);
+        let p = Profile::from_toml(&PROFILE.replace("\"f2\"", "\"case_rear\"")).unwrap();
+        let err = e.check_profile(&p).unwrap_err();
+        assert!(err.contains("'case_rear'") && !err.contains("f1"), "{err}");
+        assert!(err.contains("profile 't'"), "{err}");
+        assert!(e
+            .check_profile(&Profile::from_toml(PROFILE).unwrap())
+            .is_ok());
+    }
+
+    #[test]
+    fn the_engine_names_the_active_profiles_missing_fans() {
+        let hal = Arc::new(MockHardwareLayer::new(&["f1"], vec![at(30.0, 30.0)]));
+        let e = Engine::new(hal, &Profile::from_toml(PROFILE).unwrap());
+        assert_eq!(e.missing_fans(), ["f2"]);
+        let (_, all) = rig(&["f1", "f2"], vec![at(30.0, 30.0)]);
+        assert!(all.missing_fans().is_empty());
     }
 
     #[test]

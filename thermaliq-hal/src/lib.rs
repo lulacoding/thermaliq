@@ -55,4 +55,9 @@ pub trait HardwareLayer: Send + Sync {
     fn degraded_reasons(&self) -> Vec<String> {
         Vec::new()
     }
+    /// Names the motherboard and its fan chip, for the saved inventory (SPEC §5.2). `None` when
+    /// no backend knows the board.
+    fn board(&self) -> Option<String> {
+        None
+    }
 }

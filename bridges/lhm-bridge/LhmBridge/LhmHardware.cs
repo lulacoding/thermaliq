@@ -38,6 +38,10 @@ public sealed class LhmHardware : IFanHardware
             }
         }
         Headers = headers;
+        // The board plus every fan chip, so a swapped board or chip changes it.
+        var board = All().FirstOrDefault(h => h.HardwareType == HardwareType.Motherboard)?.Name ?? "unknown board";
+        var chips = All().Where(h => h.HardwareType == HardwareType.SuperIO).Select(h => h.Name);
+        Board = $"{board} ({string.Join(", ", chips)})";
         var temperatures = All()
             .SelectMany(h => h.Sensors.Where(s => s.SensorType == SensorType.Temperature)
                 .Select(s => (s.Identifier.ToString(), h.HardwareType, s.Name)))
@@ -46,6 +50,8 @@ public sealed class LhmHardware : IFanHardware
     }
 
     public IReadOnlyList<Header> Headers { get; }
+
+    public string Board { get; }
 
     public Readings Read()
     {

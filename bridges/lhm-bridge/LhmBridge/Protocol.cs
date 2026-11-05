@@ -59,6 +59,7 @@ public sealed class Protocol(Bridge bridge)
         reply["lhm"] = LhmInternals.PinnedVersion;
         reply["controllable"] = JsonSerializer.SerializeToNode(hello.Controllable);
         reply["refused_chips"] = JsonSerializer.SerializeToNode(hello.RefusedChips);
+        reply["board"] = hello.Board;
         return reply.ToJsonString();
     }
 

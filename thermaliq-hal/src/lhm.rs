@@ -76,6 +76,8 @@ pub struct LhmBridge {
     degraded: Mutex<Vec<String>>,
     /// Why the worker killed the bridge, until a new one says hello.
     killed: Arc<Mutex<Option<String>>>,
+    /// From the last `hello`; a board does not change while the daemon runs.
+    board: Arc<Mutex<Option<String>>>,
 }
 
 impl LhmBridge {
@@ -88,9 +90,11 @@ impl LhmBridge {
         let (ready, started) = mpsc::channel();
         let killed = Arc::new(Mutex::new(None));
         let reason = killed.clone();
+        let board = Arc::new(Mutex::new(None));
+        let worker_board = board.clone();
         thread::Builder::new()
             .name("lhm-bridge".into())
-            .spawn(move || Worker::new(starter, timing, reason).run(&jobs, &ready))
+            .spawn(move || Worker::new(starter, timing, reason, worker_board).run(&jobs, &ready))
             .map_err(|e| HalError(format!("cannot start the bridge thread: {e}")))?;
         let controllable = started
             .recv_timeout(START_TIMEOUT)
@@ -103,6 +107,7 @@ impl LhmBridge {
             suspended: AtomicBool::new(false),
             degraded: Mutex::new(Vec::new()),
             killed,
+            board,
         })
     }
 
@@ -193,6 +198,10 @@ impl HardwareLayer for LhmBridge {
         }
     }
 
+    fn board(&self) -> Option<String> {
+        self.board.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
     fn degraded_reasons(&self) -> Vec<String> {
         let mut reasons = self
             .degraded
@@ -255,6 +264,7 @@ struct Worker {
     suspended: bool,
     last_try: Instant,
     killed: Arc<Mutex<Option<String>>>,
+    board: Arc<Mutex<Option<String>>>,
 }
 
 impl Worker {
@@ -262,6 +272,7 @@ impl Worker {
         starter: Box<dyn BridgeStarter>,
         timing: Timing,
         killed: Arc<Mutex<Option<String>>>,
+        board: Arc<Mutex<Option<String>>>,
     ) -> Self {
         Self {
             starter,
@@ -271,6 +282,7 @@ impl Worker {
             suspended: false,
             last_try: Instant::now(),
             killed,
+            board,
         }
     }
 
@@ -327,7 +339,11 @@ impl Worker {
         self.connection = Some(Link::new(self.starter.start()?)?);
         let hello = self
             .request(json!({"op": "hello", "protocol": PROTOCOL}))
-            .and_then(|reply| parse_hello(&reply));
+            .and_then(|reply| {
+                *self.board.lock().unwrap_or_else(|e| e.into_inner()) =
+                    reply["board"].as_str().map(str::to_owned);
+                parse_hello(&reply)
+            });
         if hello.is_err() && self.connection.is_some() {
             self.connection = None;
             self.starter.stop();

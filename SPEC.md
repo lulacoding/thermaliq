@@ -108,6 +108,39 @@ A backend that should have started and didn't (the bridge failing to start, or N
 
 While the bridge is stopped, its sensors are gone. S3 still applies: a GPU fan whose curve reads a bridge sensor goes to 100%. S2 sees a CPU temperature only if HWiNFO supplies one, and the BIOS has the CPU fan. `/status` lists `lhm-bridge` under `unavailable_sources`.
 
+### 5.2 Fan and sensor identity (M13 brainstorm, Sam, 2026-11-06)
+
+**Stable IDs.** An ID must survive a reboot, a reorder and a driver update.
+
+- **NVIDIA:** `nvml_<uuid>_<name>` (`nvml_GPU-1b2c..._fan0`, `..._temp`, `..._load`). The UUID is NVML's, not its enumeration index. A GPU whose UUID can't be read is not started; the backend is reported as failed.
+- **Motherboard:** the bridge's chip and channel (`lhm_nct6687d_0_fan_1`). The board fingerprint (the bridge's `hello.board`: LHM's motherboard name and the chip) goes in the saved inventory, not in the ID. Same IDs on a different board count as `changed`.
+- **HWiNFO:** `hwinfo_<group>_<sensor>`, from the group and sensor names slugged to `[a-z0-9-]`, never HWiNFO's numeric ids, which shift. Two with the same name get `_2`, `_3` in HWiNFO's order.
+
+**Inventory.** `inventory.json` in the data dir: the board fingerprint and every fan (id, label, kind). Checked at every start against the first snapshot: `new`, `missing`, `changed` (label, kind, or the board) are logged and listed in `GET /identity`. The first run saves the baseline. After that it changes only when the user accepts it (`POST /inventory/accept`, or finishing `identify`), so a fan that stays missing is reported until someone decides.
+
+**Roles.** Bundled profiles name roles, not hardware. Fan roles: `cpu_fan`, `pump`, `case_front`, `case_rear`, `case_top`, `gpu_fan`. Sensor roles: `cpu_temp`, `gpu_temp`. `roles.toml` in the data dir maps a role to a real ID. When a profile loads, each role becomes its mapped ID. An unmapped role is skipped and reported by name, never silently:
+
+- a control on an unmapped fan role is dropped;
+- a curve on an unmapped sensor role is dead, and so is every control that uses it, plus any curve or custom sensor built on it;
+- an alert on an unmapped sensor role is dropped.
+
+A dropped fan goes to the BIOS or driver, not to a guess.
+
+**A profile fan that no backend lists** (after mapping) is reported by name:
+
+- at load: logged, and `degraded` with `degraded_reasons` naming the fan and the profile. The daemon still starts, because S2–S4 and the other fans must keep working;
+- on activation: refused (`POST /profiles/active` and the agent's own switches), with an error naming the fan. The engine stays on the previous profile.
+
+**First-run identification** (`thermaliq-daemon identify`, over the API). It only ever raises a fan, never lowers one, and a pump only goes up:
+
+1. **Auto:** NVML GPU fans become `gpu_fan`. A header's LHM label proposes a role (`CPU Fan` → `cpu_fan`, `Pump` → `pump`). `cpu_temp` and `gpu_temp` are the sensors of kind Cpu and Gpu when there is exactly one.
+2. **RPM pairing** (fans with a tach): the probe puts the fan at 100% for 5 s and compares every RPM. The fan whose RPM rose is the one it drives. A rise on another fan's tach is reported, never guessed.
+3. **Listen** (fans with no tach reading, or no rise): the probe puts the fan at 100% for 5 s and the user answers front, rear, top or none. `none` leaves the fan unmapped.
+
+A probe adds one flat-100% control for that fan to the active profile for 5 s, then restores the profile, so the engine stays the only writer (S1) and S2–S4 still win. Nothing is saved until the user confirms, and `roles.toml` is written atomically.
+
+M13 is identity only. Which fan cools which component is M20d.
+
 ## 6. Data, paths, auth
 
 - One shared data directory: `%ProgramData%\ThermalIQ` (overridable by env var for dev and CI). Config, profiles, token, history DB live there.

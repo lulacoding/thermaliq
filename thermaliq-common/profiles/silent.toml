@@ -1,5 +1,5 @@
-# Sensor and fan IDs here (cpu_package, gpu_edge, chassis1, ...) are role IDs, not real hardware IDs.
-# The first-run mapping (PORTING M13) translates them to this PC's hardware before the profile is used.
+# Sensor and fan IDs here (cpu_temp, gpu_temp, cpu_fan, gpu_fan, case_front, case_rear) are role IDs, not real hardware IDs.
+# roles.toml (written by `thermaliq-daemon identify`, SPEC 5.2) maps them to this PC's hardware when the profile loads.
 
 name = "silent"
 description = "Quiet: fans stay low until it gets warm"
@@ -7,7 +7,7 @@ description = "Quiet: fans stay low until it gets warm"
 [[curves]]
 id = "cpu"
 type = "linear"
-source = "cpu_package"
+source = "cpu_temp"
 min_temp = 50
 max_temp = 85
 min_pwm = 20
@@ -16,32 +16,38 @@ max_pwm = 100
 [[curves]]
 id = "gpu"
 type = "linear"
-source = "gpu_edge"
+source = "gpu_temp"
 min_temp = 50
 max_temp = 85
 min_pwm = 20
 max_pwm = 100
 
 [[controls]]
-fan = "chassis1"
+fan = "case_front"
 curve = "cpu"
 step_down_pct = 3
 min_pwm = 20
 
 [[controls]]
-fan = "gpu1"
+fan = "case_rear"
+curve = "cpu"
+step_down_pct = 3
+min_pwm = 20
+
+[[controls]]
+fan = "gpu_fan"
 curve = "gpu"
 step_down_pct = 3
 min_pwm = 20
 
 [[alerts]]
-sensor = "cpu_package"
+sensor = "cpu_temp"
 threshold = 85
 severity = "warn"
 action = { type = "notify" }
 
 [[alerts]]
-sensor = "cpu_package"
+sensor = "cpu_temp"
 threshold = 92
 severity = "crit"
 action = { type = "log" }

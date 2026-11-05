@@ -5,6 +5,7 @@ use crate::decision_client::{HostedProvider, LocalConfig, LocalProvider};
 use crate::foreground::Feed;
 pub use crate::foreground::ForegroundSource;
 use crate::history::HistoryDb;
+use crate::identity::Identity;
 use crate::keychain::{KeyStore, OsKeychain};
 use crate::runtime::{load_profiles, Daemon, Options};
 use crate::slow::{SlowParts, SlowShared, SlowThread};
@@ -172,6 +173,9 @@ pub fn start(
     for s in skipped {
         eprintln!("skipped profile: {s}");
     }
+    // Roles become this PC's fan and sensor ids here (SPEC §5.2). Problems are printed as found.
+    let (identity, profiles) = Identity::load(dir, &*hal, profiles);
+    let identity = Arc::new(identity);
     let active = profiles
         .iter()
         .find(|p| p.name == cfg.default_profile)
@@ -190,6 +194,7 @@ pub fn start(
         prune_every: Duration::from_secs(3600),
     };
     let daemon = Daemon::start(hal, &active, profiles.clone(), history.clone(), opts);
+    identity.check_when_ready(daemon.handle());
     let keys: Arc<dyn KeyStore> = Arc::new(OsKeychain::default());
     let (local, local_state) = local_model(dir, foreground == ForegroundSource::ActiveUserSession);
     let shared = SlowShared::new(keys.clone(), local_state);
@@ -214,7 +219,8 @@ pub fn start(
         token,
         dir.to_owned(),
         shared,
-    );
+    )
+    .with_identity(identity);
     // On error `slow` and then `daemon` are dropped here. The last stops the engine and hands
     // the fans back.
     let api = ApiServer::start(state, cfg.api_port)

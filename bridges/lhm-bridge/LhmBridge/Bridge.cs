@@ -2,7 +2,7 @@ using System.Diagnostics;
 
 namespace LhmBridge;
 
-public sealed record HelloInfo(IReadOnlyList<string> Controllable, IReadOnlyList<string> RefusedChips);
+public sealed record HelloInfo(IReadOnlyList<string> Controllable, IReadOnlyList<string> RefusedChips, string Board);
 
 /// Every fan rule, with no pipe and no LHM. All methods take one lock, so the watchdog can't
 /// interleave with a request. Error strings are returned, null means done and verified (S8).
@@ -54,7 +54,7 @@ public sealed class Bridge
         {
             var controllable = _hw.Headers.Where(h => h.Controllable).Select(h => h.Id).ToList();
             var refused = _hw.Headers.Where(h => !h.Controllable).Select(h => h.Chip).Distinct().ToList();
-            return new HelloInfo(controllable, refused);
+            return new HelloInfo(controllable, refused, _hw.Board);
         }
     }
 

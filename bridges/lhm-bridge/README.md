@@ -32,7 +32,7 @@ One JSON object per line, in each direction, at most 64 KiB per line. Every requ
 
 | Op | Request fields | Reply fields |
 |---|---|---|
-| `hello` | `protocol` | `protocol`, `lhm`, `controllable` (fan ids), `refused_chips` |
+| `hello` | `protocol` | `protocol`, `lhm`, `controllable` (fan ids), `refused_chips`, `board` (motherboard name and fan chips, saved by the daemon, SPEC §5.2) |
 | `heartbeat` | | |
 | `snapshot` | | `sensors`, `fans`, `metrics`, `degraded` (id → reason) |
 | `set` | `fan`, `duty` (whole number, 0-100) | |

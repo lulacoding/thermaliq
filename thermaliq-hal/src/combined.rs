@@ -152,6 +152,13 @@ impl HardwareLayer for CombinedHardwareLayer {
             .collect()
     }
 
+    fn board(&self) -> Option<String> {
+        self.backends
+            .iter()
+            .chain(self.optional.iter().map(|(_, b)| b))
+            .find_map(|b| b.board())
+    }
+
     fn set_fan_duty(&self, fan: &str, duty: u8) -> Result<(), HalError> {
         self.owner_of(fan)?.set_fan_duty(fan, duty)
     }

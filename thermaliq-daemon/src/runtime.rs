@@ -433,6 +433,10 @@ impl Daemon {
                             ));
                         }
                         let mut degraded_reasons = sources.degraded_reasons();
+                        // Inert controls: the profile names fans that no backend lists (SPEC §5.2).
+                        degraded_reasons.extend(engine.missing_fans().into_iter().map(|f| {
+                            format!("the active profile controls fan '{f}', which no backend lists")
+                        }));
                         // A fresh snapshot with no fan at all means every fan backend failed to
                         // start or lost its fans. An empty engine must not look healthy (S8).
                         if engine.snapshot_fresh() && snapshot.fans.is_empty() {
@@ -788,6 +792,36 @@ mod tests {
             "{:?}",
             c.status.degraded_reasons
         );
+    }
+
+    #[test]
+    fn an_active_profile_fan_no_backend_lists_is_degraded_and_named() {
+        let hal = Arc::new(MockHardwareLayer::new(&["other"], vec![at(40.0)]));
+        let active = Profile::from_toml(FLAT).unwrap();
+        let d = Daemon::start(hal, &active, vec![], db(), fast());
+        wait_until(|| d.cache().ticks > 3);
+        let c = d.cache();
+        assert!(c.status.degraded);
+        let why = c.status.degraded_reasons.join("\n");
+        assert!(why.contains("'f1'"), "{why}");
+    }
+
+    #[tokio::test]
+    async fn switching_to_a_profile_with_an_unlisted_fan_is_refused_by_name_and_changes_nothing() {
+        let (_, d) = start(vec![at(40.0)], vec![], &db(), fast());
+        wait_until(|| d.cache().ticks > 1);
+        let bad = Profile::from_toml(
+            &FLAT
+                .replace("name = \"flat\"", "name = \"bad\"")
+                .replace("f1", "gone"),
+        )
+        .unwrap();
+        let err = d.handle().set_profile(bad).await.unwrap_err();
+        let CommandError::Rejected(m) = err else {
+            panic!("{err:?}")
+        };
+        assert!(m.contains("'gone'"), "{m}");
+        assert_eq!(d.cache().active_profile, "flat");
     }
 
     #[test]

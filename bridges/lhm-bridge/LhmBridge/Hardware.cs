@@ -50,6 +50,10 @@ public interface IFanHardware
 {
     IReadOnlyList<Header> Headers { get; }
 
+    /// The motherboard's name and its fan chip. The daemon saves it, so the same fan ids on
+    /// another board are noticed.
+    string Board { get; }
+
     Readings Read();
 
     /// The chip's registers right now. Null if they could not be read.
