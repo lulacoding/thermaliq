@@ -18,6 +18,10 @@ param(
     [int]$ProfileMin = 40,
     # The agent's GPU target at slider 50 (SPEC 7.2: a line from 80 at quiet to 65 at cool).
     [double]$Target = 72.5,
+    # The raise check applies to stretches over the target longer than this many seconds. The
+    # agent's own raise usually pulls the GPU back under in < 30 s, so a healthy rig reads
+    # NOT TESTED at the default; -RaiseAfter 10 checks the shorter stretches it does see.
+    [int]$RaiseAfter = 30,
     [string]$Csv = '',
     [int]$WaitMinutes = 10,
     # Quiet curve: duty only climbs from $ProfileMin to 45%, so a GPU stress test runs hot enough
@@ -33,7 +37,6 @@ $BoostLimit = 60    # SPEC 7.2: a boost lasts at most 60 s
 $BoostSlack = 2     # 1 Hz sampling: a 60 s boost can span 61-62 s of rows
 $PauseWithin = 2    # duty back on the curve within 2 s of /agent/pause
 $ResumeWithin = 3
-$RaiseAfter = 30    # over target for longer than this, the duty must have risen by then
 $RaiseBy = 2        # one tick's worth of the optimiser's raise
 $Header = 't,gpu_temp,duty,commanded,curve,agent_duty,boost,agent,latched,event'
 
@@ -86,11 +89,16 @@ function Get-Verdicts($csvRows, [int]$min, [double]$target) {
     else { $out += New-Verdict 'floor' 'PASS' "$lowered lowered rows of $n, none below max(curve-15, $min)" }
 
     # 2. no predicted-only boost longer than 60 s (consecutive curve+20 rows with the GPU under target)
+    # A boost JUMPS to curve + 20 (the ask before it was none, or at least 5 points away). Easing
+    # back from a raise walks down 1 point a tick and passes through curve + 20 without being one.
     $run = $null; $prev = $null; $max = 0; $boosts = 0
     foreach ($r in $all) {
-        if (Test-Boost $r $target) {
+        $isBoost = Test-Boost $r $target
+        $joins = $null -ne $run -and $null -ne $prev -and ($r.t - $prev.t) -le 2.5
+        $jumped = $null -eq $prev -or $null -eq $prev.ask -or ($null -ne $r.ask -and [Math]::Abs($r.ask - $prev.ask) -ge 5)
+        if ($isBoost -and ($joins -or $jumped)) {
             $boosts++
-            if ($null -ne $run -and ($r.t - $prev.t) -le 2.5) { $run.end = $r.t } else { $run = @{ start = $r.t; end = $r.t } }
+            if ($joins) { $run.end = $r.t } else { $run = @{ start = $r.t; end = $r.t } }
             $max = [Math]::Max($max, $run.end - $run.start + 1)
         } else { $run = $null }
         $prev = $r
@@ -227,6 +235,11 @@ function Invoke-SelfTest {
     Expect 'ask 5 above the curve is a raise level, not a +20 boost' ($idle + (New-Span 40 5 $curve 65)) 'boost' 'NOT TESTED'
     Expect 'curve + 20 while over target is a raise, not a boost' ($idle + (New-Span 40 70 $curve 80 $null 'running' 74)) 'boost' 'NOT TESTED'
     Expect 'a 100 s raise is not a 60 s boost' ($idle + (New-Raise 40 100 $curve)) 'boost' 'NOT TESTED'
+    # easing back 1 point a tick passes through curve + 20 on its way down (Sam's 2026-11-05 run)
+    $ease = 0..24 | ForEach-Object { New-Fake (40 + $_) 43 (70 - $_) (70 - $_) 'running' '' 68 }
+    Expect 'easing down through curve + 20 is not a boost' ($idle + $ease) 'boost' 'NOT TESTED'
+    Expect 'a boost that starts from a small lowering ask is still a boost' ($idle + (New-Span 40 10 $curve 50 $null 'running' 70) + (New-Span 50 20 $curve 80)) 'boost' 'PASS'
+    Expect 'a boost right after the ease is still a boost' ($idle + $ease + (New-Span 70 20 43 63 $null 'running' 70)) 'boost' 'PASS'
     Expect 'a boost to 100 near the top counts' ($idle + (New-Span 40 5 98 100)) 'boost' 'PASS'
     Expect '30 s boost' ($idle + (New-Span 40 30 $curve 80)) 'boost' 'PASS'
     Expect '60 s boost' ($idle + (New-Span 40 60 $curve 80)) 'boost' 'PASS'
@@ -236,6 +249,11 @@ function Invoke-SelfTest {
     Expect 'one boost with a 5 s hole in the log' ($idle + (New-Span 40 40 $curve 80) + (New-Span 85 40 $curve 80)) 'boost' 'PASS'
 
     # raise: over target (72.5) for > 30 s with the agent running -> the duty must have risen by then
+    $script:RaiseAfter = 10
+    Expect 'raise: a 13 s stretch counts when -RaiseAfter is 10' ($idle + (New-Raise 40 14 $curve)) 'raise' 'PASS'
+    Expect 'raise: a 13 s stretch with a flat duty fails at -RaiseAfter 10' ($idle + (New-Span 40 14 $curve $null $null 'running' 74)) 'raise' 'FAIL'
+    $script:RaiseAfter = 30
+    Expect 'raise: the same 13 s stretch is not tested at the default 30' ($idle + (New-Raise 40 14 $curve)) 'raise' 'NOT TESTED'
     Expect 'raise: over 40 s, the duty climbs' ($idle + (New-Raise 40 40 $curve)) 'raise' 'PASS'
     Expect 'raise: over 40 s, the duty never moves' ($idle + (New-Span 40 40 $curve $null $null 'running' 74)) 'raise' 'FAIL'
     Expect 'raise: over only 20 s' ($idle + (New-Raise 40 20 $curve)) 'raise' 'NOT TESTED'
