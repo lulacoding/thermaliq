@@ -3,6 +3,7 @@
 #[cfg(windows)]
 pub mod acl;
 pub mod agent;
+pub mod anti_cheat;
 pub mod api;
 pub mod app;
 pub mod decision_client;
