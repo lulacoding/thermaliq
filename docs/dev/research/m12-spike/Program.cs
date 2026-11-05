@@ -6,7 +6,8 @@ using System.Text.RegularExpressions;
 using LibreHardwareMonitor.Hardware;
 using PawnIoDriver = LibreHardwareMonitor.PawnIo.PawnIo;
 
-const int Duty = 60;
+const int DefaultDuty = 60;
+const int MinDuty = 20; // an unreported header could be a pump, which must never stop
 const int HoldSeconds = 10;
 const int MovedRpm = 100;
 const int ServiceWaitSeconds = 20;
@@ -18,10 +19,10 @@ switch (command)
     case "selftest":
         return SelfTest();
     case "list" or "driver" when args.Length == 1:
-    case "fan" when args.Length == 2:
+    case "fan" when args.Length >= 2 && ParseDuty(args[2..]) is not null:
         break;
     default:
-        Console.Error.WriteLine("usage: m12-spike selftest | list | fan <control id from list> | driver");
+        Console.Error.WriteLine("usage: m12-spike selftest | list | fan <control id from list> [-Duty 20-100] | driver");
         return 2;
 }
 
@@ -42,7 +43,7 @@ Console.WriteLine($"PawnIO {PawnIoDriver.Version}");
 return command switch
 {
     "list" => List(),
-    "fan" => Fan(args[1]),
+    "fan" => Fan(args[1], ParseDuty(args[2..])!.Value),
     _ => Driver(),
 };
 
@@ -110,7 +111,7 @@ static int List()
     }
 }
 
-static int Fan(string id)
+static int Fan(string id, int duty)
 {
     using var stop = new CancellationTokenSource();
     PosixSignalRegistration[] signals = new[] { PosixSignal.SIGINT, PosixSignal.SIGQUIT, PosixSignal.SIGTERM, PosixSignal.SIGHUP }
@@ -128,8 +129,8 @@ static int Fan(string id)
         if (sensor?.Control is not { } control)
             return Fail($"{id} is not a control. Run `list` and copy a control id");
         // shortcut: a name check only catches labelled headers, the real pump rule comes with FanKind in M12.
-        if (IsCoolerHeader(sensor.Name))
-            return Fail($"refusing {sensor.Name}: this spike only drives a case fan");
+        if (Refused(sensor.Name, duty))
+            return Fail($"refusing {sensor.Name} at {duty}%: CPU and pump headers may only go to 100%");
 
         var before = Fans(computer);
         Print("before", computer, sensor);
@@ -138,8 +139,8 @@ static int Fan(string id)
         Dictionary<string, float?> held;
         try
         {
-            control.SetSoftware(Duty);
-            Console.WriteLine($"\nset {sensor.Name} to {Duty}% for {HoldSeconds} s (Ctrl-C hands back early)");
+            control.SetSoftware(duty);
+            Console.WriteLine($"\nset {sensor.Name} to {duty}% for {HoldSeconds} s (Ctrl-C hands back early)");
             for (var waited = 0; waited < HoldSeconds && !stop.IsCancellationRequested; waited += 2)
             {
                 stop.Token.WaitHandle.WaitOne(TimeSpan.FromSeconds(2));
@@ -160,7 +161,7 @@ static int Fan(string id)
         foreach (var fan in moved)
             Console.WriteLine($"RPM changed while held: {fan} {Show(before[fan], "")} -> {Show(held[fan], " RPM")} (a BIOS curve can do this too, so it only counts on the fan you set)");
         if (moved.Count == 0)
-            Console.WriteLine($"NO fan moved by {MovedRpm} RPM or more. Inconclusive unless it already ran near {Duty}%.");
+            Console.WriteLine($"NO fan moved by {MovedRpm} RPM or more. Inconclusive unless it already ran near {duty}%.");
 
         // Long enough for the BIOS curve to take the fan back and for the RPM to settle.
         for (var i = 0; i < 5; i++)
@@ -190,6 +191,17 @@ static void Print(string label, Computer c, ISensor control)
 
 static bool Moved(float? before, float? after) =>
     before is { } b && after is { } a && Math.Abs(a - b) >= MovedRpm;
+
+// Null means bad arguments. Accepts nothing, or -Duty N.
+static int? ParseDuty(string[] rest) => rest switch
+{
+    [] => DefaultDuty,
+    [var flag, var value] when flag.Equals("-Duty", StringComparison.OrdinalIgnoreCase)
+        && int.TryParse(value, out var duty) && duty is >= MinDuty and <= 100 => duty,
+    _ => null,
+};
+
+static bool Refused(string name, int duty) => IsCoolerHeader(name) && duty < 100;
 
 static bool IsCoolerHeader(string name) =>
     name.Contains("cpu", StringComparison.OrdinalIgnoreCase) || name.Contains("pump", StringComparison.OrdinalIgnoreCase);
@@ -277,8 +289,13 @@ static int SelfTest()
         (ParseState(running) == "4", "running state parsed, TYPE ignored"),
         (ParseState(running.Replace("4  RUNNING", "1  STOPPED")) == "1", "stopped state parsed"),
         (ParseState("[SC] EnumQueryServicesStatus:OpenService FAILED 1060:") is null, "failed query gives no state"),
-        (IsCoolerHeader("CPU Fan") && IsCoolerHeader("AIO Pump"), "CPU and pump headers refused"),
-        (!IsCoolerHeader("Chassis Fan #1") && !IsCoolerHeader("Fan #2"), "case fans allowed"),
+        (Refused("CPU Fan", 60) && Refused("AIO Pump", 99), "CPU and pump headers refused below 100%"),
+        (!Refused("CPU Fan", 100) && !Refused("Pump Fan", 100), "CPU and pump headers allowed at 100%"),
+        (!Refused("Chassis Fan #1", 60) && !Refused("Fan #2", 20), "case fans allowed"),
+        (ParseDuty([]) == DefaultDuty, "no option gives the default duty"),
+        (ParseDuty(["-Duty", "100"]) == 100 && ParseDuty(["-duty", "20"]) == 20, "duty limits accepted"),
+        (ParseDuty(["-Duty", "19"]) is null && ParseDuty(["-Duty", "101"]) is null, "duty outside the limits rejected"),
+        (ParseDuty(["-Duty", "abc"]) is null && ParseDuty(["-Duty"]) is null && ParseDuty(["100"]) is null, "malformed duty rejected"),
         (Moved(1000f, 1200f) && Moved(1200f, 1000f), "RPM change counts both ways"),
         (!Moved(1000f, 1050f) && !Moved(null, 1200f) && !Moved(1000f, null), "small change or no reading is not movement"),
     ];

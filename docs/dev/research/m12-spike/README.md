@@ -2,7 +2,7 @@
 
 Throwaway console app, not product code. It answers three questions on Sam's PC before any bridge code is written. Results so far are at the end of this file. No fan has been shown to move yet.
 
-The fan step writes to a real fan header. Pick a case fan, never the CPU fan or a pump. The spike refuses headers named CPU or pump, but many boards only say `Fan #2`, so check the header first. If the process is hard-killed or the power goes out during the 10 s, that fan keeps 60% until the next reboot. Ctrl-C and closing the window run the hand-back, and on an NCT6687D the check that it worked is `0A00` in `out\fan-after.txt` (see Results).
+The fan step writes to a real fan header. Pick a case fan, or use a CPU header only at `-Duty 100`, never lower. The spike refuses headers named CPU or pump below 100%, and any duty under 20%, but many boards only say `Fan #2`, so check the header first. If the process is hard-killed or the power goes out during the 10 s, that fan keeps 60% until the next reboot. Ctrl-C and closing the window run the hand-back, and on an NCT6687D the check that it worked is `0A00` in `out\fan-after.txt` (see Results).
 
 ## 1. Install
 
@@ -49,12 +49,13 @@ Close FanControl, LibreHardwareMonitor and OpenRGB, or the spike refuses to star
 .\bin\Release\net10.0-windows\m12-spike.exe list
 ```
 
-Copy the id of the control you want, for example `/lpc/nct6798d/control/1`. The `mode` column is LHM's own view and says `Undefined` until the spike touches a control. The chip's real mode is in the register dump at `out\list.txt`.
+Copy the id of the control you want, for example `/lpc/nct6687d/0/control/5`. The `mode` column is LHM's own view and says `Undefined` until the spike touches a control. The chip's real mode is in the register dump at `out\list.txt`.
 
-**(b) Set that fan to 60% for 10 s, read RPM, hand it back:**
+**(b) Set that fan to 60% (or `-Duty N`, 20-100) for 10 s, read RPM, hand it back:**
 
 ```powershell
-.\bin\Release\net10.0-windows\m12-spike.exe fan /lpc/nct6798d/control/1
+.\bin\Release\net10.0-windows\m12-spike.exe fan /lpc/nct6687d/0/control/5
+.\bin\Release\net10.0-windows\m12-spike.exe fan /lpc/nct6687d/0/control/0 -Duty 100
 ```
 
 It prints every fan, so you can see which one really moved, then the same again after the hand-back. Listen to the fan as well. Register dumps go in `out\fan-before.txt`, `fan-held.txt` and `fan-after.txt`.
@@ -109,11 +110,11 @@ Sam's PC, 2026-11-05: MSI B550M PRO-VDH WIFI, NCT6687D, PawnIO 2.2.0. On this ch
 
 Cause: 0.9.6 restores with `mode & ~initial`, so it clears the flag only if it was already set when saved. Fixed in LHM `dc51e75` (#2527). `0.9.7-pre742` was built from exactly that commit (its nuspec records it), and pre741 is behind it.
 
-**LHM `0.9.7-pre742`:** not run yet. Pass means both runs from the BIOS end with `0A00 = 00`.
+**LHM `0.9.7-pre742`, control 5, starting from the BIOS (Sam's report):** both runs ended with `0A00 = 00` and duty `FF`, so the hand-back passes on this header. The same PawnIO disable and enable test also passed on this build (see below).
 
-**Fan movement:** not proven. Only the CPU fan reports RPM on this board, HWiNFO agrees, and no USB fan controller was found. The `moved` line in run 2 was the CPU fan following its BIOS curve, not the spike.
+**Fan movement:** not proven. Only the CPU fan reports RPM on this board, HWiNFO agrees, and no USB fan controller was found. The `moved` line in 0.9.6 run 2 was the CPU fan following its BIOS curve, not the spike. CPU fan at 100%: not run yet.
 
-**PawnIO unload (HWiNFO closed, LHM 0.9.6):**
+**PawnIO unload (HWiNFO closed). `sc stop` tested on 0.9.6, `pnputil` on both 0.9.6 and pre742:**
 
 - `sc stop PawnIO` is refused with error 1052.
 - `pnputil /disable-device "ROOT\PAWNIO\0000"` stops the service with no reboot (`STATE 1 STOPPED`, exit code 31).
