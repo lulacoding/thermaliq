@@ -64,3 +64,6 @@ These need Sam's review first. None has been run.
 4. **Kill test:** kill the bridge during a takeover, start it again: the header ends on the BIOS and the record is gone.
 5. **Watchdog:** a client that stops sending: fans are handed back within 5 s.
 6. **Report cost:** `GetReport` dumps 256 rows and runs on every takeover and hand-back, so time it against the 2 s call timeout.
+7. **Through the daemon, as the service:** install the bridge beside the daemon under Program Files (`lhm-bridge\lhm-bridge.exe`), start the service, and check that `/fans` lists the headers and the pipe's server check passes. CI can't cover this, because the pipe only opens for SYSTEM.
+8. **Anti-cheat mode:** with a fake `faceitclient.exe` running, fans go to the BIOS, the bridge stops and PawnIO shows `STOPPED`. After closing it and waiting 30 s, all three come back. Then repeat with a service restart in the middle.
+9. **Real FACEIT:** check that the process names are right, and whether it starts with PawnIO disabled.

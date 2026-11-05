@@ -1,6 +1,6 @@
 //! The daemon's only `unsafe` code: the OS keychain, the foreground window, a helper in the
-//! user's session (a service in session 0 can't see the desktop), and a job object so that a
-//! local model can't outlive the daemon.
+//! user's session (a service in session 0 can't see the desktop), a job object so that a
+//! local model can't outlive the daemon, and the LHM bridge's pipe and process checks.
 
 use std::ffi::OsStr;
 use std::fs::File;
@@ -21,13 +21,16 @@ use windows_sys::Win32::Security::Credentials::{
     CredDeleteW, CredFree, CredReadW, CredWriteW, CREDENTIALW, CRED_PERSIST_LOCAL_MACHINE,
     CRED_TYPE_GENERIC,
 };
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+};
 use windows_sys::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
     SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
-use windows_sys::Win32::System::Pipes::CreatePipe;
+use windows_sys::Win32::System::Pipes::{CreatePipe, GetNamedPipeServerProcessId};
 use windows_sys::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
 use windows_sys::Win32::System::Threading::{
     CreateProcessAsUserW, DeleteProcThreadAttributeList, InitializeProcThreadAttributeList,
@@ -323,6 +326,39 @@ fn create_with_handle_list(
     } else {
         Err(())
     }
+}
+
+// ---- LHM bridge: who serves a pipe, and which programs are running ----
+
+pub fn pipe_server_pid(pipe: &File) -> io::Result<u32> {
+    let mut pid = 0u32;
+    if unsafe { GetNamedPipeServerProcessId(pipe.as_raw_handle() as HANDLE, &raw mut pid) } == 0 {
+        return Err(last_error());
+    }
+    Ok(pid)
+}
+
+/// The exe name of every running process.
+pub fn process_names() -> io::Result<Vec<String>> {
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+        return Err(last_error());
+    }
+    let mut entry: PROCESSENTRY32W = unsafe { core::mem::zeroed() };
+    entry.dwSize = core::mem::size_of::<PROCESSENTRY32W>() as u32;
+    let mut names = Vec::new();
+    let mut more = unsafe { Process32FirstW(snapshot, &raw mut entry) };
+    while more != 0 {
+        let len = entry
+            .szExeFile
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(entry.szExeFile.len());
+        names.push(String::from_utf16_lossy(&entry.szExeFile[..len]));
+        more = unsafe { Process32NextW(snapshot, &raw mut entry) };
+    }
+    unsafe { CloseHandle(snapshot) };
+    Ok(names)
 }
 
 // ---- a local model can't outlive the daemon ----

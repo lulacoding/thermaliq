@@ -83,6 +83,10 @@ impl HardwareLayer for InjectCpuTemp {
     fn unavailable_sources(&self) -> Vec<String> {
         self.inner.unavailable_sources()
     }
+
+    fn degraded_reasons(&self) -> Vec<String> {
+        self.inner.degraded_reasons()
+    }
 }
 
 #[cfg(test)]

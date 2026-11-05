@@ -208,11 +208,7 @@ impl Worker {
         }
     }
 
-    fn run(
-        mut self,
-        jobs: &mpsc::Receiver<Msg>,
-        ready: &Sender<Result<Vec<String>, String>>,
-    ) {
+    fn run(mut self, jobs: &mpsc::Receiver<Msg>, ready: &Sender<Result<Vec<String>, String>>) {
         let controllable = self.connect();
         let failed = controllable.is_err();
         let _ = ready.send(controllable);
@@ -243,7 +239,9 @@ impl Worker {
                 }
                 Ok(Msg::Resume) => {
                     self.suspended = false;
-                    self.last_try = Instant::now().checked_sub(self.timing.retry).unwrap_or_else(Instant::now);
+                    self.last_try = Instant::now()
+                        .checked_sub(self.timing.retry)
+                        .unwrap_or_else(Instant::now);
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     if self.connection.is_some() {
@@ -385,8 +383,12 @@ fn parse_snapshot(reply: &Value) -> HardwareSnapshot {
         fans: items("fans")
             .iter()
             .filter_map(|f| {
-                let rpm = f["rpm"].as_f64().filter(|r| (0.0..=f64::from(u32::MAX)).contains(r))?;
-                let duty = f["duty_percent"].as_f64().filter(|d| (0.0..=100.0).contains(d))?;
+                let rpm = f["rpm"]
+                    .as_f64()
+                    .filter(|r| (0.0..=f64::from(u32::MAX)).contains(r))?;
+                let duty = f["duty_percent"]
+                    .as_f64()
+                    .filter(|d| (0.0..=100.0).contains(d))?;
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 Some(FanReading {
                     id: text(f, "id")?,

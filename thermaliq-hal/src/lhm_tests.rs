@@ -207,7 +207,10 @@ fn a_missing_or_invalid_reading_is_skipped_never_zero() {
         "degraded": {},
     })));
     let s = b.snapshot().unwrap();
-    assert_eq!(s.fans.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), ["ok"]);
+    assert_eq!(
+        s.fans.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(),
+        ["ok"]
+    );
     assert!(s.metrics.iter().all(|m| m.id == "m2"), "{:?}", s.metrics);
     // A bridge can't report a GPU core: only its own CPU sensor may trip S2's CPU rule.
     assert_eq!(s.sensors[0].kind, SensorKind::Other);
@@ -300,7 +303,7 @@ fn degraded_headers_from_the_bridge_are_reported() {
 }
 
 #[test]
-fn a_failed_restore_stays_degraded_until_a_later_one_verifies() {
+fn a_failed_restore_is_an_error() {
     let (shared, b) = make();
     shared
         .scripted
@@ -338,7 +341,11 @@ fn a_failed_hand_back_on_suspend_is_reported_but_the_bridge_still_stops() {
 fn while_suspended_writes_fail_and_restore_is_done_because_the_bios_has_the_fan() {
     let (shared, b) = make();
     b.suspend().unwrap();
-    assert!(b.set_fan_duty(FAN, 60).unwrap_err().0.contains("anti-cheat"));
+    assert!(b
+        .set_fan_duty(FAN, 60)
+        .unwrap_err()
+        .0
+        .contains("anti-cheat"));
     b.restore_auto(FAN).unwrap();
     assert!(shared.sets().is_empty());
 }

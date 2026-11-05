@@ -92,15 +92,18 @@ One snapshot per tick, cached and shared. API reads use the cache, never the har
 - A named pipe only SYSTEM can open, carrying JSON lines.
 - The daemon sends a heartbeat every 1 s. After 5 s with none, the bridge hands the fans back to the BIOS by itself (S6).
 - Every bridge call has a 2 s timeout and returns an error instead of blocking.
+- The daemon checks that the pipe's server is the bridge process it just started, and connects at identification level, so a process that took the pipe name first can't impersonate it.
 
 **Hand-back (Sam, 2026-11-05).**
 
-- After each restore, the bridge reads the mode register back (`0xA00` on NCT6687D). If the header is still manual, the daemon reports `degraded`.
+- After each restore, the bridge reads the mode register back (`0xA00` on NCT6687D). If the header is still manual, the daemon reports `degraded` and names it in `degraded_reasons`. This doesn't trigger S4: one stuck header doesn't send every fan to 100%.
 - Before first taking over a header, the bridge saves its original mode and duty under `%ProgramData%\ThermalIQ`, so a restarted bridge can restore them.
 - A restarted bridge restores by using reflection on the pinned LHM build: it sets the three private save fields of `Nct677X` (`_initialFanControlMode`, `_initialFanPwmCommand`, `_restoreDefaultFanControlRequired`) from the saved originals, then calls the public `SetDefault`. It never writes registers itself.
 - A startup self-check refuses to run the bridge if those fields or types differ. Motherboard fans are then absent; the GPU and agent carry on.
 
-**Anti-cheat mode.** FACEIT has blocked PawnIO. PawnIO's maintainer reports that release 2.1.0 fixes this with a new signing certificate, which we have not tested yet. On detecting FACEIT or another blocker, ThermalIQ hands motherboard fans to the BIOS, stops the bridge, and unloads PawnIO if that works without a reboot. NVML GPU control continues. PawnIO unloads by disabling its PnP device (`ROOT\PAWNIO\0000`), which worked with no reboot on Sam's PC; `sc stop` is refused with error 1052 (`docs/dev/research/m12-spike/README.md`). ThermalIQ writes a marker under `%ProgramData%\ThermalIQ` before disabling it. On service start, if the marker shows we disabled PawnIO and no anti-cheat is running, it re-enables PawnIO and clears the marker.
+**Anti-cheat mode.** FACEIT has blocked PawnIO. PawnIO's maintainer reports that release 2.1.0 fixes this with a new signing certificate, which we have not tested yet. On detecting FACEIT or another blocker, ThermalIQ hands motherboard fans to the BIOS, stops the bridge, and unloads PawnIO if that works without a reboot. NVML GPU control continues. PawnIO unloads by disabling its PnP device (`ROOT\PAWNIO\0000`), which worked with no reboot on Sam's PC; `sc stop` is refused with error 1052 (`docs/dev/research/m12-spike/README.md`). ThermalIQ writes a marker under `%ProgramData%\ThermalIQ` before disabling it. On service start, if the marker shows we disabled PawnIO and no anti-cheat is running, it re-enables PawnIO and clears the marker. If an anti-cheat is running at service start, the bridge doesn't start, and motherboard fans stay off until the next service restart. Detection is by process name, FACEIT only so far. The mode ends once no blocker has been seen for 30 s, without a restart if the bridge was already running.
+
+While the bridge is stopped, its sensors are gone. S3 still applies: a GPU fan whose curve reads a bridge sensor goes to 100%. S2 sees a CPU temperature only if HWiNFO supplies one, and the BIOS has the CPU fan. `/status` lists `lhm-bridge` under `unavailable_sources`.
 
 ## 6. Data, paths, auth
 

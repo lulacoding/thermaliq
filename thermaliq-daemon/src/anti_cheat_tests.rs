@@ -36,7 +36,9 @@ impl PawnIoDevice for FakeDevice {
     fn disable(&mut self) -> Result<(), String> {
         // SPEC 5.1: the marker is on disk before PawnIO goes down.
         let marked = self.marker.exists();
-        self.log.borrow_mut().push(format!("disable marked={marked}"));
+        self.log
+            .borrow_mut()
+            .push(format!("disable marked={marked}"));
         if self.fail_disable {
             Err("pnputil failed".into())
         } else {
@@ -46,7 +48,9 @@ impl PawnIoDevice for FakeDevice {
 
     fn enable(&mut self) -> Result<(), String> {
         let marked = self.marker.exists();
-        self.log.borrow_mut().push(format!("enable marked={marked}"));
+        self.log
+            .borrow_mut()
+            .push(format!("enable marked={marked}"));
         if self.fail_enable {
             Err("pnputil failed".into())
         } else {
@@ -191,7 +195,12 @@ fn staying_blocked_does_nothing_more() {
     let mut m = Mode::new(r.marker.clone());
     m.step(true, T0, &mut r.bridge(), &mut r.device());
     r.log.borrow_mut().clear();
-    m.step(true, T0 + Duration::from_secs(5), &mut r.bridge(), &mut r.device());
+    m.step(
+        true,
+        T0 + Duration::from_secs(5),
+        &mut r.bridge(),
+        &mut r.device(),
+    );
     assert!(r.lines().is_empty());
 }
 
@@ -203,7 +212,12 @@ fn leaving_waits_for_the_quiet_period_then_enables_clears_and_resumes() {
     r.log.borrow_mut().clear();
     let gone = Duration::from_secs(100);
     m.step(false, gone, &mut r.bridge(), &mut r.device());
-    m.step(false, gone + QUIET - Duration::from_secs(1), &mut r.bridge(), &mut r.device());
+    m.step(
+        false,
+        gone + QUIET - Duration::from_secs(1),
+        &mut r.bridge(),
+        &mut r.device(),
+    );
     assert!(r.lines().is_empty());
     assert!(m.active());
     m.step(false, gone + QUIET, &mut r.bridge(), &mut r.device());
@@ -218,10 +232,30 @@ fn a_blocker_coming_back_restarts_the_quiet_period() {
     let mut m = Mode::new(r.marker.clone());
     m.step(true, T0, &mut r.bridge(), &mut r.device());
     r.log.borrow_mut().clear();
-    m.step(false, Duration::from_secs(10), &mut r.bridge(), &mut r.device());
-    m.step(true, Duration::from_secs(20), &mut r.bridge(), &mut r.device());
-    m.step(false, Duration::from_secs(25), &mut r.bridge(), &mut r.device());
-    m.step(false, Duration::from_secs(10) + QUIET, &mut r.bridge(), &mut r.device());
+    m.step(
+        false,
+        Duration::from_secs(10),
+        &mut r.bridge(),
+        &mut r.device(),
+    );
+    m.step(
+        true,
+        Duration::from_secs(20),
+        &mut r.bridge(),
+        &mut r.device(),
+    );
+    m.step(
+        false,
+        Duration::from_secs(25),
+        &mut r.bridge(),
+        &mut r.device(),
+    );
+    m.step(
+        false,
+        Duration::from_secs(10) + QUIET,
+        &mut r.bridge(),
+        &mut r.device(),
+    );
     assert!(r.lines().is_empty());
 }
 
@@ -234,11 +268,21 @@ fn a_failed_enable_keeps_the_marker_and_retries_without_starting_the_bridge() {
     let mut device = r.device();
     device.fail_enable = true;
     m.step(false, Duration::from_secs(1), &mut r.bridge(), &mut device);
-    m.step(false, Duration::from_secs(1) + QUIET, &mut r.bridge(), &mut device);
+    m.step(
+        false,
+        Duration::from_secs(1) + QUIET,
+        &mut r.bridge(),
+        &mut device,
+    );
     assert_eq!(r.lines(), ["enable marked=true"]);
     assert!(r.marker.exists());
     assert!(m.active());
-    m.step(false, Duration::from_secs(5) + QUIET, &mut r.bridge(), &mut r.device());
+    m.step(
+        false,
+        Duration::from_secs(5) + QUIET,
+        &mut r.bridge(),
+        &mut r.device(),
+    );
     assert_eq!(r.lines().last().unwrap(), "resume");
     assert!(!r.marker.exists());
 }

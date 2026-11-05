@@ -12,6 +12,8 @@ pub mod history;
 #[cfg(feature = "gate-tests")]
 pub mod inject;
 pub mod keychain;
+#[cfg(windows)]
+pub mod lhm_bridge;
 pub mod runtime;
 #[cfg(windows)]
 pub mod service;

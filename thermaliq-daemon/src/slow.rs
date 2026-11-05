@@ -627,6 +627,14 @@ mod tests {
         wait_until(|| r.daemon.handle().cache().ticks > 0);
         show(&r, "game.exe");
         wait_until(|| active(&r) == "gaming");
+        // The profile switches before the decision is logged.
+        wait_until(|| {
+            r.shared
+                .view()
+                .decisions
+                .iter()
+                .any(|d| d.exe == "game.exe")
+        });
         let log = r.shared.view().decisions;
         let d = log.iter().find(|d| d.exe == "game.exe").unwrap();
         assert_eq!(d.source.as_deref(), Some("user"));

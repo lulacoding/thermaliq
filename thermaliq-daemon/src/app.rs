@@ -53,26 +53,40 @@ fn backend() -> Result<Arc<dyn HardwareLayer>, String> {
     #[cfg(all(windows, not(feature = "mock-hardware")))]
     {
         use thermaliq_hal::{CombinedHardwareLayer, CpuLoad, Hwinfo, Nvidia};
-        // M12 adds its backend here; ones that fail to start are skipped, and with none
-        // left the daemon refuses to start rather than pretend.
+        // Ones that fail to start are skipped, and with none left the daemon refuses to start
+        // rather than pretend.
         let mut backends: Vec<Arc<dyn HardwareLayer>> = Vec::new();
         let mut why = Vec::new();
         match Nvidia::new() {
             Ok(n) => backends.push(Arc::new(n)),
             Err(e) => why.push(format!("NVIDIA: {e}")),
         }
+        let dir = store::data_dir().map_err(|e| e.to_string())?;
+        let mut bridge: Option<Arc<dyn HardwareLayer>> =
+            crate::lhm_bridge::start_backend(&dir).map(|b| b as Arc<dyn HardwareLayer>);
         if backends.is_empty() {
-            return Err(format!("no hardware backend started ({})", why.join("; ")));
+            // With nothing else it's the only hardware, so losing it has to reach S4.
+            match bridge.take() {
+                Some(b) => backends.push(b),
+                None => {
+                    return Err(format!("no hardware backend started ({})", why.join("; ")));
+                }
+            }
         }
         for w in why {
             eprintln!("hardware backend unavailable, continuing without it: {w}");
         }
-        // Both are optional extras: while one is down only its own readings drop out. CPU load
-        // goes first so it wins over HWiNFO's.
-        let combined = CombinedHardwareLayer::new(backends)
+        // Optional extras: while one is down only its own readings drop out. CPU load goes first
+        // so it wins over HWiNFO's and the bridge's.
+        let mut combined = CombinedHardwareLayer::new(backends)
             .and_then(|c| c.with_optional("cpu-load", Arc::new(CpuLoad::new())))
             .and_then(|c| c.with_optional("hwinfo", Arc::new(Hwinfo::new())))
             .map_err(|e| e.to_string())?;
+        if let Some(b) = bridge {
+            combined = combined
+                .with_optional_owner("lhm-bridge", b)
+                .map_err(|e| e.to_string())?;
+        }
         Ok(Arc::new(combined))
     }
     #[cfg(all(not(windows), not(feature = "mock-hardware")))]

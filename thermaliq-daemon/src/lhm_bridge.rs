@@ -3,7 +3,7 @@
 
 use crate::anti_cheat::{self, BridgeSwitch, Mode, PawnIoDevice, StartState};
 use crate::{acl, win};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -89,7 +89,10 @@ fn check_replaceable(exe: &Path) -> Result<(), String> {
     if problems.is_empty() {
         Ok(())
     } else {
-        Err(format!("others could replace the bridge: {}", problems.join("; ")))
+        Err(format!(
+            "others could replace the bridge: {}",
+            problems.join("; ")
+        ))
     }
 }
 
@@ -140,7 +143,11 @@ impl BridgeStarter for Starter {
                         writer: pipe,
                     }));
                 }
-                Err(e) if matches!(e.raw_os_error(), Some(ERROR_FILE_NOT_FOUND | ERROR_PIPE_BUSY)) => {}
+                Err(e)
+                    if matches!(
+                        e.raw_os_error(),
+                        Some(ERROR_FILE_NOT_FOUND | ERROR_PIPE_BUSY)
+                    ) => {}
                 Err(e) => return Err(format!("cannot open the bridge pipe: {e}")),
             }
             if let Ok(Some(status)) = child.try_wait() {
@@ -293,13 +300,20 @@ fn watch(marker: PathBuf, bridge: Option<Weak<LhmBridge>>, started_blocked: bool
     let tracks_backend = bridge.is_some();
     let mut switch = WeakBridge(bridge);
     let began = Instant::now();
-    let spawned = thread::Builder::new().name("anti-cheat".into()).spawn(move || loop {
-        if tracks_backend && switch.0.as_ref().is_some_and(|w| w.strong_count() == 0) {
-            return;
-        }
-        mode.step(blocker_running(), began.elapsed(), &mut switch, &mut PnpDevice);
-        thread::sleep(WATCH_EVERY);
-    });
+    let spawned = thread::Builder::new()
+        .name("anti-cheat".into())
+        .spawn(move || loop {
+            if tracks_backend && switch.0.as_ref().is_some_and(|w| w.strong_count() == 0) {
+                return;
+            }
+            mode.step(
+                blocker_running(),
+                began.elapsed(),
+                &mut switch,
+                &mut PnpDevice,
+            );
+            thread::sleep(WATCH_EVERY);
+        });
     if let Err(e) = spawned {
         eprintln!("anti-cheat watcher did not start: {e}");
     }
@@ -309,6 +323,7 @@ fn watch(marker: PathBuf, bridge: Option<Weak<LhmBridge>>, started_blocked: bool
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::io::Cursor;
 
     #[test]
@@ -369,11 +384,11 @@ mod tests {
         assert!(names.iter().any(|n| n.eq_ignore_ascii_case(&me)), "{me}");
     }
 
+    /// Not a pipe: the call must fail, so a failure can't pass for a matching pid. The real
+    /// positive case needs the bridge's SYSTEM-only pipe, so it's a hardware check.
     #[test]
-    fn the_server_pid_of_our_own_pipe_is_us() {
-        use std::os::windows::process::CommandExt;
-        let _ = CommandExt::creation_flags; // Windows-only test module
-        let (ours, _guard) = win::test_pipe_pair().unwrap();
-        assert_eq!(win::pipe_server_pid(&ours).unwrap(), std::process::id());
+    fn the_server_pid_of_something_that_is_not_a_pipe_is_an_error() {
+        let me = File::open(std::env::current_exe().unwrap()).unwrap();
+        assert!(win::pipe_server_pid(&me).is_err());
     }
 }

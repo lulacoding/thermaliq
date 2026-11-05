@@ -466,7 +466,13 @@ mod tests {
             .unwrap()
             .with_optional_owner("lhm-bridge", bridge)
             .unwrap();
-        let ids: Vec<_> = c.snapshot().unwrap().metrics.into_iter().map(|m| m.id).collect();
+        let ids: Vec<_> = c
+            .snapshot()
+            .unwrap()
+            .metrics
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
         assert_eq!(ids, ["builtin"]);
     }
 
