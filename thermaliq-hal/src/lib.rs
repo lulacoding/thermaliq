@@ -3,6 +3,7 @@
 //! Only `thermaliq-engine` may call `set_fan_duty` (SPEC S1).
 
 mod combined;
+mod cpu_load;
 mod hwinfo;
 #[cfg(windows)]
 #[allow(unsafe_code)]
@@ -11,6 +12,7 @@ mod mock;
 mod nvidia;
 
 pub use combined::CombinedHardwareLayer;
+pub use cpu_load::CpuLoad;
 pub use hwinfo::{Hwinfo, HwinfoError};
 pub use mock::{MockHardwareLayer, Tick};
 pub use nvidia::{Nvidia, Nvml};

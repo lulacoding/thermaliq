@@ -77,14 +77,18 @@ impl HardwareLayer for CombinedHardwareLayer {
                 Ok(s) => {
                     // shortcut: all-or-nothing, not per GPU; match readings to GPUs when a
                     // multi-GPU machine has NVML power on one card and not the other.
-                    let have_gpu_power = all.metrics.iter().any(|m| m.kind == MetricKind::GpuPower);
+                    // Built-in CPU load wins over HWiNFO's the same way (one CPU).
+                    let have = |all: &HardwareSnapshot, k| all.metrics.iter().any(|m| m.kind == k);
+                    let (gpu_power, cpu_load) = (
+                        have(&all, MetricKind::GpuPower),
+                        have(&all, MetricKind::CpuLoad),
+                    );
                     all.sensors.extend(s.sensors);
                     all.fans.extend(s.fans);
-                    all.metrics.extend(
-                        s.metrics
-                            .into_iter()
-                            .filter(|m| !(have_gpu_power && m.kind == MetricKind::GpuPower)),
-                    );
+                    all.metrics.extend(s.metrics.into_iter().filter(|m| {
+                        !(gpu_power && m.kind == MetricKind::GpuPower
+                            || cpu_load && m.kind == MetricKind::CpuLoad)
+                    }));
                 }
                 Err(_) => down.push(name.clone()),
             }
@@ -151,7 +155,7 @@ mod tests {
         let m = |id: &str| {
             vec![MetricReading {
                 id: id.into(),
-                kind: MetricKind::CpuLoad,
+                kind: MetricKind::CpuClock,
                 value: 1.0,
             }]
         };
@@ -205,6 +209,40 @@ mod tests {
     fn hwinfo_gpu_power_fills_in_only_when_the_required_backend_has_none() {
         assert_eq!(with_gpu_power(None), [("hwinfo".to_string(), 50.0)]);
         assert_eq!(with_gpu_power(Some(120.0)), [("nvml".to_string(), 120.0)]);
+    }
+
+    #[test]
+    fn a_later_optional_cpu_load_is_dropped_when_an_earlier_source_has_one() {
+        use thermaliq_common::{MetricKind, MetricReading};
+        let load = |id: &str| {
+            vec![MetricReading {
+                id: id.into(),
+                kind: MetricKind::CpuLoad,
+                value: 10.0,
+            }]
+        };
+        let opt = |id: &str| {
+            Arc::new(
+                Arc::into_inner(mock(&[], "x", SensorKind::Cpu))
+                    .unwrap()
+                    .metrics(load(id)),
+            )
+        };
+        let ids = |first: bool| {
+            let mut c =
+                CombinedHardwareLayer::new(vec![mock(&["a1"], "gpu", SensorKind::Gpu)]).unwrap();
+            if first {
+                c = c.with_optional("cpu-load", opt("builtin")).unwrap();
+            }
+            let snap = c
+                .with_optional("hwinfo", opt("hwinfo"))
+                .unwrap()
+                .snapshot()
+                .unwrap();
+            snap.metrics.into_iter().map(|m| m.id).collect::<Vec<_>>()
+        };
+        assert_eq!(ids(true), ["builtin"]);
+        assert_eq!(ids(false), ["hwinfo"]);
     }
 
     #[test]
