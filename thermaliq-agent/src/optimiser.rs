@@ -51,13 +51,14 @@ impl Cooled<'_> {
                 .is_some_and(|p| p > self.target)
     }
 
-    /// Known, under target, and still under target `AHEAD` ticks after lowering by `by`.
-    fn can_lower(&self, by: u8) -> bool {
+    /// Known, under target, and still under target `AHEAD` ticks after the fan is set to the
+    /// duty that will be requested, `curve − by` (not the measured duty, which lags a ramp).
+    fn can_lower(&self, curve: u8, by: u8) -> bool {
         let (Some(s), Some(m)) = (self.sample, self.model) else {
             return false;
         };
         let lowered = Sample {
-            duty: (s.duty - f64::from(by)).max(0.0),
+            duty: f64::from(curve.saturating_sub(by)),
             ..s
         };
         s.temp < self.target
@@ -100,10 +101,13 @@ impl Optimiser {
         let quiet = u32::from(100 - slider.min(100));
         let by = (u32::from(AGENT_MAX_LOWER_PCT) * quiet + 50) / 100;
         let by = u8::try_from(by).ok().filter(|&b| b > 0)?;
-        cooled.iter().all(|c| c.can_lower(by)).then(|| Request {
-            duty: curve.saturating_sub(by),
-            expires_at,
-        })
+        cooled
+            .iter()
+            .all(|c| c.can_lower(curve, by))
+            .then(|| Request {
+                duty: curve.saturating_sub(by),
+                expires_at,
+            })
     }
 }
 
@@ -183,10 +187,33 @@ mod tests {
 
     #[test]
     fn never_lowers_if_the_lowered_duty_would_go_over_target() {
-        // now: 74.5 + 2 − 2 = 74.5; 15 points lower: 75.25 ≥ 75
+        // now (duty 40): 74.9 + 2 − 2 = 74.9; at curve 50 − 15 = 35: 75.15 ≥ 75
         let m = model(2.0);
-        let c = [cooled(74.5, 75.0, Some(&m))];
+        let c = [cooled(74.9, 75.0, Some(&m))];
         assert_eq!(Optimiser::default().decide(T0, 50, 0, false, &c), None);
+    }
+
+    #[test]
+    fn the_safety_prediction_is_made_at_the_duty_that_will_be_requested() {
+        // measured duty 60 lags a curve of 50: the request is 35, not 60 − 15 = 45.
+        // At duty 45 the model says 69.75 (< 70); at 35 it says 70.25 (≥ 70).
+        let m = model(2.0);
+        let mut c = cooled(70.0, 70.0, Some(&m));
+        c.target = 70.5; // temp 70 < 70.5; 35 gives 70.25 < 70.5: allowed
+        c.sample = c.sample.map(|s| Sample { duty: 60.0, ..s });
+        assert_eq!(
+            Optimiser::default()
+                .decide(T0, 50, 0, false, &[c])
+                .map(|r| r.duty),
+            Some(35)
+        );
+        let mut c = cooled(70.0, 70.2, Some(&m));
+        c.sample = c.sample.map(|s| Sample { duty: 60.0, ..s });
+        assert_eq!(
+            Optimiser::default().decide(T0, 50, 0, false, &[c]),
+            None,
+            "35 → 70.25 ≥ 70.2 must refuse, though 45 → 69.75 would pass"
+        );
     }
 
     #[test]

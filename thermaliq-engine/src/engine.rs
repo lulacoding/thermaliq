@@ -295,6 +295,9 @@ impl Engine {
                 .filter(|f| f.kind == FanKind::Pump)
                 .map(|f| f.id.clone()),
         );
+        for f in self.fans.iter_mut().filter(|f| self.pumps.contains(&f.id)) {
+            f.ctl.withdraw(Source::Agent); // accepted before the pump was known
+        }
         for f in self.fans.iter_mut().filter(|f| !f.seeded) {
             if let Some(r) = snap.fans.iter().find(|r| r.id == f.id) {
                 f.ctl.seed(r.duty_percent, r.rpm > 0);
@@ -1205,13 +1208,31 @@ mod agent_tests {
     #[test]
     fn an_agent_request_is_dropped_while_the_curve_has_no_input() {
         let gone = Tick::Temps(vec![("gpu".into(), SensorKind::Gpu, 40.0)]);
-        let (hal, mut e) = rig_with(true, vec![cpu(40.0), gone], false);
+        // No min_pwm, so only the withdraw can keep the agent's 0 off the fan.
+        let p = Profile::from_toml(
+            "name = \"t\"\n[[curves]]\ntype = \"linear\"\nid = \"c\"\nsource = \"cpu\"\nmin_temp = 30.0\nmax_temp = 90.0\nmin_pwm = 20\nmax_pwm = 100\n[[controls]]\nfan = \"f1\"\ncurve = \"c\"\nstep_up_pct = 100\nstep_down_pct = 100\n",
+        )
+        .unwrap();
+        let hal = Arc::new(MockHardwareLayer::new(&["f1"], vec![cpu(40.0), gone]));
+        let mut e = Engine::new(hal.clone(), &p);
         e.tick(secs(0));
+        let written = hal.writes().len();
         agent(&mut e, 0, 99);
         e.tick(secs(1)); // 1 bad tick: no clamp floor is known, so the request must not act
-        assert_ne!(hal.writes().last().unwrap().1, 0);
         e.tick(secs(2));
-        assert!(hal.writes().iter().all(|&(_, d)| d != 0));
+        assert_eq!(
+            hal.writes().len(),
+            written,
+            "nothing written, least of all 0"
+        );
+    }
+
+    #[test]
+    fn an_agent_request_made_before_the_first_snapshot_is_dropped_for_a_pump() {
+        let (hal, mut e) = rig_with(false, vec![cpu(40.0)], true);
+        agent(&mut e, 90, 99); // pump set is still empty, so submit accepts it
+        e.tick(secs(0));
+        assert_eq!(last(&hal), 50, "the curve, not the agent's 90");
     }
 
     #[test]
