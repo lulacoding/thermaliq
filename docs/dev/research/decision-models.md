@@ -1,6 +1,6 @@
 # Decision models (Jev and alternatives): research notes for the M20 brainstorm
 
-Status: starting notes, gathered 2026-11-04. The M20 brainstorm must re-check them first, since this field is weeks old and moving fast.
+Status: notes gathered 2026-11-04. The M20c spike (2026-11-05, below) has its research and tooling ready, but **no latency or FPS has been measured yet**.
 
 ## Goal (Sam, 2026-11-04)
 
@@ -38,6 +38,125 @@ The agent should use a **Jev-style decision model, not an LLM**: fast, structure
 - New in the same class: OpenAI Decisions API (limited preview), Microsoft-Decision-1, Perplexity pplx-decider-v1.1-27b, Cloudflare clef-omni (multimodal). Clef-flash is now cheaper than Jev.
 - The result is in SPEC §7: a fast layer (own small models, CPU, every tick) plus a slow layer (decision model every 60 s / on app change, hosted Jev if a key is set, local otherwise, both voting on big calls).
 
+## M20c spike (2026-11-05)
+
+PC: Ryzen 5 5600 (6 cores, 12 threads), 16 GB RAM, RTX 4060. Python is not installed. Ollama 0.40.11 is.
+
+### Results
+
+| Model and route | Median | p95 | First answer after start | Peak memory | FPS cost (gate < 2%) |
+| --- | --- | --- | --- | --- | --- |
+| Strands 2B, Ollaya, idle PC | not measured | not measured | not measured | not measured | not measured |
+| Clef-flash Q4_K_M, llama-server, idle PC | not measured | not measured | not measured | not measured | not measured |
+
+### What runs on this PC (from upstream docs, not tested here)
+
+| Route | Windows | Memory | One-core control | Verdict |
+| --- | --- | --- | --- | --- |
+| **Ollaya `strands-decider:2b`** | Native | ~8 GB | `OLLAYA_THREADS` | **Try first.** 4.8 GB, no Python, calibrated |
+| Ollaya `clef:flash` | Native | ~19 GB | `OLLAYA_THREADS` | Does not fit in 16 GB |
+| **llama-server + `felipeTromso/clef-flash-GGUF` Q4_K_M** | Native | 6.6 GiB at 374 tokens | `-t 1` | **Clef-flash route.** Third-party quantization; no CPU latency published |
+| Ollama `clef-flash` | Native | 11–12 GB download, ~14 GB loaded | not found for `/v1/systemone` | Too big next to a game |
+| Ollama `strands-decider` | **No** | 2.0 GB | n/a | Needs Apple silicon (MLX) |
+| `pip install strands-decider` | Unverified | ~8 GB (fp32 torso on CPU) | `OMP_NUM_THREADS` | Fallback. Upstream CI is Ubuntu and macOS only, and its docs say Linux or WSL2 |
+| WSL2 + pip | Via VM | ~8 GB + VM | Not from Windows | Avoid: Windows priority and affinity don't reach it cleanly, and the product is Windows-native |
+| `fabricant451/...-v19-GGUF` | n/a | ~2 GB | n/a | Needs a custom runtime; stock clients are not assumed compatible |
+
+Risks to check against the numbers:
+
+- **Latency may be seconds.** Upstream measured 1.6 s per v21 ask on a Xeon 8375C with **8 threads**. One core at idle priority will be slower. Ollaya says its `decider` models are "slow on CPU".
+- **Memory may matter more than CPU.** SPEC §7.2 loads on demand and unloads after use. Reading ~8 GB every 60 s on a 16 GB PC while a game runs can cause paging and stutter, which average FPS can hide. So the FPS test also reports 1% lows. If this is the problem, a 60 s reload cadence needs rethinking.
+- **Exact model.** Ollaya lists `strands-decider:2b` as Qwen3.5-2B, with 0.616 on its own 400-state test. Its page doesn't say which Strands release that is. Clef-flash scores 0.703 on the same test.
+- **Small fallback, if both fail:** Ollaya `laya` answers five questions in 516 ms on a CPU (Ollaya's number), but scores 0.357. Too inaccurate to trust without testing on our questions.
+
+### Install
+
+**Strands 2B through Ollaya.** The CPU zip can't pick CUDA, and it adds no installer or service:
+
+```powershell
+$d = "$env:LOCALAPPDATA\ollaya-spike"
+gh release download v0.18.0 --repo ollaya-dev/ollaya --dir $d --pattern ollaya-windows-amd64.zip --pattern sha256sum.txt
+(Get-FileHash "$d\ollaya-windows-amd64.zip" -Algorithm SHA256).Hash   # must match the line below
+Select-String ollaya-windows-amd64.zip "$d\sha256sum.txt"
+Expand-Archive "$d\ollaya-windows-amd64.zip" "$d\bin"
+$ollaya = (Get-ChildItem "$d\bin" -Recurse -Filter ollaya.exe).FullName
+$env:OLLAYA_DEVICE = 'cpu'
+& $ollaya pull strands-decider:2b     # about 4.8 GB
+Get-Process ollaya* -ErrorAction SilentlyContinue | Stop-Process      # pull may leave a daemon, and it wouldn't be pinned
+```
+
+**Clef-flash through llama.cpp.** Run it once unpinned so the 5.74 GB download finishes, and stop it with Ctrl-C when it says it is listening:
+
+```powershell
+winget install llama.cpp      # open a new terminal afterwards
+llama-server --version        # needs b11415 or later for /v1/systemone
+llama-server -hf felipeTromso/clef-flash-GGUF:Q4_K_M -ngl 0 -t 1 -tb 1 -c 4096 -b 4096 -ub 4096 --parallel 1 --port 8080
+```
+
+**Fallback, only if Ollaya fails: Strands through pip** (native Windows is unverified):
+
+```powershell
+winget install astral-sh.uv   # open a new terminal afterwards
+uv venv "$env:LOCALAPPDATA\strands-spike" --python 3.12
+$py = "$env:LOCALAPPDATA\strands-spike\Scripts\python.exe"
+uv pip install --python $py torch --index-url https://download.pytorch.org/whl/cpu
+uv pip install --python $py strands-decider
+```
+
+### Measure latency
+
+Close other heavy apps. The script is `docs/dev/research/decision-latency.ps1`. It starts the server itself, sets it and its child processes to idle priority on the last logical CPU, sends one warm-up and then 50 decisions, and reports median, p95 (nearest rank), time to first answer and peak memory. It fails if any answer is outside the schema, if a process left the core, or if something was already listening on the port. Each request asks both questions (workload, profile) about a different exe.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File docs\dev\research\decision-latency.ps1 -SelfTest    # no model needed
+
+# Strands 2B
+powershell -ExecutionPolicy Bypass -File docs\dev\research\decision-latency.ps1 -Exe $ollaya -ExeArgs serve -Model strands-decider:2b -Port 11435
+
+# Clef-flash
+powershell -ExecutionPolicy Bypass -File docs\dev\research\decision-latency.ps1 -Exe llama-server -ExeArgs "-hf felipeTromso/clef-flash-GGUF:Q4_K_M -ngl 0 -t 1 -tb 1 -c 4096 -b 4096 -ub 4096 --parallel 1 --port 8080" -Port 8080
+
+# Strands 2B, pip fallback. --max-batch 2: the default warm-up would run 32 shapes on one core.
+powershell -ExecutionPolicy Bypass -File docs\dev\research\decision-latency.ps1 -Exe "$env:LOCALAPPDATA\strands-spike\Scripts\strands-decider.exe" -ExeArgs "serve StrandsAgents/strands-decider-2B-qwen3.5-v1-2610 --device cpu --max-batch 2 --port 8000" -Port 8000
+```
+
+A request that takes over 300 s fails the run. Raise it with `-TimeoutSec` if one core really is that slow, and record that. Add the numbers to the results table.
+
+### Measure the FPS cost
+
+Use the model and route that passed latency. Get [PresentMon](https://github.com/GameTechDev/PresentMon/releases) (console build) and open an **administrator** PowerShell in the repo. `$pm` is the path to its exe and `$game` is the game's exe name, for example `cs2.exe`.
+
+1. **Set up the scene.** Pick one repeatable scene, ideally the game's built-in benchmark. Turn off V-Sync and frame caps, since a cap hides the cost. Prefer a CPU-limited setting (low resolution), because a GPU-limited scene hides a cost that lands on the CPU. Keep ThermalIQ's state and the power plan the same across runs. Let the game warm up for 2 minutes first.
+2. **Run without the model (2 min).** Start the command, then alt-tab to the game within 15 s and start the scene as the capture begins:
+
+   ```powershell
+   Start-Sleep 15; & $pm --process_name $game --output_file without1.csv --timed 120 --terminate_after_timed --stop_existing_session --v1_metrics
+   ```
+
+3. **Run with the model (2 min, same scene).** This loads, decides and unloads at 0, 60 and 120 s, so it covers the on-demand load in SPEC §7.2:
+
+   ```powershell
+   Start-Sleep 15; Start-Process $pm "--process_name $game --output_file with1.csv --timed 120 --terminate_after_timed --stop_existing_session --v1_metrics"; powershell -ExecutionPolicy Bypass -File docs\dev\research\decision-latency.ps1 -Exe $ollaya -ExeArgs serve -Model strands-decider:2b -Port 11435 -EverySeconds 60 -Count 3
+   ```
+
+4. **Repeat steps 2 and 3 once**, saving to `without2.csv` and `with2.csv`, so that the order is without, with, without, with. If the two runs without the model differ by more than 1%, a 2% gate can't be read from this scene: pick a steadier scene or use more runs.
+5. **Compute the results:**
+
+   ```powershell
+   function Fps($f) { $ms = (Import-Csv $f).MsBetweenPresents | ForEach-Object { [double]$_ } | Sort-Object
+     "{0}: average {1:N1} FPS, 1% low {2:N1} FPS" -f $f, (1000 / ($ms | Measure-Object -Average).Average), (1000 / $ms[[int]($ms.Count * 0.99)]) }
+   'without1.csv','with1.csv','without2.csv','with2.csv' | ForEach-Object { Fps $_ }
+   ```
+
+   Cost % = (average without − average with) / average without × 100, using the mean of the two runs on each side.
+
+**Gate (SPEC §7.5):** a cost under 2% on average FPS passes. Otherwise the local model doesn't run while a game is in the foreground, and its calls queue until the game closes. 1% lows are not part of the gate, but report them. A clear drop there is a reason to raise the design with Sam even if the average passes.
+
+### Not done
+
+- Accuracy on ThermalIQ's questions. The script prints each answer and confidence, but nothing is labelled.
+- The product side of M20c (DecisionProvider, routing, voting), which waits for these numbers.
+
 ## Questions the M20 brainstorm answered (see SPEC §7)
 
 1. **GPU contention while gaming.** A 2B–9B model on the same GPU as the game costs VRAM and GPU time. Can it run on CPU fast enough at a 5 s agent tick? Measure it on Sam's PC.
@@ -62,3 +181,20 @@ The agent should use a **Jev-style decision model, not an LLM**: fast, structure
 - [ecosistemastartup: TypeSafe Series A, competing decision models](https://ecosistemastartup.com/typesafe-startup-de-modelos-de-decisiones-levanta-us870m/)
 - [MarkTechPost: Strands Decider 2B release](https://www.marktechpost.com/2026/10/01/aws-strands-labs-releases-strands-decider-2b/)
 - [Towards AI: running Jev locally, Ollaya](https://pub.towardsai.net/can-you-run-jev-locally-we-checked-520-jev-clients-only-193-switch-to-ollaya-with-one-setting-1d7e48e22e05)
+- [strands-labs/strands-decider: server, schema, docs/inference.md, CI](https://github.com/strands-labs/strands-decider)
+- [PyPI: strands-decider](https://pypi.org/project/strands-decider/)
+- [Hugging Face: Strands Decider 2B v1-2610](https://huggingface.co/StrandsAgents/strands-decider-2B-qwen3.5-v1-2610)
+- [ollaya-dev/ollaya: README, docs/api.md, releases](https://github.com/ollaya-dev/ollaya)
+- [Ollaya: TypeSafe compatibility](https://ollaya.dev/docs/typesafe-compatibility)
+- [Ollaya: FAQ](https://ollaya.dev/docs/faq)
+- [Ollaya library: strands-decider](https://ollaya.dev/library/strands-decider)
+- [Ollaya library: clef](https://ollaya.dev/library/clef)
+- [Ollaya library: decider](https://ollaya.dev/library/decider)
+- [Ollama library: strands-decider](https://ollama.com/library/strands-decider)
+- [Ollama library: clef-flash](https://ollama.com/library/clef-flash)
+- [jacar.es: Clef on Ollama, memory when loaded](https://jacar.es/?p=7667)
+- [Hugging Face: Cloudflare/clef-flash](https://huggingface.co/Cloudflare/clef-flash)
+- [Hugging Face: felipeTromso/clef-flash-GGUF](https://huggingface.co/felipeTromso/clef-flash-GGUF)
+- [Hugging Face: Pitaya1219/Clef-Flash-GGUF (minimum llama.cpp build)](https://huggingface.co/Pitaya1219/Clef-Flash-GGUF)
+- [Hugging Face: fabricant451 Strands GGUF](https://huggingface.co/fabricant451/strands-decider-2B-hobson-v19-GGUF)
+- [PresentMon console docs](https://github.com/GameTechDev/PresentMon/blob/main/README-ConsoleApplication.md)
