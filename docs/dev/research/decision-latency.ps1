@@ -3,10 +3,13 @@
 #
 #   -Count 50                    one server, a warm-up, then 50 timed decisions
 #   -EverySeconds 60 -Count 3    SPEC cadence for the FPS test: load, one decision, unload, wait
-#   -SelfTest                    checks this script against a fake server, no model needed
+#   -Hosted                      the same 50 decisions to Jev 1.14 on OpenRouter, nothing pinned
+#   -SelfTest                    checks this script against a fake server, no model and no key
 #
 # The script starts the server itself, because the server is what has to be pinned, and refuses
 # to run if something already listens on the port (that server would not be pinned).
+# It also refuses to run elevated. -Hosted reads the key from $env:OPENROUTER_API_KEY only and
+# never writes it anywhere; local servers don't inherit it.
 param(
     [string]$Exe,
     [string]$ExeArgs = '',
@@ -16,14 +19,23 @@ param(
     [int]$EverySeconds = 0,
     [int]$Core = [Environment]::ProcessorCount - 1,
     [int]$TimeoutSec = 300,
+    [switch]$Hosted,
     [switch]$SelfTest,
-    # Self-test only: a stand-in for the model server.
+    # Self-test only: a stand-in for the model server, or for OpenRouter.
     [switch]$FakeServer,
+    [switch]$FakeHosted,
     [switch]$BadAnswer,
-    [switch]$Escape
+    [switch]$Escape,
+    [switch]$HostedToFake
 )
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+
+$HostedUrl = 'https://openrouter.ai/api/v1/systemone'
+$HostedModel = 'typesafe/jev-1.14'
+$script:outside = 0
+$script:cost = 0.0
+$script:servedBy = ''
 
 $Workloads = [ordered]@{
     idle = 'Nothing demanding is running'; browsing = 'Web browser or light desktop use'
@@ -64,17 +76,33 @@ function New-Body([int]$i) {
     $body | ConvertTo-Json -Compress -Depth 6
 }
 
+function Hide-Key([string]$text) {
+    if ($env:OPENROUTER_API_KEY) { $text.Replace($env:OPENROUTER_API_KEY, '[key]') } else { $text }
+}
+
 # One request holds both questions: the slow layer asks them together for a new exe.
 function Invoke-Decision([int]$i) {
     $bytes = [Text.Encoding]::UTF8.GetBytes((New-Body $i))
+    $request = @{ Uri = "http://127.0.0.1:$Port/v1/systemone"; Headers = @{} }
+    if ($Hosted) {
+        if (-not $HostedToFake) { $request.Uri = $HostedUrl }
+        $request.Headers = @{ Authorization = "Bearer $env:OPENROUTER_API_KEY" }
+    }
     $sw = [Diagnostics.Stopwatch]::StartNew()
-    $r = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/v1/systemone" -Method Post -Body $bytes `
-        -ContentType 'application/json' -TimeoutSec $TimeoutSec -DisableKeepAlive
+    # No redirects: the key must only ever reach the URL above.
+    $r = Invoke-RestMethod @request -Method Post -Body $bytes -ContentType 'application/json' `
+        -TimeoutSec $TimeoutSec -DisableKeepAlive -MaximumRedirection 0
     $ms = [Math]::Round($sw.Elapsed.TotalMilliseconds)
     $w = $r.answers.workload; $p = $r.answers.profile
     if (-not $w -or -not $p -or -not $Workloads.Contains([string]$w.choice) -or -not $Profiles.Contains([string]$p.choice)) {
-        throw "answer outside the schema: $($r | ConvertTo-Json -Compress -Depth 6)"
+        $bad = "answer outside the schema: $(Hide-Key ($r | ConvertTo-Json -Compress -Depth 6))"
+        if (-not $Hosted) { throw $bad }
+        $script:outside++
+        Write-Host ("{0,3} {1,-18} {2,8} ms  {3}" -f $i, $Exes[$i % $Exes.Count], $ms, $bad)
+        return $ms
     }
+    if ($r.model) { $script:servedBy = [string]$r.model }
+    if ($r.usage.cost) { $script:cost += [double]$r.usage.cost }
     Write-Host ("{0,3} {1,-18} {2,8} ms  {3} ({4:N2}), {5} ({6:N2})" -f $i, $Exes[$i % $Exes.Count], $ms, $w.choice, $w.confidence, $p.choice, $p.confidence)
     $ms
 }
@@ -192,6 +220,30 @@ function Invoke-Benchmark {
     0
 }
 
+# Exactly the decisions a local run times, no warm-up. Every call opens a new TLS connection,
+# as a call every 60 s would. Over 2 s is when SPEC 7.2 falls back to the local model.
+function Invoke-HostedBenchmark {
+    if ($EverySeconds -gt 0 -or $Exe) { throw '-Hosted takes no -Exe or -EverySeconds' }
+    if ($Count -lt 1) { throw 'Count must be at least 1' }
+    if (-not $env:OPENROUTER_API_KEY) { Write-Host 'FAIL: $env:OPENROUTER_API_KEY is not set'; return 1 }
+    if (-not $Model) { $script:Model = $HostedModel }
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $times = @(); $code = 0
+    try {
+        for ($i = 1; $i -le $Count; $i++) { $times += Invoke-Decision $i }
+    } catch {
+        Write-Host "FAIL after $($times.Count)/$Count decisions: $(Hide-Key "$_")"
+        $code = 1
+    }
+    if ($times.Count) {
+        $slow = @($times | Where-Object { $_ -gt 2000 }).Count
+        Write-Host ("{0}/{1} answered, {2}: median {3} ms, p95 {4} ms; over 2 s: {5}; outside the schema: {6}; served by {7}; cost `${8:N6}" -f `
+            $times.Count, $Count, $Model, (Get-Percentile $times 50), (Get-Percentile $times 95), $slow, $script:outside, $script:servedBy, $script:cost)
+    }
+    if ($script:outside) { $code = 1 }
+    $code
+}
+
 function Invoke-FakeServer {
     $listener = [Net.HttpListener]::new()
     $listener.Prefixes.Add("http://127.0.0.1:$Port/")
@@ -200,9 +252,16 @@ function Invoke-FakeServer {
     while ($true) {
         $ctx = $listener.GetContext()
         $served++
-        $choice = if ($BadAnswer) { 'banana' } else { 'gaming' }
-        $json = "{`"model`":`"fake`",`"answers`":{`"workload`":{`"type`":`"choice`",`"choice`":`"$choice`",`"confidence`":0.9},`"profile`":{`"type`":`"choice`",`"choice`":`"gaming`",`"confidence`":0.8}},`"usage`":{`"input_tokens`":1,`"output_tokens`":0}}"
-        if ($served -eq 1) { $ctx.Response.StatusCode = 503 } # as llama-server does while loading
+        $auth = $ctx.Request.Headers['Authorization']
+        $bad = if ($FakeHosted) { $BadAnswer -and $served % 2 -eq 0 } else { $BadAnswer }
+        $choice = if ($bad) { 'banana' } else { 'gaming' }
+        # A bad hosted answer echoes the header, to prove that output hides the key.
+        $echo = if ($bad -and $FakeHosted) { $auth } else { '' }
+        $json = "{`"model`":`"fake`",`"echo`":`"$echo`",`"answers`":{`"workload`":{`"type`":`"choice`",`"choice`":`"$choice`",`"confidence`":0.9},`"profile`":{`"type`":`"choice`",`"choice`":`"gaming`",`"confidence`":0.8}},`"usage`":{`"input_tokens`":1,`"output_tokens`":0,`"cost`":0.00001}}"
+        if ($FakeHosted) {
+            if ($auth -ne "Bearer $env:OPENROUTER_API_KEY") { $ctx.Response.StatusCode = 401 }
+        } elseif ($env:OPENROUTER_API_KEY) { $ctx.Response.StatusCode = 500 } # a local server must not inherit the key
+        elseif ($served -eq 1) { $ctx.Response.StatusCode = 503 } # as llama-server does while loading
         elseif ($Escape) { (Get-Process -Id $PID).ProcessorAffinity = [IntPtr]1 }
         $bytes = [Text.Encoding]::UTF8.GetBytes($json)
         $ctx.Response.ContentType = 'application/json'
@@ -213,7 +272,15 @@ function Invoke-FakeServer {
 
 function Invoke-SelfTest {
     $ErrorActionPreference = 'Continue' # a child's stderr is test output here, not a failure
-    $failed = 0
+    # A dummy key for every child; the real one is never used and comes back at the end.
+    $testKey = 'selftest-not-a-real-key'
+    $realKey = $env:OPENROUTER_API_KEY
+    $env:OPENROUTER_API_KEY = $testKey
+    try { Invoke-SelfTestChecks } finally { [Environment]::SetEnvironmentVariable('OPENROUTER_API_KEY', $realKey) }
+}
+
+function Invoke-SelfTestChecks {
+    $script:failed = 0
     function Check($name, $ok) { if ($ok) { Write-Host "PASS $name" } else { Write-Host "FAIL $name"; $script:failed++ } }
     $one = 1..50
     Check 'p50 of 1..50 is 25' ((Get-Percentile $one 50) -eq 25)
@@ -246,17 +313,47 @@ function Invoke-SelfTest {
     $busy = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, $fp); $busy.Start()
     try { $r = Run '' @('-Count', '1') } finally { $busy.Stop() }
     Check 'refuses an already running server' ($r.Code -eq 1 -and $r.Out -match 'already listens')
-    if ($failed) { Write-Host "$failed self-test(s) FAILED"; return 1 }
+
+    function RunHosted($flags, $keyForClient) {
+        $server = Start-Process powershell.exe "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -FakeServer -FakeHosted -Port $fp $flags" -PassThru -NoNewWindow
+        try {
+            $deadline = (Get-Date).AddSeconds(30)
+            while (-not (Test-Listening) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 100 }
+            [Environment]::SetEnvironmentVariable('OPENROUTER_API_KEY', $keyForClient)
+            $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath -Hosted -HostedToFake -Port $fp -Count 5 -TimeoutSec 30 *>&1 | Out-String
+            [pscustomobject]@{ Code = $LASTEXITCODE; Out = $out }
+        } finally {
+            [Environment]::SetEnvironmentVariable('OPENROUTER_API_KEY', $testKey)
+            Stop-Server $server
+        }
+    }
+    $r = RunHosted '' $testKey
+    Check 'hosted: 5/5, sends the key and the model' ($r.Code -eq 0 -and $r.Out -match '5/5 answered, typesafe/jev-1\.14' -and $r.Out -match 'outside the schema: 0')
+    Check 'hosted: the key is not in the output' ($r.Out -notmatch $testKey)
+    $r = RunHosted '-BadAnswer' $testKey
+    Check 'hosted: counts answers outside the schema and keeps going' ($r.Code -eq 1 -and $r.Out -match '5/5 answered' -and $r.Out -match 'outside the schema: 2')
+    Check 'hosted: an echoed key is hidden' ($r.Out -match '\[key\]' -and $r.Out -notmatch $testKey)
+    $r = RunHosted '' 'selftest-wrong-key'
+    Check 'hosted: a rejected key fails without printing it' ($r.Code -eq 1 -and $r.Out -match '401' -and $r.Out -notmatch 'selftest-wrong-key')
+    $r = RunHosted '' $null
+    Check 'hosted: no key, no request' ($r.Code -eq 1 -and $r.Out -match 'is not set')
+    if ($script:failed) { Write-Host "$script:failed self-test(s) FAILED"; return 1 }
     Write-Host 'self-test passed'
     0
 }
 
 if ($FakeServer) { Invoke-FakeServer; exit 0 }
+$me = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+if ($me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Host 'FAIL: this window is elevated. Run this script from a normal window (only PresentMon needs admin).'
+    exit 1
+}
 if ($SelfTest) { exit (Invoke-SelfTest) }
-if (-not $Exe) { throw '-Exe is required (see decision-models.md)' }
+if ($Hosted) { exit (Invoke-HostedBenchmark) }
+if (-not $Exe) { throw '-Exe or -Hosted is required (see decision-models.md)' }
 
-# Inherited by the server: one thread, CPU only. Restored because the script may run in your shell.
-$threadEnv = @{ OMP_NUM_THREADS = '1'; MKL_NUM_THREADS = '1'; OLLAYA_THREADS = '1'; OLLAYA_DEVICE = 'cpu'; CUDA_VISIBLE_DEVICES = '-1' }
+# Inherited by the server: one thread, CPU only, no key. Restored because the script may run in your shell.
+$threadEnv = @{ OMP_NUM_THREADS = '1'; MKL_NUM_THREADS = '1'; OLLAYA_THREADS = '1'; OLLAYA_DEVICE = 'cpu'; CUDA_VISIBLE_DEVICES = '-1'; OPENROUTER_API_KEY = $null }
 $saved = @{}
 foreach ($k in $threadEnv.Keys) { $saved[$k] = [Environment]::GetEnvironmentVariable($k); [Environment]::SetEnvironmentVariable($k, $threadEnv[$k]) }
 try { $code = Invoke-Benchmark } finally { foreach ($k in $saved.Keys) { [Environment]::SetEnvironmentVariable($k, $saved[$k]) } }

@@ -48,6 +48,9 @@ PC: Ryzen 5 5600 (6 cores, 12 threads), 16 GB RAM, RTX 4060. Python is not insta
 | --- | --- | --- | --- | --- | --- |
 | Strands 2B, Ollaya, idle PC | not measured | not measured | not measured | not measured | not measured |
 | Clef-flash Q4_K_M, llama-server, idle PC | not measured | not measured | not measured | not measured | not measured |
+| Jev 1.14 hosted, OpenRouter, from this PC | not measured | not measured | n/a | n/a | n/a |
+
+Hosted answers outside the schema: not measured. Hosted decisions over 2 s (the SPEC §7.2 fallback limit): not measured.
 
 ### What runs on this PC (from upstream docs, not tested here)
 
@@ -122,25 +125,62 @@ powershell -ExecutionPolicy Bypass -File docs\dev\research\decision-latency.ps1 
 
 A request that takes over 300 s fails the run. Raise it with `-TimeoutSec` if one core really is that slow, and record that. Add the numbers to the results table.
 
+The script refuses to run in an elevated window, so use a normal one. PresentMon is the only part that runs as admin.
+
+### Measure hosted Jev 1.14
+
+This sends the same 50 decisions to `typesafe/jev-1.14` through [OpenRouter's `/api/v1/systemone`](https://openrouter.ai/docs/guides/community/typesafe-sdk) and costs real credit, about $0.042 per 1M input tokens. The exe names come from the script's fixed list and the readings are generated, so nothing from your PC is sent. Run it from a normal window:
+
+```powershell
+[bool]$env:OPENROUTER_API_KEY     # must print True
+powershell -ExecutionPolicy Bypass -File docs\dev\research\decision-latency.ps1 -Hosted
+```
+
+- **Key:** it comes from `$env:OPENROUTER_API_KEY` only, goes only to the OpenRouter URL, and redirects are refused. It is never written to a file or printed, and local model servers don't inherit it. If you set it by hand, don't type the value at a prompt, because PSReadLine may save the line to its history file.
+- **Report:** median and p95 of all answered requests, the count over 2 s, the count outside the schema, the model snapshot that answered, and the cost. An answer outside the schema is printed and counted, and the run continues and exits 1.
+- **HTTP errors:** the first one (rate limit, no credit, bad key) stops the run, with partial numbers marked as partial. It doesn't retry, because that would hide the real latency.
+- **Connections:** every call opens a new TLS connection, as a call every 60 s would. This is latency from your PC to OpenRouter and back, on your connection at that time.
+
 ### Measure the FPS cost
 
-Use the model and route that passed latency. Get [PresentMon](https://github.com/GameTechDev/PresentMon/releases) (console build) and open an **administrator** PowerShell in the repo. `$pm` is the path to its exe and `$game` is the game's exe name, for example `cs2.exe`.
+Use the model and route that passed latency. Get [PresentMon](https://github.com/GameTechDev/PresentMon/releases) (console build). This needs two windows, and both wait for the next whole minute so that they start together:
+
+**Admin window (PresentMon only).** `$pm` is the path to its exe and `$game` is the game's exe name, for example `cs2.exe`:
+
+```powershell
+$pm = "C:\path\to\PresentMon-x64.exe"; $game = "cs2.exe"
+New-Item -ItemType Directory -Force "$env:LOCALAPPDATA\fps-spike"; Set-Location "$env:LOCALAPPDATA\fps-spike"
+```
+
+**Normal window (the latency script, never elevated), in the repo:**
+
+```powershell
+$ollaya = (Get-ChildItem "$env:LOCALAPPDATA\ollaya-spike\bin" -Recurse -Filter ollaya.exe).FullName
+```
 
 1. **Set up the scene.** Pick one repeatable scene, ideally the game's built-in benchmark. Turn off V-Sync and frame caps, since a cap hides the cost. Prefer a CPU-limited setting (low resolution), because a GPU-limited scene hides a cost that lands on the CPU. Keep ThermalIQ's state and the power plan the same across runs. Let the game warm up for 2 minutes first.
-2. **Run without the model (2 min).** Start the command, then alt-tab to the game within 15 s and start the scene as the capture begins:
+2. **Run without the model (2 min).** In the admin window only, start this right after a minute turns over. Then alt-tab to the game and start the scene as the minute turns:
 
    ```powershell
-   Start-Sleep 15; & $pm --process_name $game --output_file without1.csv --timed 120 --terminate_after_timed --stop_existing_session --v1_metrics
+   while ((Get-Date).Second -ne 0) { Start-Sleep -Milliseconds 100 }; & $pm --process_name $game --output_file without1.csv --timed 120 --terminate_after_timed --stop_existing_session --v1_metrics
    ```
 
-3. **Run with the model (2 min, same scene).** This loads, decides and unloads at 0, 60 and 120 s, so it covers the on-demand load in SPEC §7.2:
+3. **Run with the model (2 min, same scene).** Start both commands right after a minute turns over, then alt-tab to the game. The script loads, decides and unloads at 0, 60 and 120 s, so it covers the on-demand load in SPEC §7.2.
+
+   Admin window:
 
    ```powershell
-   Start-Sleep 15; Start-Process $pm "--process_name $game --output_file with1.csv --timed 120 --terminate_after_timed --stop_existing_session --v1_metrics"; powershell -ExecutionPolicy Bypass -File docs\dev\research\decision-latency.ps1 -Exe $ollaya -ExeArgs serve -Model strands-decider:2b -Port 11435 -EverySeconds 60 -Count 3
+   while ((Get-Date).Second -ne 0) { Start-Sleep -Milliseconds 100 }; & $pm --process_name $game --output_file with1.csv --timed 120 --terminate_after_timed --stop_existing_session --v1_metrics
+   ```
+
+   Normal window:
+
+   ```powershell
+   while ((Get-Date).Second -ne 0) { Start-Sleep -Milliseconds 100 }; powershell -ExecutionPolicy Bypass -File docs\dev\research\decision-latency.ps1 -Exe $ollaya -ExeArgs serve -Model strands-decider:2b -Port 11435 -EverySeconds 60 -Count 3
    ```
 
 4. **Repeat steps 2 and 3 once**, saving to `without2.csv` and `with2.csv`, so that the order is without, with, without, with. If the two runs without the model differ by more than 1%, a 2% gate can't be read from this scene: pick a steadier scene or use more runs.
-5. **Compute the results:**
+5. **Compute the results** (admin window, where the CSVs are):
 
    ```powershell
    function Fps($f) { $ms = (Import-Csv $f).MsBetweenPresents | ForEach-Object { [double]$_ } | Sort-Object
@@ -198,3 +238,5 @@ Use the model and route that passed latency. Get [PresentMon](https://github.com
 - [Hugging Face: Pitaya1219/Clef-Flash-GGUF (minimum llama.cpp build)](https://huggingface.co/Pitaya1219/Clef-Flash-GGUF)
 - [Hugging Face: fabricant451 Strands GGUF](https://huggingface.co/fabricant451/strands-decider-2B-hobson-v19-GGUF)
 - [PresentMon console docs](https://github.com/GameTechDev/PresentMon/blob/main/README-ConsoleApplication.md)
+- [OpenRouter: TypeSafe SDK and /api/v1/systemone](https://openrouter.ai/docs/guides/community/typesafe-sdk)
+- [TypeSafe API reference: choice answers](https://docs.typesafe.ai/api)
