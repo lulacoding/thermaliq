@@ -105,6 +105,8 @@ pub fn router(state: ApiState) -> Router {
             post(set_override).delete(cancel_override),
         )
         .route("/config", put(put_config))
+        .route("/agent/pause", post(pause_agent))
+        .route("/agent/resume", post(resume_agent))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer,
@@ -218,6 +220,7 @@ fn status_json(c: &Cache) -> Value {
         "snapshot_age": c.snapshot_age,
         "active_profile": c.active_profile,
         "ticks": c.ticks,
+        "agent": c.status.agent.as_str(),
     })
 }
 
@@ -306,6 +309,21 @@ async fn cancel_override(State(s): State<ApiState>, Path(fan): Path<String>) -> 
     Ok(Json(json!({"fan": fan, "override": "cancelled"})))
 }
 
+/// Withdraws the agent's requests at once; the profile runs as if the agent were off.
+async fn pause_agent(State(s): State<ApiState>) -> ApiResult {
+    s.handle.pause_agent().await?;
+    Ok(Json(
+        json!({"agent": s.handle.cache().status.agent.as_str()}),
+    ))
+}
+
+async fn resume_agent(State(s): State<ApiState>) -> ApiResult {
+    s.handle.resume_agent().await?;
+    Ok(Json(
+        json!({"agent": s.handle.cache().status.agent.as_str()}),
+    ))
+}
+
 async fn get_config(State(s): State<ApiState>) -> ApiResult {
     let dir = s.dir.clone();
     let cfg = tokio::task::spawn_blocking(move || load_config(&dir))
@@ -354,6 +372,7 @@ fn frame(c: &Cache) -> Message {
         "degraded": c.status.degraded,
         "waiting_on": c.status.waiting_on,
         "unavailable_sources": c.status.unavailable_sources,
+        "agent": c.status.agent.as_str(),
     });
     v["sensors"] = json!(c.snapshot.sensors);
     v["fans"] = json!(c.snapshot.fans);
@@ -595,6 +614,50 @@ mod tests {
         assert_eq!(v["waiting_on"], json!([]));
         assert_eq!(v["snapshot_age"], 0);
         assert_eq!(v["active_profile"], "flat");
+    }
+
+    #[tokio::test]
+    async fn status_shows_the_agent_state_and_pause_resume_change_it() {
+        let r = rig(vec![at(40.0)]);
+        ticked(&r).await;
+        assert_eq!(get(&r, "/status").await.1["agent"], "running");
+        let (code, v) = call(&r, "POST", "/agent/pause", Some(TOKEN), None).await;
+        assert_eq!((code, &v["agent"]), (StatusCode::OK, &json!("paused")));
+        assert_eq!(get(&r, "/status").await.1["agent"], "paused");
+        let (code, v) = call(&r, "POST", "/agent/resume", Some(TOKEN), None).await;
+        assert_eq!((code, &v["agent"]), (StatusCode::OK, &json!("running")));
+        assert_eq!(get(&r, "/status").await.1["agent"], "running");
+    }
+
+    #[tokio::test]
+    async fn pausing_or_resuming_the_agent_needs_the_token() {
+        let r = rig(vec![at(40.0)]);
+        ticked(&r).await;
+        for path in ["/agent/pause", "/agent/resume"] {
+            let (code, _) = call(&r, "POST", path, None, None).await;
+            assert_eq!(code, StatusCode::UNAUTHORIZED, "{path}");
+            let (code, _) = call(&r, "POST", path, Some("wrong"), None).await;
+            assert_eq!(code, StatusCode::UNAUTHORIZED, "{path}");
+        }
+        assert_eq!(get(&r, "/status").await.1["agent"], "running");
+    }
+
+    #[tokio::test]
+    async fn pause_after_the_engine_stopped_is_an_error_not_a_success() {
+        let r = rig(vec![at(40.0)]);
+        ticked(&r).await;
+        let state = r.state.clone();
+        r.daemon.shutdown().unwrap();
+        let res = router(state)
+            .oneshot(
+                Request::post("/agent/pause")
+                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]

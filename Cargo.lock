@@ -931,6 +931,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thermaliq-agent",
  "thermaliq-common",
  "thermaliq-engine",
  "thermaliq-hal",

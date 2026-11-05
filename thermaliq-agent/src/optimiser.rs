@@ -5,10 +5,9 @@
 //! Lower only when every temperature the fan cools is known, under target, and the model,
 //! whose duty effect must be clearly negative, says it stays under target at the lowered
 //! duty. Anything unknown means no lowering. Raising is free.
-//! shortcut: the boost is a fixed +20 points, and `target` comes from the caller; derive both
-//! from the slider with the daemon wiring.
+//! shortcut: the boost is a fixed +20 points; revisit it with real-game data.
 
-use crate::inputs::Sample;
+use crate::inputs::{Component, Sample};
 use crate::model::ThermalModel;
 use std::time::Duration;
 use thermaliq_common::AGENT_MAX_LOWER_PCT;
@@ -19,6 +18,16 @@ pub const REQUEST_TTL: Duration = Duration::from_secs(3);
 /// A boost lasts at most this long, and re-arms only after this long without a need.
 pub const BOOST_MAX: Duration = Duration::from_secs(60);
 const BOOST_POINTS: u8 = 20;
+
+/// The temperature to hold, from the quiet ↔ cool slider (0–100): a straight line between
+/// the quiet target (GPU 80, CPU 85 °C) and the cool target (GPU 65, CPU 70 °C). SPEC §7.2.
+pub fn target(component: Component, slider: u8) -> f64 {
+    let (quiet, cool) = match component {
+        Component::Gpu => (80.0, 65.0),
+        Component::Cpu => (85.0, 70.0),
+    };
+    quiet + (cool - quiet) * f64::from(slider.min(100)) / 100.0
+}
 
 /// One temperature a fan cools. `sample`/`model` are `None` when unknown.
 pub struct Cooled<'a> {
@@ -141,6 +150,16 @@ mod tests {
 
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)
+    }
+
+    #[test]
+    fn targets_are_a_straight_line_from_quiet_to_cool() {
+        let t = |c, s| target(c, s);
+        assert_eq!((t(Component::Gpu, 0), t(Component::Gpu, 100)), (80.0, 65.0));
+        assert_eq!((t(Component::Cpu, 0), t(Component::Cpu, 100)), (85.0, 70.0));
+        assert_eq!((t(Component::Gpu, 50), t(Component::Cpu, 50)), (72.5, 77.5));
+        assert_eq!(t(Component::Gpu, 200), 65.0, "slider is clamped to 100");
+        assert_eq!(t(Component::Gpu, 20), 77.0);
     }
 
     #[test]
