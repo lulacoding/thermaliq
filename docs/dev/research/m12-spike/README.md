@@ -1,6 +1,6 @@
 # M12 spike: prove one case fan moves
 
-Throwaway console app, not product code. It answers three questions on Sam's PC before any bridge code is written. Results so far are at the end of this file. No fan has been shown to move yet.
+Throwaway console app, not product code. It answers three questions on Sam's PC before any bridge code is written. Results are at the end of this file.
 
 The fan step writes to a real fan header. Pick a case fan, or use a CPU header only at `-Duty 100`, never lower. The spike refuses headers named CPU or pump below 100%, and any duty under 20%, but many boards only say `Fan #2`, so check the header first. If the process is hard-killed or the power goes out during the 10 s, that fan keeps 60% until the next reboot. Ctrl-C and closing the window run the hand-back, and on an NCT6687D the check that it worked is `0A00` in `out\fan-after.txt` (see Results).
 
@@ -112,7 +112,7 @@ Cause: 0.9.6 restores with `mode & ~initial`, so it clears the flag only if it w
 
 **LHM `0.9.7-pre742`, control 5, starting from the BIOS (Sam's report):** both runs ended with `0A00 = 00` and duty `FF`, so the hand-back passes on this header. The same PawnIO disable and enable test also passed on this build (see below).
 
-**Fan movement:** not proven. Only the CPU fan reports RPM on this board, HWiNFO agrees, and no USB fan controller was found. The `moved` line in 0.9.6 run 2 was the CPU fan following its BIOS curve, not the spike. CPU fan at 100%: not run yet.
+**Fan movement, LHM `0.9.7-pre742` (from Sam's review on PR #56):** CPU fan (control 0) went from 62% to 100% for 10 s, **1675 → 2010 RPM**, and hand-back ended `0A00 = 00`. After the run the duty read 83% (`D3`), not 62%: with the flag clear, that is the BIOS's own ramp-down. Sam counts this as the spike gate. G3 still needs a case fan with a tach signal: only the CPU fan reports RPM on this board, HWiNFO agrees, and no USB fan controller was found. The `moved` line in 0.9.6 run 2 was the CPU fan following its BIOS curve, not the spike.
 
 **PawnIO unload (HWiNFO closed). `sc stop` tested on 0.9.6, `pnputil` on both 0.9.6 and pre742:**
 

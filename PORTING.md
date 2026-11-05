@@ -12,7 +12,7 @@ Stop and talk these through with Sam (in claude.ai) before any code for the modu
 
 - [x] **M20 / Agent:** brainstormed with Sam on 2026-11-04. The result is SPEC §7 and modules M20a–M20e below.
 - [x] **Metrics (small, after the agent brainstorm):** inputs settled in SPEC §7, so no separate brainstorm is needed. the snapshot currently has temperatures only. Add CPU/GPU load %, power (W) and maybe clocks: HWiNFO already exposes them, NVML has GPU load and power. Extend M10, M11 and history. M12 should report load from day one.
-- [x] **M12:** brainstormed with Sam on 2026-11-05. The result is SPEC §5.1 and the M12 module below. Still required before any bridge code: run the spike on Sam's PC and prove one case fan moves (`docs/dev/research/m12-spike/`).
+- [x] **M12:** brainstormed with Sam on 2026-11-05. The result is SPEC §5.1 and the M12 module below. Spike gate passed (Sam, PR #56): the CPU fan moved 1675 → 2010 RPM and hand-back worked (`docs/dev/research/m12-spike/`). G3 still needs a case fan with a tach signal.
 - [ ] **M13 (medium):** first-run fan identification UX (spin each header, "which fan moved?"); stable ID scheme across hardware changes.
 - [ ] **M18 (medium):** which screens matter; onboarding; keep v0 design or restyle; how a standard-user account gets the token. **Design in Claude Design first, code second:**
     1. Make a Design System artifact (colours, type, components): restyle from v0's look (dark, neon-green accent) or a fresh direction.
