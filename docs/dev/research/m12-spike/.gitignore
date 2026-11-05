@@ -1,0 +1,4 @@
+bin/
+obj/
+# LHM reports can include board identifiers. Paste only what's needed into the results.
+out/
