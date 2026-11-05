@@ -123,7 +123,7 @@ Decided in the agent brainstorm (Sam, 2026-11-04). Research: `docs/dev/research/
 - **Provider routing, in order:** (1) hosted Jev, when a key is set, the PC is online and an answer arrives within 2 s; (2) the local model, when the PC is idle; (3) a built-in list of well-known exes, for the workload question only; (4) ask the user.
 - **Keys:** each user brings their own OpenRouter or TypeSafe key, stored in the OS keychain. No key is shipped and there is no ThermalIQ proxy.
 - **Local model:** an open decision model (Strands Decider class; Clef-flash is deferred) behind an Ollaya-compatible endpoint (`TYPESAFE_BASE_URL`). It never runs while a game is in the foreground: if one comes to the foreground during a call, the call stops and the model unloads. When the PC is idle it may use up to half the cores at below-normal priority. M20c defines idle, which must rule out a game it doesn't recognise yet, and how cores are counted. It is loaded on demand and unloaded after use, so it isn't resident in VRAM. It may use the GPU only while GPU load is < 50%.
-- **Big calls** (accept a learned curve, create a profile): when both providers are available, both answer. Agreement → apply. Disagreement → ask the user.
+- **Big calls** (accept a learned curve, create a profile): when both providers are available, both answer. Agreement → apply. Disagreement → ask the user. With only one provider available, a big call applies only at or above the big-change threshold (§7.4); otherwise it asks.
 - Hosted requests contain numbers and exe names only. The user can turn hosted off at any time.
 - Nothing can answer: the fast layer keeps running, the slow layer's calls queue as questions for the user, and nothing pretends to have decided (S8).
 
