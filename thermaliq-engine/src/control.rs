@@ -93,6 +93,14 @@ impl FanControl {
         self.requests.len() != before
     }
 
+    /// The duty a source is asking for right now, after any clamping (as of the last tick).
+    pub(crate) fn request(&self, source: Source) -> Option<u8> {
+        self.requests
+            .iter()
+            .find(|r| r.source == source)
+            .map(|r| r.duty.min(100))
+    }
+
     /// Raises an Agent request up to `floor` (SPEC §7.2: never far below the curve).
     pub(crate) fn floor_agent(&mut self, floor: u8) {
         for r in self
