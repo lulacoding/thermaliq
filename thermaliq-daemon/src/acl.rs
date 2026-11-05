@@ -123,34 +123,69 @@ fn rights_mask(rights: &str) -> io::Result<u32> {
                 b"FR" => 0x12_0089,
                 b"FW" => 0x12_0116,
                 b"FX" => 0x12_00a0,
+                b"GA" => 0x1000_0000,
+                b"GX" => 0x2000_0000,
+                b"GW" => 0x4000_0000,
+                b"GR" => 0x8000_0000,
                 _ => return Err(io::Error::other(format!("unknown right {rights}"))),
             })
     })
 }
 
-/// `icacls /save` writes the SDDL, which names trustees by SID: no locale issues.
-pub fn read_dacl(path: &Path) -> io::Result<Dacl> {
+/// `icacls /save` writes the SDDL, which names trustees by SID: no locale issues. Each item is a
+/// line with its name, then a line with its SDDL.
+fn saved_sddl(path: &Path, tree: bool) -> io::Result<String> {
     static N: AtomicU32 = AtomicU32::new(0);
     let out = std::env::temp_dir().join(format!(
         "thermaliq-{}-{}.sddl",
         std::process::id(),
         N.fetch_add(1, Ordering::Relaxed)
     ));
-    let saved = icacls(&[&path.to_string_lossy(), "/save", &out.to_string_lossy()])
-        .and_then(|()| std::fs::read(&out));
+    let (p, o) = (path.to_string_lossy(), out.to_string_lossy());
+    let args: &[&str] = if tree {
+        &[&p, "/save", &o, "/T"]
+    } else {
+        &[&p, "/save", &o]
+    };
+    let saved = icacls(args).and_then(|()| std::fs::read(&out));
     let _ = std::fs::remove_file(&out);
     let units: Vec<u16> = saved?
         .chunks(2)
         .map(|c| u16::from_le_bytes([c[0], *c.get(1).unwrap_or(&0)]))
         .collect();
-    let text = String::from_utf16_lossy(&units);
-    let bad =
-        |what: &str| io::Error::other(format!("{what} in the SDDL of {}: {text}", path.display()));
+    Ok(String::from_utf16_lossy(&units))
+}
+
+pub fn read_dacl(path: &Path) -> io::Result<Dacl> {
+    let text = saved_sddl(path, false)?;
     let sddl = text
         .lines()
         .map(|l| l.trim_start_matches('\u{feff}'))
         .find(|l| l.starts_with("D:"))
-        .ok_or_else(|| bad("no DACL"))?;
+        .ok_or_else(|| {
+            io::Error::other(format!("no DACL in the SDDL of {}: {text}", path.display()))
+        })?;
+    parse_dacl(sddl, path)
+}
+
+/// Every item under `dir`, and `dir` itself, with its DACL.
+fn read_dacl_tree(dir: &Path) -> io::Result<Vec<(String, Dacl)>> {
+    let text = saved_sddl(dir, true)?;
+    let lines: Vec<&str> = text
+        .lines()
+        .map(|l| l.trim_start_matches('\u{feff}'))
+        .filter(|l| !l.is_empty())
+        .collect();
+    lines
+        .windows(2)
+        .filter(|w| w[1].starts_with("D:"))
+        .map(|w| Ok((w[0].to_owned(), parse_dacl(w[1], dir)?)))
+        .collect()
+}
+
+fn parse_dacl(sddl: &str, path: &Path) -> io::Result<Dacl> {
+    let bad =
+        |what: &str| io::Error::other(format!("{what} in the SDDL of {}: {sddl}", path.display()));
     let sddl = sddl.split("S:").next().unwrap_or(sddl); // drop any SACL
     let (head, rest) = sddl[2..].split_once('(').ok_or_else(|| bad("no entries"))?;
     let aces = rest
@@ -207,6 +242,85 @@ pub fn untrusted_owners(owners: &[(PathBuf, String)], installer_sid: &str) -> Ve
         .filter(|(_, o)| ![SYSTEM_SID, ADMINS_SID, installer_sid].contains(&o.as_str()))
         .map(|(p, _)| p.clone())
         .collect()
+}
+
+// ---- who could replace a program the service runs as SYSTEM ----
+
+const TRUSTED_INSTALLER_SID: &str =
+    "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+
+fn writer_is_trusted(sid: &str) -> bool {
+    ["SY", "BA", SYSTEM_SID, ADMINS_SID, TRUSTED_INSTALLER_SID].contains(&sid)
+}
+
+fn owner_is_trusted(sid: &str) -> bool {
+    [SYSTEM_SID, ADMINS_SID, TRUSTED_INSTALLER_SID].contains(&sid)
+}
+
+/// The owner of one item.
+fn owner_of(path: &Path) -> io::Result<String> {
+    const SCRIPT: &str = "$ErrorActionPreference='Stop'; \
+        (Get-Item -LiteralPath $env:TIQ_DIR -Force).GetAccessControl().GetOwner([System.Security.Principal.SecurityIdentifier]).Value";
+    let out = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT])
+        .env("TIQ_DIR", path)
+        .env_remove("PSModulePath")
+        .output()?;
+    let sid = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    if !out.status.success() || !sid.starts_with("S-1-") {
+        return Err(io::Error::other(format!(
+            "reading the owner of {} failed: {}",
+            path.display(),
+            String::from_utf8_lossy(&out.stderr)
+        )));
+    }
+    Ok(sid)
+}
+
+/// Entries in `d` that let anyone but SYSTEM, Administrators or TrustedInstaller change the item.
+/// Inherit-only entries don't apply to it (children are checked themselves), and a deny grants
+/// nothing. Any other kind, such as a conditional grant, isn't understood, so it isn't trusted.
+fn untrusted_writers(d: &Dacl) -> Vec<String> {
+    d.aces
+        .iter()
+        .filter(|a| !a.flags.contains("IO") && a.kind != "D")
+        .filter(|a| a.kind != "A" || (a.mask & WRITE_BITS != 0 && !writer_is_trusted(&a.sid)))
+        .map(|a| format!("{}:{}:{:#x}", a.kind, a.sid, a.mask))
+        .collect()
+}
+
+/// Everything that would let someone other than an administrator replace `exe`, which sits under
+/// `root` (`%ProgramFiles%`). An empty list means nobody can. Checks `root`, and the whole folder
+/// the app was installed in, not just the exe: a DLL beside it runs as SYSTEM too. An owner counts
+/// because it can rewrite the ACL, whatever the ACL says.
+pub fn replaceable_by_others(exe: &Path, root: &Path) -> io::Result<Vec<String>> {
+    let first = exe
+        .strip_prefix(root)
+        .ok()
+        .and_then(|rel| rel.components().next())
+        .ok_or_else(|| {
+            io::Error::other(format!("{} is not under {}", exe.display(), root.display()))
+        })?;
+    let app = root.join(first);
+    let mut problems = Vec::new();
+    for w in untrusted_writers(&read_dacl(root)?) {
+        problems.push(format!("{}: writable by {w}", root.display()));
+    }
+    let owner = owner_of(root)?;
+    if !owner_is_trusted(&owner) {
+        problems.push(format!("{} is owned by {owner}", root.display()));
+    }
+    for (name, d) in read_dacl_tree(&app)? {
+        for w in untrusted_writers(&d) {
+            problems.push(format!("{name}: writable by {w}"));
+        }
+    }
+    for (path, owner) in owners(&app)? {
+        if !owner_is_trusted(&owner) {
+            problems.push(format!("{} is owned by {owner}", path.display()));
+        }
+    }
+    Ok(problems)
 }
 
 // ---- checking it is exactly right ----
@@ -444,6 +558,191 @@ mod tests {
 
     fn grant(path: &Path, ace: &str) {
         icacls(&[&path.to_string_lossy(), "/grant", ace]).unwrap();
+    }
+
+    // ---- who may replace a program the service runs as SYSTEM ----
+
+    fn an_ace(kind: &str, flags: &str, mask: u32, sid: &str) -> Ace {
+        Ace {
+            kind: kind.into(),
+            flags: flags.into(),
+            mask,
+            sid: sid.into(),
+        }
+    }
+
+    fn only(a: Ace) -> Dacl {
+        Dacl {
+            protected: false,
+            aces: vec![a],
+        }
+    }
+
+    const TI: &str = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+
+    #[test]
+    fn only_system_admins_and_trustedinstaller_may_write() {
+        for sid in ["SY", "BA", TI, SYSTEM_SID, ADMINS_SID] {
+            assert!(
+                untrusted_writers(&only(an_ace("A", "", FULL, sid))).is_empty(),
+                "{sid}"
+            );
+        }
+        for sid in ["BU", "WD", "AU", "IU", "CO", "S-1-5-21-1-2-3-1001"] {
+            assert_eq!(
+                untrusted_writers(&only(an_ace("A", "", FULL, sid))).len(),
+                1,
+                "{sid}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_way_of_writing_counts_and_reading_does_not() {
+        for bit in [
+            0x2u32,
+            0x4,
+            0x10,
+            0x40,
+            0x100,
+            0x1_0000,
+            0x4_0000,
+            0x8_0000,
+            0x4000_0000,
+            0x1000_0000,
+        ] {
+            assert_eq!(
+                untrusted_writers(&only(an_ace("A", "", bit, "BU"))).len(),
+                1,
+                "{bit:#x}"
+            );
+        }
+        assert!(untrusted_writers(&only(an_ace("A", "", 0x12_00a9, "BU"))).is_empty());
+    }
+
+    #[test]
+    fn an_inherit_only_entry_or_a_deny_grants_nothing_here_but_an_unknown_kind_is_refused() {
+        // CREATOR OWNER on Program Files: it applies to children, which are checked themselves.
+        assert!(untrusted_writers(&only(an_ace("A", "OICIIO", FULL, "CO"))).is_empty());
+        assert!(untrusted_writers(&only(an_ace("D", "", FULL, "BU"))).is_empty());
+        assert_eq!(
+            untrusted_writers(&only(an_ace("XA", "", 0x1, "BU"))).len(),
+            1,
+            "a conditional grant isn't understood, so it isn't trusted"
+        );
+    }
+
+    #[test]
+    fn generic_rights_parse_as_sddl_writes_them() {
+        assert_eq!(rights_mask("GA").unwrap(), 0x1000_0000);
+        assert_eq!(rights_mask("GW").unwrap(), 0x4000_0000);
+        assert_eq!(rights_mask("GR").unwrap(), 0x8000_0000);
+        assert_eq!(rights_mask("GX").unwrap(), 0x2000_0000);
+        assert_eq!(rights_mask("GRGX").unwrap(), 0xa000_0000);
+    }
+
+    #[test]
+    fn the_real_program_files_can_be_read_and_is_safe_as_a_root() {
+        let root = PathBuf::from(std::env::var_os("ProgramFiles").unwrap());
+        let d = read_dacl(&root).unwrap();
+        assert_eq!(untrusted_writers(&d), Vec::<String>::new(), "{}", d.show());
+        assert!(owner_is_trusted(&owner_of(&root).unwrap()));
+    }
+
+    fn app_in(root: &Path) -> PathBuf {
+        let bin = root.join("App").join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(root.join("App").join("lib")).unwrap();
+        fs::write(bin.join("model.exe"), "x").unwrap();
+        fs::write(root.join("App").join("lib").join("dep.dll"), "x").unwrap();
+        bin.join("model.exe")
+    }
+
+    #[test]
+    fn a_folder_that_grants_users_write_is_refused() {
+        let t = tempfile::tempdir().unwrap();
+        let exe = app_in(t.path());
+        grant(&t.path().join("App"), "*S-1-5-32-545:(OI)(CI)M");
+        let p = replaceable_by_others(&exe, t.path()).unwrap();
+        assert!(p.iter().any(|m| m.contains("BU")), "{p:?}");
+    }
+
+    #[test]
+    fn a_dll_beside_the_exe_that_users_can_write_is_refused() {
+        let t = tempfile::tempdir().unwrap();
+        let exe = app_in(t.path());
+        let dll = t.path().join("App").join("lib").join("dep.dll");
+        grant(&dll, "*S-1-5-32-545:M");
+        let p = replaceable_by_others(&exe, t.path()).unwrap();
+        assert!(
+            p.iter().any(|m| m.contains("dep.dll") && m.contains("BU")),
+            "{p:?}"
+        );
+    }
+
+    #[test]
+    fn a_program_outside_the_root_or_unreadable_is_an_error_not_a_pass() {
+        let t = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let exe = app_in(other.path());
+        assert!(replaceable_by_others(&exe, t.path()).is_err());
+        let gone = t.path().join("Nope").join("x.exe");
+        assert!(replaceable_by_others(&gone, t.path()).is_err());
+    }
+
+    /// Needs an elevated token, to hand ownership to Administrators. CI is elevated.
+    #[test]
+    fn a_locked_down_install_passes_and_each_way_of_loosening_it_is_caught() {
+        let elevated = Command::new("net")
+            .arg("session")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !elevated {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "CI runner is not elevated"
+            );
+            eprintln!("skipped: not elevated");
+            return;
+        }
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("Root");
+        fs::create_dir(&root).unwrap();
+        let exe = app_in(&root);
+        let sid = installer_sid().unwrap();
+        let _g = Unlock(root.clone(), sid.clone());
+        let r = root.to_string_lossy().to_string();
+        icacls(&[
+            &r,
+            "/inheritance:r",
+            "/remove:g",
+            &format!("*{sid}"),
+            "/grant:r",
+            &format!("{SYSTEM}:(OI)(CI)F"),
+            &format!("{ADMINS}:(OI)(CI)F"),
+            &format!("{USERS}:(OI)(CI)RX"),
+        ])
+        .unwrap();
+        icacls(&[&format!("{r}\\*"), "/reset", "/T", "/C"]).unwrap();
+        icacls(&[&r, "/setowner", ADMINS, "/T", "/C"]).unwrap();
+        assert_eq!(
+            replaceable_by_others(&exe, &root).unwrap(),
+            Vec::<String>::new()
+        );
+        // the user owning a file can rewrite its ACL, whatever the ACL says
+        let dll = root.join("App").join("lib").join("dep.dll");
+        icacls(&[&dll.to_string_lossy(), "/setowner", &format!("*{sid}")]).unwrap();
+        let p = replaceable_by_others(&exe, &root).unwrap();
+        assert!(
+            p.iter()
+                .any(|m| m.contains("dep.dll") && m.contains("owned")),
+            "{p:?}"
+        );
+        icacls(&[&dll.to_string_lossy(), "/setowner", ADMINS]).unwrap();
+        // the root itself: a new folder could be planted beside the app, or the app renamed
+        grant(&root, "*S-1-5-32-545:M");
+        let p = replaceable_by_others(&exe, &root).unwrap();
+        assert!(p.iter().any(|m| m.contains("BU")), "{p:?}");
     }
 
     #[test]

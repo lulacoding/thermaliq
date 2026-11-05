@@ -73,7 +73,16 @@ CREATE TABLE IF NOT EXISTS metric_readings (
     recorded_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_metric_readings ON metric_readings(metric_id, recorded_at);
-CREATE INDEX IF NOT EXISTS idx_metric_time ON metric_readings(recorded_at);";
+CREATE INDEX IF NOT EXISTS idx_metric_time ON metric_readings(recorded_at);
+CREATE TABLE IF NOT EXISTS exe_workloads (
+    exe TEXT PRIMARY KEY,
+    workload TEXT NOT NULL,
+    source TEXT NOT NULL,
+    confidence REAL
+);";
+
+/// exe → (workload, source, confidence).
+pub type ExeWorkloads = std::collections::HashMap<String, (String, String, Option<f64>)>;
 
 pub struct HistoryDb(Connection);
 
@@ -92,6 +101,30 @@ impl HistoryDb {
     fn init(conn: Connection) -> rusqlite::Result<Self> {
         conn.execute_batch(SCHEMA)?;
         Ok(Self(conn))
+    }
+
+    /// The slow layer's per-exe answer (SPEC §7.2). Replaces any earlier one. Not pruned.
+    pub fn save_exe_workload(
+        &self,
+        exe: &str,
+        workload: &str,
+        source: &str,
+        confidence: Option<f64>,
+    ) -> rusqlite::Result<()> {
+        self.0.execute(
+            "INSERT OR REPLACE INTO exe_workloads (exe, workload, source, confidence) VALUES (?1, ?2, ?3, ?4)",
+            params![exe, workload, source, confidence],
+        )?;
+        Ok(())
+    }
+
+    /// Every saved answer.
+    pub fn exe_workloads(&self) -> rusqlite::Result<ExeWorkloads> {
+        let mut stmt = self
+            .0
+            .prepare("SELECT exe, workload, source, confidence FROM exe_workloads")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?, r.get(3)?))))?;
+        rows.collect()
     }
 
     /// Writes every reading of one tick atomically: all rows land or none do.
@@ -209,6 +242,22 @@ mod tests {
     use thermaliq_common::{HardwareSnapshot, MetricKind, Profile, SensorKind};
 
     const NOW: i64 = 100 * DAY;
+
+    #[test]
+    fn exe_answers_are_saved_replaced_and_survive_pruning() {
+        let mut db = HistoryDb::in_memory().unwrap();
+        db.save_exe_workload("a.exe", "gaming", "hosted", Some(0.9))
+            .unwrap();
+        db.save_exe_workload("b.exe", "other", "user", None)
+            .unwrap();
+        db.save_exe_workload("a.exe", "compiling", "user", None)
+            .unwrap();
+        db.prune(NOW).unwrap();
+        let rows = db.exe_workloads().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows["a.exe"], ("compiling".into(), "user".into(), None));
+        assert_eq!(rows["b.exe"].0, "other");
+    }
 
     fn s(id: &str, t: f32) -> SensorReading {
         SensorReading {

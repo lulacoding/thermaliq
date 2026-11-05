@@ -170,7 +170,14 @@ fn run_service() -> Result<(), String> {
     let started = store::data_dir()
         .map_err(|e| e.to_string())
         .and_then(|dir| Ok((dir, app::hardware()?)))
-        .and_then(|(dir, hal)| app::start(&dir, hal, Token::MustExist));
+        .and_then(|(dir, hal)| {
+            app::start(
+                &dir,
+                hal,
+                Token::MustExist,
+                app::ForegroundSource::ActiveUserSession,
+            )
+        });
     let running = match started {
         Ok(a) => a,
         Err(e) => {

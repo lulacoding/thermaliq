@@ -3,7 +3,9 @@
 //! only answers 200 once the engine thread (or the disk) has actually done it.
 
 use crate::history::HistoryDb;
+use crate::keychain::{Account, Key};
 use crate::runtime::{clamp_override, Cache, CommandError, Handle};
+use crate::slow::SlowShared;
 use crate::store::{load_config, save_config};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Request, State};
@@ -19,6 +21,8 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
+use thermaliq_agent::classifier::Workload;
+use thermaliq_agent::decision::{clean_exe, profile_for};
 use thermaliq_common::{DaemonConfig, Profile};
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
@@ -42,6 +46,7 @@ pub struct ApiState {
     config_lock: Arc<tokio::sync::Mutex<()>>,
     /// The port we are served on; only `Host: <loopback name>:<port>` is accepted.
     port: u16,
+    slow: SlowShared,
 }
 
 impl ApiState {
@@ -57,6 +62,7 @@ impl ApiState {
         history: Arc<Mutex<HistoryDb>>,
         token: String,
         dir: PathBuf,
+        slow: SlowShared,
     ) -> Self {
         Self {
             handle,
@@ -66,6 +72,7 @@ impl ApiState {
             dir: Arc::new(dir),
             config_lock: Arc::default(),
             port: 0,
+            slow,
         }
     }
 }
@@ -107,6 +114,9 @@ pub fn router(state: ApiState) -> Router {
         .route("/config", put(put_config))
         .route("/agent/pause", post(pause_agent))
         .route("/agent/resume", post(resume_agent))
+        .route("/agent/decisions", get(agent_decisions))
+        .route("/agent/key", put(put_key).delete(delete_key))
+        .route("/agent/workloads/{exe}", put(put_workload))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer,
@@ -338,6 +348,79 @@ async fn resume_agent(State(s): State<ApiState>) -> ApiResult {
     ))
 }
 
+/// What the slow layer has decided and what it needs answered. Behind the token: the exe names
+/// are a record of what this PC runs.
+async fn agent_decisions(State(s): State<ApiState>) -> ApiResult {
+    let v = s.slow.view();
+    let hosted = match s.slow.keys().get() {
+        Ok(Some(k)) => json!(k.account.name()),
+        Ok(None) => Value::Null,
+        Err(_) => json!("unreadable"),
+    };
+    let hosted_error = s
+        .slow
+        .hosted_error()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    Ok(Json(json!({
+        "hosted_account": hosted,
+        "hosted_error": hosted_error,
+        "local": v.local,
+        "foreground": v.foreground,
+        "crashed": v.crashed,
+        "questions": v.questions,
+        "decisions": v.decisions,
+    })))
+}
+
+#[derive(Deserialize)]
+struct KeyBody {
+    provider: String,
+    key: String,
+}
+
+/// Stores the user's own key (SPEC §7.2). It is never returned, by this or any other endpoint.
+async fn put_key(State(s): State<ApiState>, Json(b): Json<KeyBody>) -> ApiResult {
+    let bad = |m: &str| ApiError(StatusCode::BAD_REQUEST, m.into());
+    let account = Account::from_name(&b.provider).ok_or_else(|| bad("unknown provider"))?;
+    let key = Key::new(account, &b.key).ok_or_else(|| bad("that is not a usable key"))?;
+    s.slow.keys().set(&key).map_err(internal)?;
+    Ok(Json(json!({"hosted_account": account.name()})))
+}
+
+/// Turns hosted off at once (SPEC §7.2): routing moves on to the next step.
+async fn delete_key(State(s): State<ApiState>) -> ApiResult {
+    s.slow.keys().delete().map_err(internal)?;
+    Ok(Json(json!({"hosted_account": null})))
+}
+
+#[derive(Deserialize)]
+struct WorkloadBody {
+    workload: String,
+}
+
+/// The user's answer to a question, or a correction of any answer (a built-in default too).
+async fn put_workload(
+    State(s): State<ApiState>,
+    Path(exe): Path<String>,
+    Json(b): Json<WorkloadBody>,
+) -> ApiResult {
+    let bad = |m: &str| ApiError(StatusCode::BAD_REQUEST, m.into());
+    if clean_exe(&exe).as_deref() != Some(exe.as_str()) {
+        return Err(bad("exe must be a bare, lower-case file name"));
+    }
+    let workload = Workload::from_name(&b.workload).ok_or_else(|| bad("unknown workload"))?;
+    s.slow
+        .answer(&exe, workload, &s.history)
+        .map_err(internal)?;
+    Ok(Json(json!({
+        "exe": exe,
+        "workload": workload.name(),
+        "profile": profile_for(workload),
+    })))
+}
+
 async fn get_config(State(s): State<ApiState>) -> ApiResult {
     let dir = s.dir.clone();
     let cfg = tokio::task::spawn_blocking(move || load_config(&dir))
@@ -550,6 +633,10 @@ mod tests {
             db.clone(),
             TOKEN.into(),
             dir.path().into(),
+            SlowShared::new(
+                Arc::new(crate::keychain::MemoryKeys::default()),
+                "not configured".into(),
+            ),
         )
         .on_port(PORT);
         Rig {
@@ -641,6 +728,106 @@ mod tests {
         let (code, v) = call(&r, "POST", "/agent/resume", Some(TOKEN), None).await;
         assert_eq!((code, &v["agent"]), (StatusCode::OK, &json!("running")));
         assert_eq!(get(&r, "/status").await.1["agent"], "running");
+    }
+
+    // ---- the slow layer's endpoints (M20c) ----
+
+    #[tokio::test]
+    async fn the_slow_layers_endpoints_all_need_the_token() {
+        let r = rig(vec![at(40.0)]);
+        let body = json!({"provider": "openrouter", "key": "sk-or-secret"});
+        for (m, path, b) in [
+            ("GET", "/agent/decisions", None),
+            ("PUT", "/agent/key", Some(body)),
+            ("DELETE", "/agent/key", None),
+            (
+                "PUT",
+                "/agent/workloads/a.exe",
+                Some(json!({"workload": "gaming"})),
+            ),
+        ] {
+            let (code, _) = call(&r, m, path, None, b.clone()).await;
+            assert_eq!(code, StatusCode::UNAUTHORIZED, "{m} {path}");
+        }
+        let (_, v) = call(&r, "GET", "/agent/decisions", Some(TOKEN), None).await;
+        assert_eq!(v["hosted_account"], Value::Null, "nothing got stored");
+    }
+
+    #[tokio::test]
+    async fn a_key_is_stored_and_no_response_ever_contains_it() {
+        let r = rig(vec![at(40.0)]);
+        let body = json!({"provider": "openrouter", "key": "sk-or-secret"});
+        let (code, v) = call(&r, "PUT", "/agent/key", Some(TOKEN), Some(body)).await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(!v.to_string().contains("sk-or-secret"), "{v}");
+        let k = r.state.slow.keys().get().unwrap().unwrap();
+        assert_eq!(k.secret(), "sk-or-secret");
+        let (code, v) = call(&r, "GET", "/agent/decisions", Some(TOKEN), None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["hosted_account"], "openrouter");
+        assert!(!v.to_string().contains("sk-or-secret"), "{v}");
+        assert_eq!(v["hosted_error"], Value::Null);
+        *r.state.slow.hosted_error().lock().unwrap() = Some("HTTP 401".into());
+        let (_, v) = call(&r, "GET", "/agent/decisions", Some(TOKEN), None).await;
+        assert_eq!(
+            v["hosted_error"], "HTTP 401",
+            "a silent fallback hides a bad key"
+        );
+        let (code, _) = call(&r, "DELETE", "/agent/key", Some(TOKEN), None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(r.state.slow.keys().get().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_bad_key_or_provider_is_refused_and_nothing_is_stored() {
+        let r = rig(vec![at(40.0)]);
+        for body in [
+            json!({"provider": "evil", "key": "k"}),
+            json!({"provider": "openrouter", "key": ""}),
+            json!({"provider": "openrouter", "key": "two words"}),
+        ] {
+            let (code, _) = call(&r, "PUT", "/agent/key", Some(TOKEN), Some(body)).await;
+            assert_eq!(code, StatusCode::BAD_REQUEST);
+        }
+        assert!(r.state.slow.keys().get().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn the_users_workload_is_saved_before_it_says_so() {
+        let r = rig(vec![at(40.0)]);
+        let (code, v) = call(
+            &r,
+            "PUT",
+            "/agent/workloads/mystery.exe",
+            Some(TOKEN),
+            Some(json!({"workload": "rendering"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["profile"], "performance");
+        let rows = r.db.lock().unwrap().exe_workloads().unwrap();
+        assert_eq!(rows["mystery.exe"].1, "user");
+    }
+
+    #[tokio::test]
+    async fn a_bad_workload_or_exe_name_is_refused() {
+        let r = rig(vec![at(40.0)]);
+        for (exe, workload) in [
+            ("a.exe", "banana"),
+            ("a%5Cb.exe", "gaming"),
+            ("A.EXE", "gaming"),
+        ] {
+            let (code, _) = call(
+                &r,
+                "PUT",
+                &format!("/agent/workloads/{exe}"),
+                Some(TOKEN),
+                Some(json!({"workload": workload})),
+            )
+            .await;
+            assert_eq!(code, StatusCode::BAD_REQUEST, "{exe} {workload}");
+        }
+        assert!(r.db.lock().unwrap().exe_workloads().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1351,6 +1538,8 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
+        // The first frame goes out on connect: before the first tick it rightly has no sensors.
+        rt.block_on(ticked(&r));
         let ticks: Vec<u64> = rt.block_on(async {
             let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
             let mut ticks = vec![];

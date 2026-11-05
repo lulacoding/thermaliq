@@ -48,6 +48,9 @@ PC: Ryzen 5 5600 (6 cores, 12 threads), 16 GB RAM, RTX 4060. Python is not insta
 | --- | --- | --- | --- | --- |
 | Jev 1.14 hosted, OpenRouter, from this PC | 560 ms | 615 ms | n/a | n/a |
 | Strands 2B, Ollaya, core 11 at idle priority | 9,460 ms | 9,544 ms | 37,548 ms | 7,766 MB |
+| Strands 2B through the daemon, half the logical processors at below-normal, one call | n/a | n/a | 23.2 s, including load | 7,480 MB |
+
+The last row is from the M20c PC checks (`docs/dev/m20c-pc-checks.md`), on one new exe. Hosted answers on real exe-centric states there were 0.90 and 0.83, both for `idle`; the local answer was 0.38, also `idle`, so it asked.
 
 Not measured: Clef-flash (deferred) and FPS cost (test skipped). Strands 2B is about 17 times slower than hosted Jev at the median.
 
@@ -60,7 +63,7 @@ Not measured: Clef-flash (deferred) and FPS cost (test skipped). Strands 2B is a
 - **When the PC is idle,** the local model may use up to half the cores at below-normal priority. This setup hasn't been measured: the numbers above are for one core at idle priority.
 - **Clef-flash is deferred.**
 
-Still open for M20c: what counts as idle (it must rule out a game not recognised yet), how cores are counted, and the confidence thresholds. Only OpenRouter has been measured, not a TypeSafe key.
+Sam's review of PR #54 settled what counts as idle and as a game, and that thresholds are per provider and built-in answers are correctable defaults. M20c put these in SPEC §7.2 and §7.4. The threshold values are uncalibrated until M20e. Only OpenRouter has been measured, not a TypeSafe key.
 
 ### Local run: Strands 2B (Sam's PC, one run)
 
@@ -192,12 +195,16 @@ powershell -NoProfile -ExecutionPolicy Bypass -File docs\dev\research\decision-l
 - **HTTP errors:** the first one (rate limit, no credit, bad key) stops the run, prints the status and OpenRouter's error body with the key hidden, and marks partial numbers as partial. It doesn't retry, because that would hide the real latency.
 - **Connections:** every call opens a new TLS connection, as a call every 60 s would. This is latency from your PC to OpenRouter and back, on your connection at that time.
 
+### Setting up the local route for the service (M20c, not tested yet)
+
+The service runs the model as SYSTEM, so it only accepts an exe under `%ProgramFiles%` that nobody but administrators can replace, and it reads models from `<data dir>\models`. The steps are in `docs/dev/m20c-pc-checks.md`, step 5. Ollaya's install is `bin`, `lib` and `share`, and all of it must be copied.
+
 ### Not done
 
 - FPS test: skipped by Sam's decision above. The steps are in this file's git history (PR #54).
 - Accuracy on ThermalIQ's questions. The script prints each answer and confidence, but nothing is labelled.
 - Latency with the exe-centric, one-question state, and with the local model on half the cores.
-- The product side of M20c (DecisionProvider, routing, voting).
+- Scoring answers on exe-centric states. The PC checks ran only a handful, and nothing is labelled.
 
 ## Questions the M20 brainstorm answered (see SPEC §7)
 

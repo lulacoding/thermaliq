@@ -17,6 +17,8 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         [] => interactive(),
+        // Internal: started by the daemon in the user's session. Touches no hardware.
+        [thermaliq_daemon::foreground::HELPER_ARG] => thermaliq_daemon::foreground::run_helper(),
         #[cfg(windows)]
         ["--service"] => thermaliq_daemon::service::run(),
         #[cfg(windows)]
@@ -48,7 +50,12 @@ fn interactive() -> Result<(), String> {
     let hal = app::hardware()?;
     let dir = store::data_dir().map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let running = app::start(&dir, hal, Token::CreateIfMissing)?;
+    let running = app::start(
+        &dir,
+        hal,
+        Token::CreateIfMissing,
+        app::ForegroundSource::SameSession,
+    )?;
     let (stop, stopped) = mpsc::channel();
     ctrlc::set_handler(move || {
         let _ = stop.send(());
