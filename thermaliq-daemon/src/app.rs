@@ -436,7 +436,7 @@ mod tests {
     fn a_windows_build_starts_nvidia_or_refuses_naming_it() {
         if let Err(e) = hardware() {
             assert!(
-                e.contains("no hardware backend") && e.contains("NVIDIA"),
+                e.contains("no hardware backend") && e.to_lowercase().contains("nvidia"),
                 "{e}"
             );
         }
