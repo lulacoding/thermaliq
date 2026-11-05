@@ -132,7 +132,7 @@ Retrain the classifier and the thermal models on history. Search curve changes p
 ### 7.5 Evaluation (tests + M20 spike on Sam's PC)
 
 - Decisions: Brier score and accuracy against labelled history and user accept/undo.
-- Thermal model: mean error at 20 s ahead, ≤ 2 °C on held-out history.
+- Thermal model: mean error at 20 s ahead, ≤ 2 °C on held-out history, over windows where no input (load, power, duty) steps during the window. No model can foresee an unmeasured step, like a game starting. Errors over windows with a step are reported separately, not gated. Fitted coefficients must be physically possible (more duty never heats, more power never cools), or the fit is rejected: history is recorded in closed loop, where the curve sets duty from temperature, and that biases a naive fit.
 - Live optimiser: in mock-hardware tests, it never lowers a fan whose temperature is over target or predicted over target, and never goes past the 15-point limit.
 - Gaming cost: the local CPU decision model's FPS cost in a real game must be < 2% (average FPS, same scene, with and without it). If it fails, the local model doesn't run while a game is in the foreground, and its calls queue until the game closes.
 - Latency: the fast layer takes < 1 ms per tick. Slow-layer timing is logged per provider.
