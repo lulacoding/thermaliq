@@ -699,8 +699,20 @@ mod tests {
         wait_until(|| h.writes().iter().any(|(f, duty)| f == "f2" && *duty == 100));
         // `flat` never controls f2, so the original profile back means f2 is handed to the BIOS.
         wait_until(|| h.restores().contains(&"f2".to_owned()));
-        // And a new probe is refused until the first has finished, dropped or not.
-        assert!(id.probe(&d.handle(), &profiles, "f1").await.is_ok());
+        // The task still holds `probing` for a moment after the restore (it resumes the agent and
+        // builds its result), so a new probe may be Busy until then; once it is not, it must work.
+        let end = Instant::now() + Duration::from_secs(2);
+        loop {
+            match id.probe(&d.handle(), &profiles, "f1").await {
+                Err(ProbeError::Busy) if Instant::now() < end => {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                r => {
+                    assert!(r.is_ok(), "{r:?}");
+                    break;
+                }
+            }
+        }
     }
 
     #[tokio::test]
