@@ -9,7 +9,7 @@ Reference: the v0 code is tagged `v0-archive` (see `PORTING.md`). The audit that
 **The agent is the product** (decided by Sam, 2026-11-04). ThermalIQ is not a manual fan-control tool with an optional AI add-on. Instead of the user building curves and configuring every system fan, GPU fan, CPU cooler and AIO pump, the agent:
 
 1. **Sets up:** finds every fan and pump, calibrates each one, and works out which fan cools what by spinning each and watching which temperatures change.
-2. **Runs:** every second, a small learned model predicts temperatures and adjusts fans to the user's quiet ↔ cool goal, during gaming too. A Jev-style decision model (not an LLM) makes the bigger calls: which profile, whether to accept a learned curve.
+2. **Runs:** every second, a small learned model predicts temperatures and adjusts fans to the user's quiet ↔ cool goal, during gaming too. A Jev-style decision model (not an LLM) makes the bigger calls: which workload a new app is, whether to accept a learned curve.
 3. **Improves over time:** learns from history which settings meet the user's temperature goals with the least noise, per workload, and keeps tuning.
 
 All of this happens inside the SPEC §3 safety rules, which the agent can never override. Manual curves stay available as an advanced option. Underneath is a background service with a desktop UI, a CLI and a local API. Local-first: no cloud, no telemetry. A hosted decision model is only used if the user opts in.
@@ -116,7 +116,9 @@ Decided in the agent brainstorm (Sam, 2026-11-04). Research: `docs/dev/research/
   - *Which fan cools what:* until setup mapping (M20d) exists, a fan cools the component whose temperature sensor its profile curve reads. If the GPU, its load or its power cannot be named unambiguously, or no fan follows it, the agent leaves those fans to their curves.
 
 **Slow layer: every 60 s and whenever the foreground app changes. Decision model, not an LLM.**
-- Typed questions with confidence: the workload for an app not seen before (cached per exe afterwards); which profile to use; whether to accept a learned curve or a new profile.
+- Typed questions with confidence: the workload for an app not seen before (cached per exe afterwards); whether to accept a learned curve or a new profile.
+- **Profile choice is a fixed rule, not a model question:** idle → silent, browsing → efficiency, gaming → gaming, compiling and rendering → performance, other → balanced. A workload answer at or above its confidence threshold selects the profile, and applying it is a slow-layer change (§7.4). Below the threshold, nothing changes and the §7.4 ask applies.
+- **State sent to the model:** centred on the foreground exe: its name plus recent averages of load, power and temperature, not one instant reading. M20c chooses the averaging window.
 - **Provider routing:** hosted Jev when the user has added a key (OS keychain), is online, and gets an answer within 2 s. Otherwise local: an open decision model (Strands Decider / Clef-flash class) behind an Ollaya-compatible endpoint (`TYPESAFE_BASE_URL`). The local model runs on one CPU core at background priority. It is loaded on demand and unloaded after use, so it isn't resident in VRAM. It may use the GPU only while GPU load is < 50%.
 - **Big calls** (accept a learned curve, create a profile): when both providers are available, both answer. Agreement → apply. Disagreement → ask the user.
 - Hosted requests contain numbers and exe names only. The user can turn hosted off at any time.
@@ -167,3 +169,7 @@ Decided 2026-11-04 by Sam:
 - Linux moves to v2.1. v2.0 is Windows-only. CI still builds and tests on Ubuntu and macOS with mock hardware.
 - HWiNFO stays as an optional extra sensor source once the LHM bridge works.
 - LLM for profile generation: OpenRouter by default; any OpenAI-compatible base URL (e.g. local Ollama) can be configured.
+
+Decided 2026-11-05 by Sam:
+
+- The decision model no longer picks the profile. Profile answers were unreliable in the M20c spike, so a fixed workload → profile rule replaces that question, and the state centres on the exe (§7.2, `docs/dev/research/decision-models.md`).
