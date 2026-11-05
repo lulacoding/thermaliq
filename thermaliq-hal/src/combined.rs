@@ -54,7 +54,8 @@ impl CombinedHardwareLayer {
 
     /// A source that may be missing and owns fans (the LHM bridge). If its snapshot fails, its
     /// readings drop out as with `with_optional`, and S4 stays out of it: its own watchdog gives
-    /// its fans to the BIOS (S6). Writes to them fail until it is back.
+    /// its fans to the BIOS, or it is killed and its replacement does (S6). Writes to them fail
+    /// until it is back.
     pub fn with_optional_owner(
         mut self,
         name: &str,

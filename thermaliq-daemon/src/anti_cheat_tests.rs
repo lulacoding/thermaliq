@@ -302,7 +302,8 @@ fn a_mode_started_blocked_is_already_active_and_leaves_normally() {
 fn blockers_are_recognised_by_exact_exe_name_any_case() {
     assert!(is_blocker("faceitclient.exe"));
     assert!(is_blocker("FACEITClient.exe"));
-    assert!(is_blocker("FACEITService.exe"));
+    assert!(!is_blocker("faceit.exe"), "the desktop app loads no driver");
+    assert!(!is_blocker("FACEIT.exe"));
     assert!(!is_blocker("faceit-notes.exe"));
     assert!(!is_blocker("notepad.exe"));
 }

@@ -122,6 +122,9 @@ impl Starter {
 
 impl BridgeStarter for Starter {
     fn start(&mut self) -> Result<Box<dyn BridgeConnection>, String> {
+        if !self.kill() {
+            return Err("the previous bridge is still alive and can't be killed".into());
+        }
         let deadline = Instant::now() + START_BUDGET;
         let mut child = self.spawn()?;
         loop {
@@ -160,6 +163,8 @@ impl BridgeStarter for Starter {
                 return Err(exit_reason(status.code()));
             }
             if Instant::now() >= deadline {
+                self.child = Some(child);
+                self.kill();
                 return Err("the bridge did not open its pipe in time".into());
             }
             thread::sleep(POLL);
@@ -169,19 +174,42 @@ impl BridgeStarter for Starter {
     /// Never kills a bridge that is still exiting: it may be handing fans back. One still alive
     /// after the budget is wedged, and the next one restores from the saved originals.
     fn stop(&mut self) {
-        let Some(mut child) = self.child.take() else {
+        let Some(child) = self.child.as_mut() else {
             return;
         };
-        let deadline = Instant::now() + STOP_BUDGET;
-        while Instant::now() < deadline {
-            if matches!(child.try_wait(), Ok(Some(_))) {
-                return;
-            }
-            thread::sleep(POLL);
+        if exited_within(child, STOP_BUDGET) {
+            self.child = None;
+        } else {
+            eprintln!("the bridge did not exit in time, killing it");
+            self.kill();
         }
-        eprintln!("the bridge did not exit in time, killing it");
+    }
+
+    /// A bridge stuck inside a driver call can't die until that call returns, so the wait is
+    /// bounded and the child is kept for another try.
+    fn kill(&mut self) -> bool {
+        let Some(child) = self.child.as_mut() else {
+            return true;
+        };
         let _ = child.kill();
-        let _ = child.wait();
+        let gone = exited_within(child, STOP_BUDGET);
+        if gone {
+            self.child = None;
+        }
+        gone
+    }
+}
+
+fn exited_within(child: &mut Child, budget: Duration) -> bool {
+    let deadline = Instant::now() + budget;
+    loop {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(POLL);
     }
 }
 
@@ -229,13 +257,20 @@ fn read_reply(reader: &mut impl BufRead) -> io::Result<String> {
 }
 
 fn blocker_running() -> bool {
-    match win::process_names() {
+    let process = match win::process_names() {
         Ok(names) => names.iter().any(|n| anti_cheat::is_blocker(n)),
         Err(e) => {
-            eprintln!("cannot list processes, so no anti-cheat seen: {e}");
+            eprintln!("cannot list processes, so no anti-cheat process seen: {e}");
             false
         }
-    }
+    };
+    process
+        || anti_cheat::BLOCKER_SERVICES.iter().any(|name| {
+            win::service_active(name).unwrap_or_else(|e| {
+                eprintln!("cannot query service {name}, so it counts as stopped: {e}");
+                false
+            })
+        })
 }
 
 struct PnpDevice;
@@ -342,6 +377,47 @@ mod tests {
     fn a_reply_that_never_ends_is_an_error_not_unbounded_memory() {
         let endless = vec![b'x'; usize::try_from(MAX_REPLY_BYTES).unwrap() + 10];
         assert!(read_reply(&mut Cursor::new(endless)).is_err());
+    }
+
+    fn live_process() -> Child {
+        let root = std::env::var_os("SystemRoot").unwrap();
+        Command::new(Path::new(&root).join("System32").join("ping.exe"))
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    fn starter_with(child: Option<Child>) -> (tempfile::TempDir, Starter) {
+        let dir = tempfile::tempdir().unwrap();
+        let starter = Starter {
+            exe: dir.path().join("no-such-bridge.exe"),
+            data_dir: dir.path().to_owned(),
+            child,
+        };
+        (dir, starter)
+    }
+
+    #[test]
+    fn kill_ends_a_live_bridge_and_says_so() {
+        let mut child = live_process();
+        assert!(child.try_wait().unwrap().is_none());
+        let (_dir, mut starter) = starter_with(Some(child));
+        assert!(starter.kill());
+        assert!(starter.child.is_none());
+    }
+
+    #[test]
+    fn kill_with_no_bridge_is_done() {
+        let (_dir, mut starter) = starter_with(None);
+        assert!(starter.kill());
+    }
+
+    #[test]
+    fn starting_clears_a_bridge_still_left_alive_first() {
+        let (_dir, mut starter) = starter_with(Some(live_process()));
+        assert!(starter.start().is_err(), "this exe doesn't exist");
+        assert!(starter.child.is_none());
     }
 
     #[test]

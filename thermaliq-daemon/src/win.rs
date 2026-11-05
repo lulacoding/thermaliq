@@ -11,8 +11,8 @@ use std::path::Path;
 use std::process::Child;
 use std::ptr::{null, null_mut};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, SetHandleInformation, SetLastError, ERROR_NOT_FOUND, HANDLE,
-    HANDLE_FLAG_INHERIT, RECT,
+    CloseHandle, GetLastError, SetHandleInformation, SetLastError, ERROR_NOT_FOUND,
+    ERROR_SERVICE_DOES_NOT_EXIST, HANDLE, HANDLE_FLAG_INHERIT, RECT,
 };
 use windows_sys::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
@@ -32,6 +32,10 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::Pipes::{CreatePipe, GetNamedPipeServerProcessId};
 use windows_sys::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
+use windows_sys::Win32::System::Services::{
+    CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatus, SC_MANAGER_CONNECT,
+    SERVICE_QUERY_STATUS, SERVICE_STATUS, SERVICE_STOPPED,
+};
 use windows_sys::Win32::System::Threading::{
     CreateProcessAsUserW, DeleteProcThreadAttributeList, InitializeProcThreadAttributeList,
     OpenProcess, QueryFullProcessImageNameW, TerminateProcess, UpdateProcThreadAttribute,
@@ -361,6 +365,33 @@ pub fn process_names() -> io::Result<Vec<String>> {
     Ok(names)
 }
 
+/// Whether a service is in any state but stopped. One that isn't installed counts as stopped.
+pub fn service_active(name: &str) -> io::Result<bool> {
+    let manager = unsafe { OpenSCManagerW(null(), null(), SC_MANAGER_CONNECT) };
+    if manager.is_null() {
+        return Err(last_error());
+    }
+    let name = wide(OsStr::new(name));
+    let service = unsafe { OpenServiceW(manager, name.as_ptr(), SERVICE_QUERY_STATUS) };
+    let active = if service.is_null() {
+        match unsafe { GetLastError() } {
+            ERROR_SERVICE_DOES_NOT_EXIST => Ok(false),
+            _ => Err(last_error()),
+        }
+    } else {
+        let mut status: SERVICE_STATUS = unsafe { core::mem::zeroed() };
+        let read = if unsafe { QueryServiceStatus(service, &raw mut status) } == 0 {
+            Err(last_error())
+        } else {
+            Ok(status.dwCurrentState != SERVICE_STOPPED)
+        };
+        unsafe { CloseServiceHandle(service) };
+        read
+    };
+    unsafe { CloseServiceHandle(manager) };
+    active
+}
+
 // ---- a local model can't outlive the daemon ----
 
 /// Closing it (drop, or the process ending in any way) kills everything assigned to it,
@@ -520,6 +551,15 @@ mod tests {
             .find(|l| l.contains("probe leaked="))
             .map(str::to_owned);
         Some(line.unwrap_or_else(|| panic!("the child never reported: {text}")))
+    }
+
+    #[test]
+    fn a_running_service_is_active_and_a_missing_one_is_not() {
+        assert!(
+            service_active("RpcSs").unwrap(),
+            "Windows can't run without it"
+        );
+        assert!(!service_active("thermaliq-no-such-service").unwrap());
     }
 
     #[test]

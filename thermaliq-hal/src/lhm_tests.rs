@@ -17,9 +17,12 @@ struct Shared {
     hang_on: Mutex<Option<String>>,
     starts: AtomicUsize,
     stops: AtomicUsize,
+    kills: AtomicUsize,
+    unkillable: AtomicBool,
     fail_start: AtomicBool,
     die_next: AtomicBool,
     bad_id_next: AtomicBool,
+    slow_hello: AtomicBool,
 }
 
 impl Shared {
@@ -30,6 +33,14 @@ impl Shared {
             .iter()
             .map(|r| r["op"].as_str().unwrap().to_owned())
             .collect()
+    }
+
+    fn hellos(&self) -> usize {
+        self.ops().iter().filter(|o| *o == "hello").count()
+    }
+
+    fn hang_on(&self, op: &str) {
+        *self.hang_on.lock().unwrap() = Some(op.into());
     }
 
     fn sets(&self) -> Vec<(String, u64)> {
@@ -59,7 +70,14 @@ impl BridgeConnection for FakeConnection {
             return Err(std::io::Error::other("pipe broke"));
         }
         if self.0.hang_on.lock().unwrap().as_deref() == Some(op.as_str()) {
-            thread::sleep(Duration::from_secs(60));
+            // A hung bridge answers nothing until it is killed, which breaks the pipe.
+            while self.0.hang_on.lock().unwrap().is_some() {
+                thread::sleep(Duration::from_millis(5));
+            }
+            return Err(std::io::Error::other("the bridge was killed"));
+        }
+        if op == "hello" && self.0.slow_hello.load(Ordering::SeqCst) {
+            thread::sleep(timing().hang * 2);
         }
         let id = if self.0.bad_id_next.swap(false, Ordering::SeqCst) {
             json!(999_999)
@@ -91,6 +109,10 @@ struct FakeStarter(Arc<Shared>);
 
 impl BridgeStarter for FakeStarter {
     fn start(&mut self) -> Result<Box<dyn BridgeConnection>, String> {
+        // The real starter's rule: never a second bridge while an old one is alive.
+        if self.0.unkillable.load(Ordering::SeqCst) {
+            return Err("the old bridge is still alive".into());
+        }
         self.0.starts.fetch_add(1, Ordering::SeqCst);
         if self.0.fail_start.load(Ordering::SeqCst) {
             return Err("no bridge".into());
@@ -100,6 +122,15 @@ impl BridgeStarter for FakeStarter {
 
     fn stop(&mut self) {
         self.0.stops.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn kill(&mut self) -> bool {
+        self.0.kills.fetch_add(1, Ordering::SeqCst);
+        if self.0.unkillable.load(Ordering::SeqCst) {
+            return false;
+        }
+        *self.0.hang_on.lock().unwrap() = None;
+        true
     }
 }
 
@@ -128,6 +159,8 @@ fn timing() -> Timing {
         call: Duration::from_millis(200),
         heartbeat: Duration::from_millis(20),
         retry: Duration::from_millis(20),
+        hang: Duration::from_millis(300),
+        shutdown: Duration::from_millis(400),
     }
 }
 
@@ -266,6 +299,75 @@ fn a_wedged_call_times_out_instead_of_blocking() {
 fn the_default_call_timeout_is_two_seconds_and_the_heartbeat_one() {
     assert_eq!(Timing::default().call, Duration::from_secs(2));
     assert_eq!(Timing::default().heartbeat, Duration::from_secs(1));
+}
+
+#[test]
+fn a_hung_bridge_is_killed_at_the_limit_restarted_and_degraded_until_it_is_back() {
+    let (shared, b) = make();
+    shared.fail_start.store(true, Ordering::SeqCst); // hold it down so the middle can be seen
+    shared.hang_on("set");
+    let began = std::time::Instant::now();
+    assert!(b.set_fan_duty(FAN, 60).is_err());
+    wait_until("the kill", || shared.kills.load(Ordering::SeqCst) == 1);
+    assert!(began.elapsed() >= timing().hang, "{:?}", began.elapsed());
+    wait_until("a report", || !b.degraded_reasons().is_empty());
+    assert!(b.degraded_reasons()[0].contains("hung"));
+    assert_eq!(shared.hellos(), 1, "not back yet");
+
+    shared.fail_start.store(false, Ordering::SeqCst);
+    wait_until("the restart", || shared.hellos() == 2);
+    wait_until("the report clearing", || b.degraded_reasons().is_empty());
+    b.set_fan_duty(FAN, 60).unwrap();
+}
+
+#[test]
+fn a_bridge_hung_with_no_callers_is_caught_on_its_heartbeat() {
+    let (shared, _b) = make();
+    shared.hang_on("heartbeat");
+    wait_until("the kill", || shared.kills.load(Ordering::SeqCst) == 1);
+    wait_until("the restart", || shared.hellos() == 2);
+}
+
+#[test]
+fn a_bridge_that_will_not_die_stays_degraded_says_so_and_gets_no_second_bridge() {
+    let (shared, b) = make();
+    shared.unkillable.store(true, Ordering::SeqCst);
+    shared.hang_on("snapshot");
+    assert!(b.snapshot().is_err());
+    wait_until("the report", || !b.degraded_reasons().is_empty());
+    assert!(b.degraded_reasons()[0].contains("can't be killed"));
+    thread::sleep(timing().retry * 5);
+    assert_eq!(shared.starts.load(Ordering::SeqCst), 1);
+    assert!(b.snapshot().is_err());
+
+    // It finally dies: the next retry starts a fresh bridge and the report goes.
+    shared.unkillable.store(false, Ordering::SeqCst);
+    *shared.hang_on.lock().unwrap() = None;
+    wait_until("the restart", || shared.hellos() == 2);
+    wait_until("the report clearing", || b.degraded_reasons().is_empty());
+}
+
+#[test]
+fn a_shutdown_that_hangs_is_killed_reported_and_not_restarted_while_suspended() {
+    let (shared, b) = make();
+    shared.hang_on("shutdown");
+    assert!(b.suspend().is_err());
+    assert_eq!(shared.kills.load(Ordering::SeqCst), 1);
+    thread::sleep(timing().retry * 5);
+    assert_eq!(shared.starts.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn a_slow_hello_is_a_cold_start_not_a_hang() {
+    let shared = Arc::new(Shared::default());
+    shared.slow_hello.store(true, Ordering::SeqCst);
+    LhmBridge::with_timing(Box::new(FakeStarter(shared.clone())), timing()).unwrap();
+    assert_eq!(shared.kills.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn the_default_hang_limit_is_five_seconds() {
+    assert_eq!(Timing::default().hang, Duration::from_secs(5));
 }
 
 #[test]

@@ -6,8 +6,8 @@ use crate::{Capabilities, HalError, HardwareLayer};
 use serde_json::{json, Value};
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
-use std::sync::Mutex;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use thermaliq_common::{
@@ -17,8 +17,6 @@ use thermaliq_common::{
 const PROTOCOL: u64 = 1;
 /// Starting the bridge opens LHM, which can be slow on a cold start. Not a per-tick call.
 const START_TIMEOUT: Duration = Duration::from_secs(15);
-/// `shutdown` restores every header in turn, so it gets longer than a single call.
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// One connected bridge. A blocking request and its reply, as JSON lines.
 pub trait BridgeConnection: Send {
@@ -30,6 +28,10 @@ pub trait BridgeStarter: Send + 'static {
     fn start(&mut self) -> Result<Box<dyn BridgeConnection>, String>;
     /// The connection is finished with. The bridge exits by itself when its client goes.
     fn stop(&mut self);
+    /// Kills a bridge that stopped answering, and says whether it has gone. Its record of the
+    /// originals stays, so the next bridge hands the fans back. `start` must refuse to run a
+    /// second bridge while this one is alive: both would write to one chip.
+    fn kill(&mut self) -> bool;
 }
 
 #[derive(Clone, Copy)]
@@ -37,6 +39,10 @@ pub struct Timing {
     pub call: Duration,
     pub heartbeat: Duration,
     pub retry: Duration,
+    /// How long one request may go unanswered before the bridge counts as hung.
+    pub hang: Duration,
+    /// `shutdown` restores every header in turn, so it gets longer than a single request.
+    pub shutdown: Duration,
 }
 
 impl Default for Timing {
@@ -46,6 +52,8 @@ impl Default for Timing {
             call: Duration::from_secs(2),
             heartbeat: Duration::from_secs(1),
             retry: Duration::from_secs(5),
+            hang: Duration::from_secs(5),
+            shutdown: Duration::from_secs(6),
         }
     }
 }
@@ -56,8 +64,9 @@ enum Msg {
     Resume,
 }
 
-/// The bridge runs on one worker thread, so a wedged pipe only stalls that thread: callers give
-/// up at the deadline, and the bridge's own watchdog hands the fans back (S6).
+/// The bridge runs on one worker thread, so callers give up at their deadline whatever the pipe
+/// does. The bridge's own watchdog can't cover a request stuck inside LHM or PawnIO, because both
+/// hold one lock, so the worker kills a bridge that stops answering (S6).
 pub struct LhmBridge {
     worker: Sender<Msg>,
     timing: Timing,
@@ -65,6 +74,8 @@ pub struct LhmBridge {
     /// In anti-cheat mode: the bridge is stopped on purpose and the BIOS has the fans.
     suspended: AtomicBool,
     degraded: Mutex<Vec<String>>,
+    /// Why the worker killed the bridge, until a new one says hello.
+    killed: Arc<Mutex<Option<String>>>,
 }
 
 impl LhmBridge {
@@ -75,9 +86,11 @@ impl LhmBridge {
     pub fn with_timing(starter: Box<dyn BridgeStarter>, timing: Timing) -> Result<Self, HalError> {
         let (worker, jobs) = mpsc::channel();
         let (ready, started) = mpsc::channel();
+        let killed = Arc::new(Mutex::new(None));
+        let reason = killed.clone();
         thread::Builder::new()
             .name("lhm-bridge".into())
-            .spawn(move || Worker::new(starter, timing).run(&jobs, &ready))
+            .spawn(move || Worker::new(starter, timing, reason).run(&jobs, &ready))
             .map_err(|e| HalError(format!("cannot start the bridge thread: {e}")))?;
         let controllable = started
             .recv_timeout(START_TIMEOUT)
@@ -89,6 +102,7 @@ impl LhmBridge {
             controllable,
             suspended: AtomicBool::new(false),
             degraded: Mutex::new(Vec::new()),
+            killed,
         })
     }
 
@@ -101,7 +115,7 @@ impl LhmBridge {
             .send(Msg::Suspend(reply))
             .map_err(|_| "the bridge thread has stopped".to_owned())?;
         answer
-            .recv_timeout(SHUTDOWN_TIMEOUT + self.timing.call)
+            .recv_timeout(self.timing.shutdown + self.timing.call)
             .map_err(|_| "the bridge did not stop in time".to_owned())?
     }
 
@@ -180,24 +194,75 @@ impl HardwareLayer for LhmBridge {
     }
 
     fn degraded_reasons(&self) -> Vec<String> {
-        self.degraded
+        let mut reasons = self
+            .degraded
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clone()
+            .clone();
+        reasons.extend(
+            self.killed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+        );
+        reasons
+    }
+}
+
+/// A connection on its own thread, so a request that never returns can't stop the worker from
+/// killing the bridge. The thread ends when this is dropped, or when a kill breaks the pipe.
+struct Link {
+    lines: Sender<String>,
+    replies: Receiver<io::Result<String>>,
+}
+
+impl Link {
+    fn new(mut connection: Box<dyn BridgeConnection>) -> Result<Self, String> {
+        let (lines, requests) = mpsc::channel::<String>();
+        let (answers, replies) = mpsc::channel();
+        thread::Builder::new()
+            .name("lhm-bridge-pipe".into())
+            .spawn(move || {
+                for line in requests {
+                    if answers.send(connection.exchange(&line)).is_err() {
+                        return;
+                    }
+                }
+            })
+            .map_err(|e| format!("cannot start the pipe thread: {e}"))?;
+        Ok(Self { lines, replies })
+    }
+
+    fn exchange(&self, line: String, limit: Duration) -> Result<String, Reply> {
+        self.lines
+            .send(line)
+            .map_err(|_| Reply::Broken("the pipe thread has stopped".into()))?;
+        match self.replies.recv_timeout(limit) {
+            Ok(reply) => reply.map_err(|e| Reply::Broken(e.to_string())),
+            Err(RecvTimeoutError::Timeout) => Err(Reply::Hung),
+            Err(RecvTimeoutError::Disconnected) => {
+                Err(Reply::Broken("the pipe thread has stopped".into()))
+            }
+        }
     }
 }
 
 struct Worker {
     starter: Box<dyn BridgeStarter>,
     timing: Timing,
-    connection: Option<Box<dyn BridgeConnection>>,
+    connection: Option<Link>,
     next_id: u64,
     suspended: bool,
     last_try: Instant,
+    killed: Arc<Mutex<Option<String>>>,
 }
 
 impl Worker {
-    fn new(starter: Box<dyn BridgeStarter>, timing: Timing) -> Self {
+    fn new(
+        starter: Box<dyn BridgeStarter>,
+        timing: Timing,
+        killed: Arc<Mutex<Option<String>>>,
+    ) -> Self {
         Self {
             starter,
             timing,
@@ -205,6 +270,7 @@ impl Worker {
             next_id: 1,
             suspended: false,
             last_try: Instant::now(),
+            killed,
         }
     }
 
@@ -258,7 +324,7 @@ impl Worker {
 
     fn connect(&mut self) -> Result<Vec<String>, String> {
         self.last_try = Instant::now();
-        self.connection = Some(self.starter.start()?);
+        self.connection = Some(Link::new(self.starter.start()?)?);
         let hello = self
             .request(json!({"op": "hello", "protocol": PROTOCOL}))
             .and_then(|reply| parse_hello(&reply));
@@ -266,21 +332,29 @@ impl Worker {
             self.connection = None;
             self.starter.stop();
         }
+        if hello.is_ok() {
+            *self.killed.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
         hello
     }
 
     /// A refusal keeps the connection. A broken pipe or a garbled reply drops it, because the
-    /// next reply might then answer the wrong request.
+    /// next reply might then answer the wrong request. No answer at all gets the bridge killed.
     fn request(&mut self, mut request: Value) -> Result<Value, String> {
-        let Some(connection) = self.connection.as_mut() else {
+        let Some(link) = self.connection.as_ref() else {
             return Err("the bridge is down".into());
+        };
+        let op = request["op"].as_str().unwrap_or("?").to_owned();
+        let limit = match op.as_str() {
+            "hello" => START_TIMEOUT, // a new bridge opens LHM and hands back before it answers
+            "shutdown" => self.timing.shutdown,
+            _ => self.timing.hang,
         };
         let id = self.next_id;
         self.next_id += 1;
         request["id"] = json!(id);
-        let outcome = connection
-            .exchange(&request.to_string())
-            .map_err(|e| Reply::Broken(e.to_string()))
+        let outcome = link
+            .exchange(request.to_string(), limit)
             .and_then(|line| parse_reply(&line, id));
         match outcome {
             Ok(value) => Ok(value),
@@ -291,7 +365,23 @@ impl Worker {
                 self.last_try = Instant::now();
                 Err(format!("bridge connection lost: {e}"))
             }
+            Err(Reply::Hung) => {
+                self.kill_hung(&op);
+                Err(format!("the bridge hung on '{op}'"))
+            }
         }
+    }
+
+    fn kill_hung(&mut self, op: &str) {
+        self.connection = None;
+        let reason = if self.starter.kill() {
+            format!("lhm-bridge: hung on '{op}', so it was killed. A new one hands its fans back")
+        } else {
+            format!("lhm-bridge: hung on '{op}' and can't be killed, so its fans may be stuck until a reboot")
+        };
+        eprintln!("{reason}");
+        *self.killed.lock().unwrap_or_else(|e| e.into_inner()) = Some(reason);
+        self.last_try = Instant::now();
     }
 
     fn shut_down(&mut self) -> Result<(), String> {
@@ -310,6 +400,7 @@ impl Worker {
 enum Reply {
     Refused(String),
     Broken(String),
+    Hung,
 }
 
 fn parse_reply(line: &str, id: u64) -> Result<Value, Reply> {

@@ -8,13 +8,16 @@ use std::time::Duration;
 
 /// Under the data dir. Exists only while we hold PawnIO disabled, so a restart knows it was us.
 pub const MARKER_FILE: &str = "anti-cheat-mode";
-/// How long a blocker must be gone before leaving the mode, so a client that restarts itself
-/// doesn't bounce the driver. Chosen, not measured: M12 PR note.
+/// How long every blocker must be gone, its service stopped included, before leaving the mode, so
+/// a client that restarts itself doesn't bounce the driver. Chosen, not measured: M12 PR note.
 pub const QUIET: Duration = Duration::from_secs(30);
 
-/// shortcut: FACEIT only, by process name. Add others when a block is confirmed. A process list
-/// also reacts up to one poll after the client starts, so a first launch can still be refused.
-const BLOCKERS: &[&str] = &["faceit.exe", "faceitclient.exe", "faceitservice.exe"];
+/// shortcut: FACEIT only. Add others when a block is confirmed. Polling also reacts up to one
+/// poll after the client starts, so a first launch can still be refused.
+/// `FACEIT.exe` is the desktop app: it loads no driver, so it doesn't count.
+const BLOCKERS: &[&str] = &["faceitclient.exe"];
+/// Blocking in any state but stopped.
+pub const BLOCKER_SERVICES: &[&str] = &["FACEITService"];
 
 pub fn is_blocker(exe: &str) -> bool {
     BLOCKERS.iter().any(|b| b.eq_ignore_ascii_case(exe))
