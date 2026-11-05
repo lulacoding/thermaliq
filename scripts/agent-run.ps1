@@ -46,8 +46,12 @@ function ConvertTo-Row($r) {
     }
 }
 
-# A boost is the agent asking for more than the curve.
-function Test-Boost($r) { $null -ne $r.ask -and $null -ne $r.curve -and $r.ask -gt $r.curve }
+# A boost is the agent asking for well above the curve (the optimiser adds 20, capped at 100).
+# The ask is computed one tick before the curve is sampled, so a curve that just moved can leave
+# a lowering ask 1-4 points above it; that is not a boost.
+function Test-Boost($r) {
+    $null -ne $r.ask -and $null -ne $r.curve -and ($r.ask -ge $r.curve + 5 -or ($r.ask -eq 100 -and $r.ask -gt $r.curve))
+}
 
 function New-Verdict($name, $result, $detail) { [pscustomobject]@{ Name = $name; Result = $result; Detail = $detail } }
 
@@ -173,6 +177,10 @@ function Invoke-SelfTest {
 
     # boost
     Expect 'no boost' $idle 'boost' 'NOT TESTED'
+    Expect 'a stale lowering ask 1 above a falling curve is not a boost' ($idle + (New-Span 40 5 $curve 61)) 'boost' 'NOT TESTED'
+    Expect 'ask 4 above the curve is not a boost' ($idle + (New-Span 40 5 $curve 64)) 'boost' 'NOT TESTED'
+    Expect 'ask 5 above the curve is a boost' ($idle + (New-Span 40 5 $curve 65)) 'boost' 'PASS'
+    Expect 'a boost to 100 near the top counts' ($idle + (New-Span 40 5 98 100)) 'boost' 'PASS'
     Expect '30 s boost' ($idle + (New-Span 40 30 $curve 80)) 'boost' 'PASS'
     Expect '60 s boost' ($idle + (New-Span 40 60 $curve 80)) 'boost' 'PASS'
     Expect '62 s boost (slack)' ($idle + (New-Span 40 62 $curve 80)) 'boost' 'PASS'
@@ -314,7 +322,7 @@ try {
             $fa = @(Get-Api '/fans') | Where-Object { $_.id -eq $Fan } | Select-Object -First 1
             $misses = 0
             $ask = $fa.agent_duty; $curve = $fa.curve_duty
-            $boost = if ($null -ne $ask -and $null -ne $curve -and $ask -gt $curve) { 1 } else { 0 }
+            $boost = if (Test-Boost ([pscustomobject]@{ ask = $ask; curve = $curve })) { 1 } else { 0 }
             $cells = @([Math]::Round($t, 3), $se.temp_celsius, $fa.duty_percent, $fa.commanded_duty, $curve, $ask, $boost, $st.agent, $st.latched, $event)
             Add-Content -Path $Csv -Value (($cells | ForEach-Object { Format-Cell $_ }) -join ',') -Encoding ascii
             $event = ''
