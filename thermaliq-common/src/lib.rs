@@ -19,6 +19,11 @@ use std::fmt;
 pub const MIN_VALID_TEMP_C: f32 = -20.0;
 pub const MAX_VALID_TEMP_C: f32 = 150.0;
 
+/// SPEC §7.2: the agent may lower a fan at most this many points below its curve output.
+/// The agent checks it and the engine enforces it. The engine's baseline is the profile
+/// curve today (M15 carry-over in PORTING).
+pub const AGENT_MAX_LOWER_PCT: u8 = 15;
+
 #[derive(Debug)]
 pub enum Error {
     Parse(toml::de::Error),

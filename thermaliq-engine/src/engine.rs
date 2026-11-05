@@ -2,7 +2,9 @@ use crate::{CurveEngine, FanControl, SensorEngine, Source, Temps};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use thermaliq_common::{Control, FanKind, HardwareSnapshot, Profile, SensorKind, SensorReading};
+use thermaliq_common::{
+    Control, FanKind, HardwareSnapshot, Profile, SensorKind, SensorReading, AGENT_MAX_LOWER_PCT,
+};
 use thermaliq_hal::HardwareLayer;
 
 /// SPEC S2 thresholds (°C) and hold time.
@@ -91,6 +93,8 @@ struct Fan {
     lost: bool,
     /// Ramp state taken from the hardware or the last write.
     seeded: bool,
+    /// The profile curve's duty on the last tick; `None` when safety (latch, S3, S4) took over.
+    curve_duty: Option<u8>,
 }
 
 impl Fan {
@@ -103,6 +107,7 @@ impl Fan {
             bad: 0,
             lost: false,
             seeded: false,
+            curve_duty: None,
         }
     }
 }
@@ -223,10 +228,28 @@ impl Engine {
         duty: u8,
         expires_at: Option<Duration>,
     ) -> Result<(), String> {
+        if source == Source::Agent && self.pumps.contains(fan) {
+            return Err(format!(
+                "fan '{fan}' is a pump: the agent never controls it"
+            ));
+        }
         let f = self.fans.iter_mut().find(|f| f.id == fan);
         f.ok_or_else(|| format!("no control for fan '{fan}'"))?
             .ctl
             .submit(source, duty, expires_at)
+    }
+
+    /// What the profile curve asks of this fan right now (SPEC §7.2: the agent's baseline).
+    /// `None` before the first tick, for an unknown fan, and whenever safety has taken over.
+    pub fn curve_output(&self, fan: &str) -> Option<u8> {
+        self.fans.iter().find(|f| f.id == fan)?.curve_duty
+    }
+
+    /// Drops one source's requests on every fan: pause and agent crash withdraw `Source::Agent`.
+    pub fn withdraw_all(&mut self, source: Source) {
+        for f in &mut self.fans {
+            f.ctl.withdraw(source);
+        }
     }
 
     /// Drops the manual override on a fan. `Ok(false)`: it had none.
@@ -272,6 +295,9 @@ impl Engine {
                 .filter(|f| f.kind == FanKind::Pump)
                 .map(|f| f.id.clone()),
         );
+        for f in self.fans.iter_mut().filter(|f| self.pumps.contains(&f.id)) {
+            f.ctl.withdraw(Source::Agent); // accepted before the pump was known
+        }
         for f in self.fans.iter_mut().filter(|f| !f.seeded) {
             if let Some(r) = snap.fans.iter().find(|r| r.id == f.id) {
                 f.ctl.seed(r.duty_percent, r.rpm > 0);
@@ -298,6 +324,7 @@ impl Engine {
                 (f.good, f.bad) = (0, f.bad.saturating_add(1));
                 f.lost |= f.bad >= FAULT_TICKS;
             }
+            f.curve_duty = duty.filter(|_| !f.lost);
             let out = if f.lost {
                 f.ctl.seed(100, true);
                 Some(100)
@@ -306,9 +333,13 @@ impl Engine {
                     Some(d) => {
                         // Profile never needs an expiry, so submit cannot fail.
                         let _ = f.ctl.submit(Source::Profile, d, None);
+                        // SPEC §7.2: the engine itself keeps an agent within 15 points of the curve.
+                        f.ctl.floor_agent(d.saturating_sub(AGENT_MAX_LOWER_PCT));
                     }
                     None => {
+                        // No curve output means no floor to enforce: the agent must not act either.
                         f.ctl.withdraw(Source::Profile);
+                        f.ctl.withdraw(Source::Agent);
                     }
                 }
                 f.ctl.tick(now)
@@ -322,6 +353,7 @@ impl Engine {
 
     /// Safety output: every controllable fan to 100%, no ramp.
     fn all_full(&mut self) {
+        self.fans.iter_mut().for_each(|f| f.curve_duty = None);
         let ids: Vec<String> = self.controllable.iter().cloned().collect();
         for id in ids {
             if let Some(f) = self.fans.iter_mut().find(|f| f.id == id) {
@@ -1019,6 +1051,196 @@ mod status_tests {
         e.tick(secs(31));
         assert!(!e.latched());
         assert!(e.latch_waiting_on().is_empty());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod agent_tests {
+    use super::*;
+    use thermaliq_hal::{MockHardwareLayer, Tick};
+
+    /// Curve outputs 50 flat (or follows cpu 30..90 → 20..100 when `linear`); f1 min_pwm 45.
+    fn rig_with(linear: bool, script: Vec<Tick>, pump: bool) -> (Arc<MockHardwareLayer>, Engine) {
+        let curve = if linear {
+            "type = \"linear\"\nid = \"c\"\nsource = \"cpu\"\nmin_temp = 30.0\nmax_temp = 90.0\nmin_pwm = 20\nmax_pwm = 100\n"
+        } else {
+            "type = \"flat\"\nid = \"c\"\npwm = 50\n"
+        };
+        let p = Profile::from_toml(&format!(
+            "name = \"t\"\n[[curves]]\n{curve}[[controls]]\nfan = \"f1\"\ncurve = \"c\"\nmin_pwm = 45\nstep_up_pct = 100\nstep_down_pct = 100\n"
+        ))
+        .unwrap();
+        let mut hal = MockHardwareLayer::new(&["f1"], script);
+        if pump {
+            hal = hal.pump("f1");
+        }
+        let hal = Arc::new(hal);
+        (hal.clone(), Engine::new(hal, &p))
+    }
+
+    fn cpu(t: f32) -> Tick {
+        Tick::Temps(vec![("cpu".into(), SensorKind::Cpu, t)])
+    }
+
+    fn rig() -> (Arc<MockHardwareLayer>, Engine) {
+        rig_with(false, vec![cpu(40.0)], false)
+    }
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    fn agent(e: &mut Engine, duty: u8, until: u64) {
+        e.submit("f1", Source::Agent, duty, Some(secs(until)))
+            .unwrap();
+    }
+
+    fn last(hal: &MockHardwareLayer) -> u8 {
+        hal.writes().last().unwrap().1
+    }
+
+    #[test]
+    fn the_engine_exposes_each_fans_curve_output() {
+        let (_, mut e) = rig();
+        assert_eq!(e.curve_output("f1"), None, "before the first tick");
+        e.tick(secs(0));
+        assert_eq!(e.curve_output("f1"), Some(50));
+        assert_eq!(e.curve_output("nope"), None);
+    }
+
+    #[test]
+    fn an_agent_may_raise_and_lower_within_15_points() {
+        let (hal, mut e) = rig();
+        e.tick(secs(0));
+        agent(&mut e, 80, 99);
+        e.tick(secs(1));
+        assert_eq!(last(&hal), 80);
+        agent(&mut e, 35, 99);
+        e.tick(secs(2));
+        assert_eq!(
+            last(&hal),
+            45,
+            "35 is the clamp, then the profile minimum 45 applies"
+        );
+    }
+
+    #[test]
+    fn the_engine_clamps_an_agent_that_asks_for_more_than_15_below_the_curve() {
+        let (hal, mut e) = rig_with(false, vec![cpu(40.0)], false);
+        // A profile without a minimum, so only the 15-point clamp can act.
+        let p = Profile::from_toml(
+            "name = \"t\"\n[[curves]]\ntype = \"flat\"\nid = \"c\"\npwm = 50\n[[controls]]\nfan = \"f1\"\ncurve = \"c\"\nstep_up_pct = 100\nstep_down_pct = 100\n",
+        )
+        .unwrap();
+        e.set_profile(&p);
+        e.tick(secs(0));
+        agent(&mut e, 0, 99);
+        e.tick(secs(1));
+        assert_eq!(last(&hal), 35);
+        agent(&mut e, 34, 99);
+        e.tick(secs(2));
+        assert_eq!(last(&hal), 35);
+    }
+
+    #[test]
+    fn an_agent_never_goes_below_the_profile_minimum() {
+        let (hal, mut e) = rig();
+        e.tick(secs(0));
+        agent(&mut e, 40, 99);
+        e.tick(secs(1));
+        assert_eq!(last(&hal), 45);
+    }
+
+    #[test]
+    fn agent_requests_expire_and_the_profile_resumes() {
+        let (hal, mut e) = rig();
+        e.tick(secs(0));
+        agent(&mut e, 90, 3);
+        e.tick(secs(2));
+        assert_eq!(last(&hal), 90);
+        e.tick(secs(3));
+        assert_eq!(last(&hal), 50);
+    }
+
+    #[test]
+    fn withdraw_all_drops_agent_requests_but_not_overrides() {
+        let hal_script = vec![cpu(40.0)];
+        let p = Profile::from_toml(
+            "name = \"t\"\n[[curves]]\ntype = \"flat\"\nid = \"c\"\npwm = 50\n[[controls]]\nfan = \"f1\"\ncurve = \"c\"\nstep_up_pct = 100\nstep_down_pct = 100\n[[controls]]\nfan = \"f2\"\ncurve = \"c\"\nstep_up_pct = 100\nstep_down_pct = 100\n",
+        )
+        .unwrap();
+        let hal = Arc::new(MockHardwareLayer::new(&["f1", "f2"], hal_script));
+        let mut e = Engine::new(hal.clone(), &p);
+        e.tick(secs(0));
+        e.submit("f1", Source::Agent, 90, Some(secs(99))).unwrap();
+        e.submit("f2", Source::Agent, 90, Some(secs(99))).unwrap();
+        e.submit("f2", Source::Override, 70, Some(secs(99)))
+            .unwrap();
+        e.withdraw_all(Source::Agent);
+        e.tick(secs(1));
+        let w = hal.writes();
+        assert_eq!(&w[w.len() - 2..], [("f1".into(), 50), ("f2".into(), 70)]);
+    }
+
+    #[test]
+    fn the_latch_beats_an_agent_request() {
+        let (hal, mut e) = rig_with(false, vec![cpu(97.0)], false);
+        agent(&mut e, 0, 99);
+        e.tick(secs(0));
+        assert_eq!(last(&hal), 100);
+        assert_eq!(e.curve_output("f1"), None, "no curve output while latched");
+    }
+
+    #[test]
+    fn sensor_loss_beats_an_agent_request_and_hides_the_curve_output() {
+        let gone = Tick::Temps(vec![("gpu".into(), SensorKind::Gpu, 40.0)]);
+        let (hal, mut e) = rig_with(true, vec![cpu(40.0), gone], false);
+        e.tick(secs(0));
+        agent(&mut e, 0, 99);
+        for t in 1..=3 {
+            e.tick(secs(t));
+        }
+        assert_eq!(last(&hal), 100);
+        assert_eq!(e.curve_output("f1"), None);
+    }
+
+    #[test]
+    fn an_agent_request_is_dropped_while_the_curve_has_no_input() {
+        let gone = Tick::Temps(vec![("gpu".into(), SensorKind::Gpu, 40.0)]);
+        // No min_pwm, so only the withdraw can keep the agent's 0 off the fan.
+        let p = Profile::from_toml(
+            "name = \"t\"\n[[curves]]\ntype = \"linear\"\nid = \"c\"\nsource = \"cpu\"\nmin_temp = 30.0\nmax_temp = 90.0\nmin_pwm = 20\nmax_pwm = 100\n[[controls]]\nfan = \"f1\"\ncurve = \"c\"\nstep_up_pct = 100\nstep_down_pct = 100\n",
+        )
+        .unwrap();
+        let hal = Arc::new(MockHardwareLayer::new(&["f1"], vec![cpu(40.0), gone]));
+        let mut e = Engine::new(hal.clone(), &p);
+        e.tick(secs(0));
+        let written = hal.writes().len();
+        agent(&mut e, 0, 99);
+        e.tick(secs(1)); // 1 bad tick: no clamp floor is known, so the request must not act
+        e.tick(secs(2));
+        assert_eq!(
+            hal.writes().len(),
+            written,
+            "nothing written, least of all 0"
+        );
+    }
+
+    #[test]
+    fn an_agent_request_made_before_the_first_snapshot_is_dropped_for_a_pump() {
+        let (hal, mut e) = rig_with(false, vec![cpu(40.0)], true);
+        agent(&mut e, 90, 99); // pump set is still empty, so submit accepts it
+        e.tick(secs(0));
+        assert_eq!(last(&hal), 50, "the curve, not the agent's 90");
+    }
+
+    #[test]
+    fn an_agent_may_not_submit_to_a_pump() {
+        let (_, mut e) = rig_with(false, vec![cpu(40.0)], true);
+        e.tick(secs(0));
+        assert!(e.submit("f1", Source::Agent, 90, Some(secs(99))).is_err());
+        assert!(e.submit("f1", Source::Override, 90, Some(secs(99))).is_ok());
     }
 }
 
