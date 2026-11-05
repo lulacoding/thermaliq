@@ -432,7 +432,13 @@ impl Daemon {
                                 snapshot.metrics.clone(),
                             ));
                         }
-                        let degraded_reasons = sources.degraded_reasons();
+                        let mut degraded_reasons = sources.degraded_reasons();
+                        // A fresh snapshot with no fan at all means every fan backend failed to
+                        // start or lost its fans. An empty engine must not look healthy (S8).
+                        if engine.snapshot_fresh() && snapshot.fans.is_empty() {
+                            degraded_reasons
+                                .push("no fans found: no hardware backend is providing any".into());
+                        }
                         let status = Status {
                             engine_running: true,
                             latched: engine.latched(),
@@ -764,6 +770,33 @@ mod tests {
             "one stuck header must not send every fan to 100%: {:?}",
             mock.writes()
         );
+    }
+
+    #[test]
+    fn a_snapshot_with_no_fans_is_degraded_and_says_so_never_a_healthy_empty_engine() {
+        let hal = Arc::new(MockHardwareLayer::new(&[], vec![at(40.0)]));
+        let active = Profile::from_toml(FLAT).unwrap();
+        let d = Daemon::start(hal, &active, vec![], db(), fast());
+        wait_until(|| d.cache().ticks > 3);
+        let c = d.cache();
+        assert!(c.status.degraded);
+        assert!(
+            c.status
+                .degraded_reasons
+                .iter()
+                .any(|r| r.contains("no fans")),
+            "{:?}",
+            c.status.degraded_reasons
+        );
+    }
+
+    #[test]
+    fn fans_present_means_no_missing_fans_reason() {
+        let hal = Arc::new(MockHardwareLayer::new(&["f1"], vec![at(40.0)]));
+        let active = Profile::from_toml(FLAT).unwrap();
+        let d = Daemon::start(hal, &active, vec![], db(), fast());
+        wait_until(|| d.cache().ticks > 3);
+        assert!(d.cache().status.degraded_reasons.is_empty());
     }
 
     #[test]

@@ -12,6 +12,8 @@ pub struct CombinedHardwareLayer {
     optional: Vec<(String, Arc<dyn HardwareLayer>)>,
     /// Optional sources whose last snapshot failed.
     unavailable: Mutex<Vec<String>>,
+    /// Sources that never started, and why if that was a failure rather than a choice.
+    unstarted: Vec<(String, Option<String>)>,
 }
 
 impl CombinedHardwareLayer {
@@ -33,7 +35,16 @@ impl CombinedHardwareLayer {
             owner,
             optional: Vec::new(),
             unavailable: Mutex::new(Vec::new()),
+            unstarted: Vec::new(),
         })
+    }
+
+    /// Records a source that never started, so an engine without it doesn't look healthy (S8). It
+    /// shows in `unavailable_sources`. `Some(why)` is a failure and also in `degraded_reasons`;
+    /// `None` means it was left off on purpose (not installed, anti-cheat mode).
+    pub fn with_unstarted(mut self, name: &str, fault: Option<String>) -> Self {
+        self.unstarted.push((name.to_string(), fault));
+        self
     }
 
     /// Adds a read-only source that may be missing: if its snapshot fails, only its own
@@ -119,10 +130,13 @@ impl HardwareLayer for CombinedHardwareLayer {
     }
 
     fn unavailable_sources(&self) -> Vec<String> {
-        self.unavailable
+        let mut all = self
+            .unavailable
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+            .clone();
+        all.extend(self.unstarted.iter().map(|(name, _)| name.clone()));
+        all
     }
 
     fn degraded_reasons(&self) -> Vec<String> {
@@ -130,6 +144,11 @@ impl HardwareLayer for CombinedHardwareLayer {
             .iter()
             .chain(self.optional.iter().map(|(_, b)| b))
             .flat_map(|b| b.degraded_reasons())
+            .chain(
+                self.unstarted
+                    .iter()
+                    .filter_map(|(name, fault)| Some(format!("{name}: {}", fault.as_ref()?))),
+            )
             .collect()
     }
 
@@ -502,6 +521,25 @@ mod tests {
             .with_optional_owner("lhm-bridge", Arc::new(Faulty))
             .unwrap();
         assert_eq!(c.degraded_reasons(), ["header still manual"]);
+    }
+
+    #[test]
+    fn a_source_that_never_started_is_unavailable_and_a_fault_is_degraded() {
+        let c = CombinedHardwareLayer::new(vec![mock(&["a1"], "gpu", SensorKind::Gpu)])
+            .unwrap()
+            .with_unstarted("lhm-bridge", Some("cannot open the pipe".into()))
+            .with_unstarted("hwinfo-off", None);
+        c.snapshot().unwrap();
+        assert_eq!(c.unavailable_sources(), ["lhm-bridge", "hwinfo-off"]);
+        assert_eq!(c.degraded_reasons(), ["lhm-bridge: cannot open the pipe"]);
+    }
+
+    #[test]
+    fn unstarted_and_failing_sources_are_both_listed_without_repeats() {
+        let opt = Arc::new(MockHardwareLayer::new(&[], vec![Tick::Fail]));
+        let c = required_plus(opt).with_unstarted("lhm-bridge", None);
+        c.snapshot().unwrap();
+        assert_eq!(c.unavailable_sources(), ["hwinfo", "lhm-bridge"]);
     }
 
     #[test]

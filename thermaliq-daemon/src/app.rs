@@ -38,6 +38,25 @@ pub fn hardware() -> Result<Arc<dyn HardwareLayer>, String> {
     Ok(hal)
 }
 
+/// Whether this machine could run at all, for `install-service`, without starting anything: the
+/// bridge's pipe only opens for SYSTEM, and a started bridge outlives the check.
+pub fn installable() -> Result<(), String> {
+    #[cfg(all(windows, not(feature = "mock-hardware")))]
+    {
+        if thermaliq_hal::Nvidia::new().is_ok() || crate::lhm_bridge::installed() {
+            Ok(())
+        } else {
+            Err(
+                "no hardware backend: no NVIDIA GPU, and lhm-bridge\\lhm-bridge.exe is not \
+                 installed beside the daemon"
+                    .into(),
+            )
+        }
+    }
+    #[cfg(not(all(windows, not(feature = "mock-hardware"))))]
+    hardware().map(drop)
+}
+
 /// Fake hardware only exists behind `mock-hardware`.
 fn backend() -> Result<Arc<dyn HardwareLayer>, String> {
     #[cfg(feature = "mock-hardware")]
@@ -52,29 +71,39 @@ fn backend() -> Result<Arc<dyn HardwareLayer>, String> {
     }
     #[cfg(all(windows, not(feature = "mock-hardware")))]
     {
+        use crate::lhm_bridge::{start_backend, Backend};
         use thermaliq_hal::{CombinedHardwareLayer, CpuLoad, Hwinfo, Nvidia};
         // Ones that fail to start are skipped, and with none left the daemon refuses to start
-        // rather than pretend.
+        // rather than pretend. Every skipped one is recorded, so /status never shows a healthy
+        // engine that is quietly missing its fans (S8).
         let mut backends: Vec<Arc<dyn HardwareLayer>> = Vec::new();
-        let mut why = Vec::new();
+        let mut unstarted: Vec<(&str, Option<String>)> = Vec::new();
         match Nvidia::new() {
             Ok(n) => backends.push(Arc::new(n)),
-            Err(e) => why.push(format!("NVIDIA: {e}")),
+            Err(e) => {
+                eprintln!("hardware backend unavailable, continuing without it: NVIDIA: {e}");
+                unstarted.push(("nvidia", Some(e.to_string())));
+            }
         }
         let dir = store::data_dir().map_err(|e| e.to_string())?;
-        let mut bridge: Option<Arc<dyn HardwareLayer>> =
-            crate::lhm_bridge::start_backend(&dir).map(|b| b as Arc<dyn HardwareLayer>);
+        let mut bridge: Option<Arc<dyn HardwareLayer>> = None;
+        match start_backend(&dir) {
+            Backend::Running(b) => bridge = Some(b),
+            Backend::Off(_) => unstarted.push(("lhm-bridge", None)),
+            Backend::Failed(why) => unstarted.push(("lhm-bridge", Some(why))),
+        }
         if backends.is_empty() {
             // With nothing else it's the only hardware, so losing it has to reach S4.
             match bridge.take() {
                 Some(b) => backends.push(b),
                 None => {
+                    let why: Vec<String> = unstarted
+                        .iter()
+                        .map(|(n, w)| format!("{n}: {}", w.as_deref().unwrap_or("off")))
+                        .collect();
                     return Err(format!("no hardware backend started ({})", why.join("; ")));
                 }
             }
-        }
-        for w in why {
-            eprintln!("hardware backend unavailable, continuing without it: {w}");
         }
         // Optional extras: while one is down only its own readings drop out. CPU load goes first
         // so it wins over HWiNFO's and the bridge's.
@@ -86,6 +115,9 @@ fn backend() -> Result<Arc<dyn HardwareLayer>, String> {
             combined = combined
                 .with_optional_owner("lhm-bridge", b)
                 .map_err(|e| e.to_string())?;
+        }
+        for (name, fault) in unstarted {
+            combined = combined.with_unstarted(name, fault);
         }
         Ok(Arc::new(combined))
     }

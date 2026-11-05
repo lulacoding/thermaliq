@@ -29,11 +29,15 @@ cargo build -p thermaliq-daemon
 $pf = "$env:ProgramFiles\ThermalIQ"
 $dir = "$env:ProgramData\ThermalIQ"
 if (Get-Service ThermalIQ -ErrorAction SilentlyContinue) { Stop-Service ThermalIQ; & "$PWD\target\debug\thermaliq-daemon.exe" uninstall-service }
+Get-Process lhm-bridge -ErrorAction SilentlyContinue | Stop-Process -Force
+Remove-Item -Recurse -Force "$pf\lhm-bridge" -ErrorAction SilentlyContinue
+Remove-Item "$dir\lhm-bridge.log", "$dir\service.log" -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force $pf | Out-Null
 Copy-Item target\debug\thermaliq-daemon.exe $pf -Force
 dotnet publish bridges\lhm-bridge\LhmBridge\LhmBridge.csproj -c Release -r win-x64 --self-contained -o "$pf\lhm-bridge"
 if (Test-Path "$dir\config.toml") { Copy-Item "$dir\config.toml" "$dir\config.toml.m12bak" -Force }
 & "$pf\thermaliq-daemon.exe" install-service
+Get-Process lhm-bridge -ErrorAction SilentlyContinue   # must print nothing: install-service starts no bridge
 Start-Service ThermalIQ
 Start-Sleep 15
 $api = 'http://127.0.0.1:7272'
@@ -43,11 +47,12 @@ function Show-State {
     Get-Process lhm-bridge -ErrorAction SilentlyContinue | Select-Object Id, StartTime | Format-Table
 }
 Show-State
+Get-Content "$dir\service.log", "$dir\lhm-bridge.log" -ErrorAction SilentlyContinue
 ```
 
-**Pass:** `/fans` lists `lhm_nct6687d_0_fan_*` headers, `unavailable_sources` is empty, and `lhm-bridge` is running. Listing them proves the pipe's server check passed, because no client gets a fan list without it.
+**Pass:** `/fans` lists `lhm_nct6687d_0_fan_*` headers beside the GPU fan, `degraded` is false, `unavailable_sources` holds only `hwinfo` (if HWiNFO isn't running), and `lhm-bridge` is running. Listing the headers proves the pipe's server check passed, because no client gets a fan list without it.
 
-If `lhm-bridge` is listed under `unavailable_sources` or absent, send `Get-Content "$dir\lhm-bridge.log"`.
+**If it fails,** it now says why in three places, so paste all three: `degraded_reasons` (a bridge that should have started and didn't shows as `lhm-bridge: <reason>`), `unavailable_sources`, and `service.log` (everything the service prints, bridge start-up included; before this fix it was thrown away). An engine with no fans at all reports `degraded` too.
 
 Then pick a **case-fan** header you can hear, not `CPU` or `Pump`. Last time that was control 5:
 

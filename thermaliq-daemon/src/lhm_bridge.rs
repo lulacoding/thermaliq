@@ -27,22 +27,43 @@ const ERROR_FILE_NOT_FOUND: i32 = 2;
 const ERROR_PIPE_BUSY: i32 = 231;
 const EXIT_PIPE_TAKEN: i32 = 12;
 
-/// The backend, if this machine can run one. `None` means motherboard fans are absent, and why
-/// has been logged: the GPU and agent carry on (SPEC §5.1).
-pub fn start_backend(data_dir: &Path) -> Option<Arc<LhmBridge>> {
+pub enum Backend {
+    Running(Arc<LhmBridge>),
+    /// Left off on purpose: no bridge installed, no PawnIO, or anti-cheat running. Motherboard
+    /// fans are optional (SPEC §5.1), so this is only listed as unavailable.
+    Off(String),
+    /// Should have run and didn't. The caller reports it as `degraded` (S8).
+    Failed(String),
+}
+
+const NOT_INSTALLED: &str = "the bridge is not installed";
+
+/// Why a start didn't happen, as a choice or a failure. Exit 10 is the bridge's own "no PawnIO".
+fn not_started(why: String) -> Backend {
+    if why.starts_with(NOT_INSTALLED) || why == exit_reason(Some(10)) {
+        Backend::Off(why)
+    } else {
+        Backend::Failed(why)
+    }
+}
+
+/// The backend, if this machine can run one. Whatever it is, the reason has been logged: the GPU
+/// and agent carry on without motherboard fans (SPEC §5.1).
+pub fn start_backend(data_dir: &Path) -> Backend {
     let marker = data_dir.join(anti_cheat::MARKER_FILE);
     let blocked = blocker_running();
     let state = anti_cheat::on_service_start(&marker, blocked, &mut PnpDevice);
     if state == StartState::Blocked {
-        eprintln!("anti-cheat mode at startup: motherboard fans stay off until a service restart");
+        let why = "anti-cheat mode at startup: motherboard fans stay off until a service restart";
+        eprintln!("{why}");
         watch(marker, None, true);
-        return None;
+        return Backend::Off(why.into());
     }
     let exe = match bridge_exe() {
         Ok(exe) => exe,
         Err(e) => {
             eprintln!("motherboard fans absent: {e}");
-            return None;
+            return not_started(e);
         }
     };
     let starter = Starter {
@@ -54,13 +75,19 @@ pub fn start_backend(data_dir: &Path) -> Option<Arc<LhmBridge>> {
         Ok(bridge) => {
             let bridge = Arc::new(bridge);
             watch(marker, Some(Arc::downgrade(&bridge)), false);
-            Some(bridge)
+            Backend::Running(bridge)
         }
         Err(HalError(e)) => {
             eprintln!("motherboard fans absent: {e}");
-            None
+            not_started(e)
         }
     }
+}
+
+/// Whether the bridge is installed. Starts nothing: the pipe only opens for SYSTEM, so probing it
+/// from an installer run as a user can only fail, and leaves a stray bridge holding the pipe name.
+pub fn installed() -> bool {
+    bridge_exe().is_ok()
 }
 
 /// Beside the daemon, so it sits in the folder the installer locks down.
@@ -74,7 +101,7 @@ fn bridge_exe() -> Result<PathBuf, String> {
     if exe.exists() {
         Ok(exe)
     } else {
-        Err(format!("{} is not installed", exe.display()))
+        Err(format!("{NOT_INSTALLED}: {}", exe.display()))
     }
 }
 
@@ -418,6 +445,30 @@ mod tests {
         let (_dir, mut starter) = starter_with(Some(live_process()));
         assert!(starter.start().is_err(), "this exe doesn't exist");
         assert!(starter.child.is_none());
+    }
+
+    #[test]
+    fn a_start_that_failed_is_a_fault_but_no_pawnio_or_no_exe_is_a_choice() {
+        let fault = |e: &str| matches!(not_started(e.into()), Backend::Failed(_));
+        assert!(fault("pipe is served by process 9, not our bridge 8"));
+        assert!(fault(
+            "cannot open the bridge pipe: Access is denied. (os error 5)"
+        ));
+        assert!(fault(&exit_reason(Some(11))));
+        assert!(
+            !fault(&exit_reason(Some(10))),
+            "no PawnIO is optional (SPEC §5.1)"
+        );
+        assert!(!fault(&format!("{NOT_INSTALLED}: C:\\x")));
+    }
+
+    #[test]
+    fn a_missing_bridge_exe_is_off_by_choice_and_says_where_it_looked() {
+        let Err(e) = bridge_exe() else { return }; // present only on a machine with it installed
+        assert!(
+            e.starts_with(NOT_INSTALLED) && e.contains("lhm-bridge.exe"),
+            "{e}"
+        );
     }
 
     #[test]

@@ -26,7 +26,7 @@ pub const STOP_BUDGET: Duration = Duration::from_secs(8);
 
 /// Locks the data dir, then registers the service (LocalSystem, automatic start).
 pub fn install(force: bool) -> Result<(), String> {
-    app::hardware()?; // don't install a service that can only refuse to start
+    app::installable()?; // don't install a service that can only refuse to start
     let dir = store::data_dir().map_err(|e| e.to_string())?;
     // Opening the SCM first fails fast without elevation, before the dir is touched.
     let manager =
@@ -134,6 +134,10 @@ fn log(msg: &str) {
 }
 
 fn service_main(_args: Vec<OsString>) {
+    // First, so the bridge's start-up messages and every later eprintln! reach a file.
+    if let Ok(dir) = store::data_dir() {
+        let _ = crate::win::redirect_stderr(&dir.join("service.log"));
+    }
     if let Err(e) = run_service() {
         log(&e);
     }

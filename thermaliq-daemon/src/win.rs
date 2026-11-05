@@ -21,6 +21,7 @@ use windows_sys::Win32::Security::Credentials::{
     CredDeleteW, CredFree, CredReadW, CredWriteW, CREDENTIALW, CRED_PERSIST_LOCAL_MACHINE,
     CRED_TYPE_GENERIC,
 };
+use windows_sys::Win32::System::Console::{SetStdHandle, STD_ERROR_HANDLE};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
@@ -365,6 +366,21 @@ pub fn process_names() -> io::Result<Vec<String>> {
     Ok(names)
 }
 
+/// Sends everything `eprintln!` writes to `path` from now on. A service has no console, so without
+/// this every startup and bridge message is lost, and the daemon can fail with nothing to read.
+pub fn redirect_stderr(path: &Path) -> io::Result<()> {
+    use std::os::windows::io::IntoRawHandle;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    // The process keeps this handle for good, so it is leaked on purpose.
+    if unsafe { SetStdHandle(STD_ERROR_HANDLE, file.into_raw_handle() as HANDLE) } == 0 {
+        return Err(last_error());
+    }
+    Ok(())
+}
+
 /// Whether a service is in any state but stopped. One that isn't installed counts as stopped.
 pub fn service_active(name: &str) -> io::Result<bool> {
     let manager = unsafe { OpenSCManagerW(null(), null(), SC_MANAGER_CONNECT) };
@@ -551,6 +567,22 @@ mod tests {
             .find(|l| l.contains("probe leaked="))
             .map(str::to_owned);
         Some(line.unwrap_or_else(|| panic!("the child never reported: {text}")))
+    }
+
+    #[test]
+    fn redirected_stderr_lands_in_the_file() {
+        use std::io::Write;
+        use windows_sys::Win32::System::Console::GetStdHandle;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("service.log");
+        let before = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
+        redirect_stderr(&log).unwrap();
+        // `io::stderr()`, not `eprintln!`: the test harness captures the macro before it gets here.
+        writeln!(io::stderr(), "bridge said hello").unwrap();
+        unsafe { SetStdHandle(STD_ERROR_HANDLE, before) };
+        assert!(std::fs::read_to_string(&log)
+            .unwrap()
+            .contains("bridge said hello"));
     }
 
     #[test]
