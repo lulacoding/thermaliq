@@ -12,7 +12,7 @@ Reference: the v0 code is tagged `v0-archive` (see `PORTING.md`). The audit that
 2. **Runs:** every second, a small learned model predicts temperatures and adjusts fans to the user's quiet ↔ cool goal, during gaming too. A Jev-style decision model (not an LLM) makes the bigger calls: which profile, whether to accept a learned curve.
 3. **Improves over time:** learns from history which settings meet the user's temperature goals with the least noise, per workload, and keeps tuning.
 
-All of this happens inside the SPEC §3 safety rules, which the agent can never override. Manual curves stay available as an advanced option. Underneath is a background service with a desktop UI, a CLI and a local API. Local-first: no cloud, no telemetry. A hosted decision model is only used if the user opts in.
+All of this happens inside the SPEC §3 safety rules, which the agent can never override. Manual curves stay available as an advanced option. Underneath is a background service with a desktop UI, a CLI and a local API. Local-first: no cloud, no telemetry. The agent's decision model always runs on the user's PC; there is no hosted decision provider (Sam, 2026-11-05).
 
 ## 2. Scope
 
@@ -117,9 +117,9 @@ Decided in the agent brainstorm (Sam, 2026-11-04). Research: `docs/dev/research/
 
 **Slow layer: every 60 s and whenever the foreground app changes. Decision model, not an LLM.**
 - Typed questions with confidence: the workload for an app not seen before (cached per exe afterwards); which profile to use; whether to accept a learned curve or a new profile.
-- **Provider routing:** hosted Jev when the user has added a key (OS keychain), is online, and gets an answer within 2 s. Otherwise local: an open decision model (Strands Decider / Clef-flash class) behind an Ollaya-compatible endpoint (`TYPESAFE_BASE_URL`). The local model runs on one CPU core at background priority. It is loaded on demand and unloaded after use, so it isn't resident in VRAM. It may use the GPU only while GPU load is < 50%.
-- **Big calls** (accept a learned curve, create a profile): when both providers are available, both answer. Agreement → apply. Disagreement → ask the user.
-- Hosted requests contain numbers and exe names only. The user can turn hosted off at any time.
+- **Provider: local only** (Sam, 2026-11-05; hosted Jev is not used, since Jev's weights are closed and it only runs hosted). An open Jev-style decision model (Strands Decider / Clef-flash class), picked by the M20c spike, behind an Ollaya-compatible endpoint on 127.0.0.1. It never needs the network after the one-time model download. The local model runs on one CPU core at background priority. It is loaded on demand and unloaded after use, so it isn't resident in VRAM. It may use the GPU only while GPU load is < 50%.
+- **Big calls** (accept a learned curve, create a profile) need a higher confidence than small ones. Below it → ask the user. The thresholds are set from the spike's measured calibration.
+- If the spike shows the local model costs ≥ 2% FPS, it doesn't run while a game is in the foreground. Its calls queue until the game closes, and the fast layer keeps full control meanwhile (§7.5).
 - No provider available: the fast layer keeps running, the slow layer's calls queue as questions for the user, and nothing pretends to have decided (S8).
 
 ### 7.3 Learning (when the PC is idle)
@@ -163,7 +163,7 @@ A module is done when its tests pass in CI on Windows, macOS and Ubuntu runners 
 Decided 2026-11-04 by Sam:
 
 - Agent modes: 3 — observe, ask, auto. Auto is the default and applies above a confidence threshold, asking below it (agent brainstorm, §7).
-- Agent decision provider: hosted Jev if a key is set and online, local open model otherwise. Both vote on big calls (§7.2).
+- Agent decision provider: local open model only, no hosted Jev (2026-11-05, replaces the earlier hosted + local voting). Big calls use a higher confidence threshold instead of a second model's vote (§7.2).
 - Linux moves to v2.1. v2.0 is Windows-only. CI still builds and tests on Ubuntu and macOS with mock hardware.
 - HWiNFO stays as an optional extra sensor source once the LHM bridge works.
 - LLM for profile generation: OpenRouter by default; any OpenAI-compatible base URL (e.g. local Ollama) can be configured.
