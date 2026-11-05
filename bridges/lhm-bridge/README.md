@@ -2,7 +2,7 @@
 
 .NET sidecar for motherboard fans (SPEC §5.1). The daemon starts it and talks to it over a named pipe. Only the bridge touches LibreHardwareMonitorLib and PawnIO.
 
-**Status:** tests pass with fake hardware and against LHM's real types. It has never run on real hardware. `LhmHardware.cs` is not covered by CI, because it needs the chip. Don't run it on real fans until Sam has reviewed it.
+**Status:** tests pass with fake hardware and against LHM's real types. It has never run on real hardware. `LhmHardware.cs` is not covered by CI, because it needs the chip.
 
 ## Build and test
 
@@ -56,7 +56,7 @@ One JSON object per line, in each direction, at most 64 KiB per line. Every requ
 
 ## Hardware checks before first use
 
-These need Sam's review first. None has been run.
+None has been run. The commands and pass criteria, in the order to run them, are in `docs/dev/m12-pc-checks.md`. It also covers killing a hung bridge. `lhm-bridge.log` records `GetReport` times and slow write landings for checks 3 and 6. A header held at 100% after a failed hand-back can't be provoked on real hardware, so only tests cover it.
 
 1. **Takeover and hand-back:** on a case fan or an empty header, `set` then `restore`: `0xA00` ends clear and the duty returns to the BIOS's.
 2. **No low first write:** watch a header during its first `set`: it must not dip.
@@ -65,5 +65,5 @@ These need Sam's review first. None has been run.
 5. **Watchdog:** a client that stops sending: fans are handed back within 5 s.
 6. **Report cost:** `GetReport` dumps 256 rows and runs on every takeover and hand-back, so time it against the 2 s call timeout.
 7. **Through the daemon, as the service:** install the bridge beside the daemon under Program Files (`lhm-bridge\lhm-bridge.exe`), start the service, and check that `/fans` lists the headers and the pipe's server check passes. CI can't cover this, because the pipe only opens for SYSTEM.
-8. **Anti-cheat mode:** with a fake `faceitclient.exe` running, fans go to the BIOS, the bridge stops and PawnIO shows `STOPPED`. After closing it and waiting 30 s, all three come back. Then repeat with a service restart in the middle.
-9. **Real FACEIT:** check that the process names are right, and whether it starts with PawnIO disabled.
+8. **Anti-cheat mode:** with a fake `faceitclient.exe` running, fans go to the BIOS, the bridge stops and PawnIO is disabled. After closing it and waiting 30 s, all three come back. Then repeat with a service restart in the middle.
+9. **Real FACEIT:** check that `FACEITService` and `faceitclient.exe` are right, that the desktop app alone doesn't start the mode, that the service stops afterwards, and whether the client starts with PawnIO disabled.
