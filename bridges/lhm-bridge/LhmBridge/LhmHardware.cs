@@ -86,7 +86,9 @@ public sealed class LhmHardware : IFanHardware
     public Original? ReadRegisters(Header h)
     {
         if (!h.Controllable) return null;
+        var clock = System.Diagnostics.Stopwatch.StartNew();
         var report = _slots[h.Id].Chip.GetReport();
+        Console.Error.WriteLine($"GetReport took {clock.ElapsedMilliseconds} ms"); // hardware check: only on takeover and hand-back
         return report is null ? null : RegisterReport.Nct6687D(report, h.Index);
     }
 

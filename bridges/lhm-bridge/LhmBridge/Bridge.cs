@@ -27,6 +27,7 @@ public sealed class Bridge
     private readonly HashSet<string> _everTaken = [];
     private readonly Dictionary<string, string> _degraded = [];
     private TimeSpan _lastBeat;
+    private int _slowestLanding;
 
     public Bridge(IFanHardware hw, OriginalsStore store)
         : this(hw, store, Elapsed(), Thread.Sleep)
@@ -224,7 +225,12 @@ public sealed class Bridge
     {
         for (var poll = 0; poll < DutyPolls; poll++)
         {
-            if (_hw.ActualDuty(h) is { } actual && Math.Abs(actual - duty) <= DutyTolerance) return true;
+            if (_hw.ActualDuty(h) is { } actual && Math.Abs(actual - duty) <= DutyTolerance)
+            {
+                // Only a new worst, so the log stays small on a service that runs for months.
+                if (poll > _slowestLanding) Console.Error.WriteLine($"a write took {_slowestLanding = poll} read-back polls to land");
+                return true;
+            }
             _sleep(DutyPollGap);
         }
         return false;
