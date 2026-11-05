@@ -11,6 +11,7 @@ public sealed class FakeHardware : IFanHardware
     public readonly Dictionary<string, float> Actual = new();
     public readonly Dictionary<string, Original> Armed = new();
     public readonly HashSet<string> StuckManual = [];
+    private readonly HashSet<string> _inDefault = [];
     public bool DropWrites;
     public bool ReportUnreadable;
     public int DefaultsUntilClear;
@@ -42,7 +43,8 @@ public sealed class FakeHardware : IFanHardware
     {
         Log.Add($"write {h.Id} {duty}");
         if (DropWrites) return;
-        if (Stored[h.Id] == duty && Registers[h.Id].Mode != 0) return; // LHM ignores a repeated value
+        // LHM ignores a repeated value, unless the control was in default mode.
+        if (!_inDefault.Remove(h.Id) && Stored[h.Id] == duty && Registers[h.Id].Mode != 0) return;
         Registers[h.Id] = Registers[h.Id] with { Mode = (byte)(1 << h.Index), Command = duty };
         Stored[h.Id] = duty;
         Actual[h.Id] = duty;
@@ -57,13 +59,20 @@ public sealed class FakeHardware : IFanHardware
     public void Default(Header h)
     {
         Log.Add($"default {h.Id}");
+        _inDefault.Add(h.Id);
         if (DefaultsUntilClear > 0)
         {
             DefaultsUntilClear--;
             return;
         }
-        if (StuckManual.Contains(h.Id)) return;
-        if (Armed.TryGetValue(h.Id, out var o)) Registers[h.Id] = o;
+        Armed.TryGetValue(h.Id, out var o);
+        if (StuckManual.Contains(h.Id))
+        {
+            // The flag stays set, but the old duty still goes in: the fan drops to it.
+            if (o is not null) Actual[h.Id] = o.Command / 2.55f;
+            return;
+        }
+        if (o is not null) Registers[h.Id] = o;
     }
 
     public static Header Case(int index = 5) =>
