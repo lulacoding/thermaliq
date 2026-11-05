@@ -85,15 +85,19 @@ fn local_model(dir: &Path, service: bool) -> (Option<LocalProvider>, String) {
     let program_files = std::env::var_os("ProgramFiles").map(PathBuf::from);
     let checked = LocalConfig::load(dir).and_then(|c| {
         if let Some(c) = &c {
-            c.check(service, program_files.as_deref())?;
+            c.verify(service, program_files.as_deref())?;
         }
         Ok(c)
     });
     match checked {
-        Ok(Some(c)) => (
-            Some(LocalProvider::new(c, dir.to_owned())),
-            "configured".into(),
-        ),
+        Ok(Some(c)) => {
+            let provider = LocalProvider::new(c, dir.to_owned());
+            let provider = match (service, program_files) {
+                (true, Some(root)) => provider.for_service(root),
+                _ => provider,
+            };
+            (Some(provider), "configured".into())
+        }
         Ok(None) => (None, "not configured".into()),
         Err(e) => {
             eprintln!("local model unavailable: {e}");

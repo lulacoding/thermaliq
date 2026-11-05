@@ -11,8 +11,8 @@ use std::path::Path;
 use std::process::Child;
 use std::ptr::{null, null_mut};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, SetHandleInformation, ERROR_NOT_FOUND, HANDLE, HANDLE_FLAG_INHERIT,
-    RECT,
+    CloseHandle, GetLastError, SetHandleInformation, SetLastError, ERROR_NOT_FOUND, HANDLE,
+    HANDLE_FLAG_INHERIT, RECT,
 };
 use windows_sys::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
@@ -21,7 +21,7 @@ use windows_sys::Win32::Security::Credentials::{
     CredDeleteW, CredFree, CredReadW, CredWriteW, CREDENTIALW, CRED_PERSIST_LOCAL_MACHINE,
     CRED_TYPE_GENERIC,
 };
-use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+use windows_sys::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
     SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -30,9 +30,11 @@ use windows_sys::Win32::System::JobObjects::{
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
 use windows_sys::Win32::System::Threading::{
-    CreateProcessAsUserW, OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
-    CREATE_NO_WINDOW, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, STARTF_USESTDHANDLES,
-    STARTUPINFOW,
+    CreateProcessAsUserW, DeleteProcThreadAttributeList, InitializeProcThreadAttributeList,
+    OpenProcess, QueryFullProcessImageNameW, TerminateProcess, UpdateProcThreadAttribute,
+    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
+    PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW,
 };
 use windows_sys::Win32::UI::Shell::{
     SHQueryUserNotificationState, QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN,
@@ -205,62 +207,122 @@ pub fn spawn_in_user_session(exe: &Path, arg: &str) -> io::Result<(File, Session
     if unsafe { WTSQueryUserToken(session, &mut token) } == 0 {
         return Err(last_error());
     }
-    let attrs = SECURITY_ATTRIBUTES {
-        nLength: core::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: null_mut(),
-        bInheritHandle: 1,
-    };
+    let spawned = spawn_with_token(token, exe, arg, &[]);
+    unsafe { CloseHandle(token) };
+    spawned
+}
+
+/// A SYSTEM handle in a process the user can open is an escalation path, so the child gets a
+/// handle list holding only its pipe (plus `extra`, which only a test passes), never "whatever
+/// is inheritable right now". Its environment is the user's, not the service's.
+fn spawn_with_token(
+    token: HANDLE,
+    exe: &Path,
+    arg: &str,
+    extra: &[HANDLE],
+) -> io::Result<(File, SessionChild)> {
     let (mut read, mut write): (HANDLE, HANDLE) = (null_mut(), null_mut());
-    if unsafe { CreatePipe(&mut read, &mut write, &attrs, 0) } == 0 {
-        let e = last_error();
-        unsafe { CloseHandle(token) };
-        return Err(e);
+    if unsafe { CreatePipe(&mut read, &mut write, null(), 0) } == 0 {
+        return Err(last_error());
     }
-    // Only the child's end is inherited.
-    unsafe { SetHandleInformation(read, HANDLE_FLAG_INHERIT, 0) };
-    let mut desktop = wide(OsStr::new("winsta0\\default"));
-    let app = wide(exe.as_os_str());
-    let mut cmd = wide(OsStr::new(&format!("\"{}\" {arg}", exe.display())));
-    let mut si: STARTUPINFOW = unsafe { core::mem::zeroed() };
-    si.cb = core::mem::size_of::<STARTUPINFOW>() as u32;
-    si.lpDesktop = desktop.as_mut_ptr();
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdOutput = write;
-    si.hStdError = write;
-    let mut pi: PROCESS_INFORMATION = unsafe { core::mem::zeroed() };
-    let ok = unsafe {
-        CreateProcessAsUserW(
-            token,
-            app.as_ptr(),
-            cmd.as_mut_ptr(),
-            null(),
-            null(),
-            1,
-            CREATE_NO_WINDOW,
-            null(),
-            null(),
-            &si,
-            &mut pi,
-        )
-    };
+    // Inheritable only now, and closed just after: as short a window as possible for a
+    // `Command` spawned at the same moment to pick up this pipe.
+    unsafe { SetHandleInformation(write, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) };
+    let mut handles = vec![write];
+    handles.extend_from_slice(extra);
+    let result = create_with_handle_list(token, exe, arg, write, &handles);
     let e = last_error();
+    unsafe { CloseHandle(write) };
+    match result {
+        Ok(pi) => {
+            unsafe { CloseHandle(pi.hThread) };
+            // `read` is ours alone from here on.
+            let stdout = unsafe { File::from_raw_handle(read) };
+            Ok((
+                stdout,
+                SessionChild {
+                    process: pi.hProcess as isize,
+                },
+            ))
+        }
+        Err(()) => {
+            unsafe { CloseHandle(read) };
+            Err(e)
+        }
+    }
+}
+
+/// On failure the OS's last error says why.
+fn create_with_handle_list(
+    token: HANDLE,
+    exe: &Path,
+    arg: &str,
+    stdout: HANDLE,
+    handles: &[HANDLE],
+) -> Result<PROCESS_INFORMATION, ()> {
+    // The first call only asks for the size, and "fails" doing so.
+    let mut size = 0;
+    unsafe { InitializeProcThreadAttributeList(null_mut(), 1, 0, &mut size) };
+    let mut storage = vec![0usize; size / core::mem::size_of::<usize>() + 1];
+    let list = storage.as_mut_ptr().cast();
+    if unsafe { InitializeProcThreadAttributeList(list, 1, 0, &mut size) } == 0 {
+        return Err(());
+    }
+    let mut environment = null_mut();
+    let mut pi: PROCESS_INFORMATION = unsafe { core::mem::zeroed() };
+    let mut ok = unsafe {
+        UpdateProcThreadAttribute(
+            list,
+            0,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+            handles.as_ptr().cast(),
+            core::mem::size_of_val(handles),
+            null_mut(),
+            null(),
+        )
+    } != 0
+        && unsafe { CreateEnvironmentBlock(&mut environment, token, 0) } != 0;
+    if ok {
+        let mut desktop = wide(OsStr::new("winsta0\\default"));
+        let app = wide(exe.as_os_str());
+        let mut cmd = wide(OsStr::new(&format!("\"{}\" {arg}", exe.display())));
+        let mut si: STARTUPINFOEXW = unsafe { core::mem::zeroed() };
+        si.StartupInfo.cb = core::mem::size_of::<STARTUPINFOEXW>() as u32;
+        si.StartupInfo.lpDesktop = desktop.as_mut_ptr();
+        si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        si.StartupInfo.hStdOutput = stdout;
+        si.StartupInfo.hStdError = stdout;
+        si.lpAttributeList = list;
+        ok = unsafe {
+            CreateProcessAsUserW(
+                token,
+                app.as_ptr(),
+                cmd.as_mut_ptr(),
+                null(),
+                null(),
+                1,
+                CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
+                environment,
+                null(),
+                &si.StartupInfo,
+                &mut pi,
+            )
+        } != 0;
+    }
+    // These must not overwrite the error the caller reads.
+    let error = unsafe { GetLastError() };
     unsafe {
-        CloseHandle(write);
-        CloseHandle(token);
+        if !environment.is_null() {
+            DestroyEnvironmentBlock(environment);
+        }
+        DeleteProcThreadAttributeList(list);
+        SetLastError(error);
     }
-    if ok == 0 {
-        unsafe { CloseHandle(read) };
-        return Err(e);
+    if ok {
+        Ok(pi)
+    } else {
+        Err(())
     }
-    unsafe { CloseHandle(pi.hThread) };
-    // `read` is ours alone from here on.
-    let stdout = unsafe { File::from_raw_handle(read) };
-    Ok((
-        stdout,
-        SessionChild {
-            process: pi.hProcess as isize,
-        },
-    ))
 }
 
 // ---- a local model can't outlive the daemon ----
@@ -299,5 +361,158 @@ impl Job {
 impl Drop for Job {
     fn drop(&mut self) {
         unsafe { CloseHandle(self.0 as HANDLE) };
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use windows_sys::Win32::Security::{
+        DuplicateTokenEx, SecurityImpersonation, TokenPrimary, SECURITY_ATTRIBUTES,
+        TOKEN_ALL_ACCESS,
+    };
+    use windows_sys::Win32::Storage::FileSystem::WriteFile;
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    const SECRET: &[u8] = b"system-only-secret";
+    const SERVICE_VAR: &str = "THERMALIQ_TEST_SERVICE_ONLY_VAR";
+    const PROBE: &str = "session-probe=";
+
+    /// Runs inside the child this test binary starts of itself. Does nothing in a normal run.
+    #[test]
+    fn session_probe_child() {
+        let Some(value) = std::env::args()
+            .find_map(|a| a.strip_prefix(PROBE).and_then(|v| v.parse::<isize>().ok()))
+        else {
+            return;
+        };
+        let (mut buf, mut got, mut total) = ([0u8; 64], 0u32, 0u32);
+        let ok = unsafe {
+            PeekNamedPipe(
+                value as HANDLE,
+                buf.as_mut_ptr().cast(),
+                buf.len() as u32,
+                &mut got,
+                &mut total,
+                null_mut(),
+            )
+        };
+        let leaked = ok != 0 && &buf[..got as usize] == SECRET;
+        println!(
+            "probe leaked={leaked} service_var={} user_env={}",
+            std::env::var_os(SERVICE_VAR).is_some(),
+            std::env::var_os("USERPROFILE").is_some()
+        );
+    }
+
+    /// An inheritable handle holding a secret, as a handle inside the service might.
+    fn inheritable_secret() -> HANDLE {
+        let attrs = SECURITY_ATTRIBUTES {
+            nLength: core::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: null_mut(),
+            bInheritHandle: 1,
+        };
+        let (mut read, mut write): (HANDLE, HANDLE) = (null_mut(), null_mut());
+        assert_ne!(unsafe { CreatePipe(&mut read, &mut write, &attrs, 0) }, 0);
+        let mut wrote = 0;
+        assert_ne!(
+            unsafe {
+                WriteFile(
+                    write,
+                    SECRET.as_ptr(),
+                    SECRET.len() as u32,
+                    &mut wrote,
+                    null_mut(),
+                )
+            },
+            0
+        );
+        read
+    }
+
+    /// Our own token, duplicated as a primary one: the shape `WTSQueryUserToken` returns.
+    fn own_token() -> HANDLE {
+        let (mut mine, mut dup): (HANDLE, HANDLE) = (null_mut(), null_mut());
+        unsafe {
+            assert_ne!(
+                OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &mut mine),
+                0
+            );
+            assert_ne!(
+                DuplicateTokenEx(
+                    mine,
+                    TOKEN_ALL_ACCESS,
+                    null(),
+                    SecurityImpersonation,
+                    TokenPrimary,
+                    &mut dup
+                ),
+                0
+            );
+            CloseHandle(mine);
+        }
+        dup
+    }
+
+    /// The child's report, or `None` when this logon may not start a process with a token.
+    fn probe(secret: HANDLE, extra: &[HANDLE]) -> Option<String> {
+        let exe = std::env::current_exe().unwrap();
+        let arg = format!(
+            "win::tests::session_probe_child --exact --nocapture --test-threads=1 {PROBE}{}",
+            secret as isize
+        );
+        let token = own_token();
+        let spawned = spawn_with_token(token, &exe, &arg, extra);
+        unsafe { CloseHandle(token) };
+        let (mut out, _child) = match spawned {
+            Ok(s) => s,
+            // ERROR_PRIVILEGE_NOT_HELD: the service has this right, a dev shell may not
+            Err(e) if e.raw_os_error() == Some(1314) => {
+                assert!(std::env::var_os("CI").is_none(), "{e}");
+                eprintln!("skipped: {e}");
+                return None;
+            }
+            Err(e) => panic!("{e}"),
+        };
+        let mut text = String::new();
+        out.read_to_string(&mut text).unwrap();
+        let line = text
+            .lines()
+            .find(|l| l.contains("probe leaked="))
+            .map(str::to_owned);
+        Some(line.unwrap_or_else(|| panic!("the child never reported: {text}")))
+    }
+
+    #[test]
+    fn the_session_child_inherits_only_its_pipe() {
+        let secret = inheritable_secret();
+        let Some(report) = probe(secret, &[]) else {
+            return;
+        };
+        assert!(report.contains("leaked=false"), "{report}");
+    }
+
+    /// Shows the probe can see a leak at all, so the test above means something.
+    #[test]
+    fn the_probe_does_see_a_handle_that_is_passed_on() {
+        let secret = inheritable_secret();
+        let Some(report) = probe(secret, &[secret]) else {
+            return;
+        };
+        assert!(report.contains("leaked=true"), "{report}");
+    }
+
+    #[test]
+    fn the_session_child_gets_the_users_environment_not_ours() {
+        // Unique name, only read in the child: no other test cares.
+        std::env::set_var(SERVICE_VAR, "1");
+        let Some(report) = probe(null_mut(), &[]) else {
+            return;
+        };
+        assert!(report.contains("service_var=false"), "{report}");
+        assert!(report.contains("user_env=true"), "{report}");
     }
 }

@@ -194,21 +194,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File docs\dev\research\decision-l
 
 ### Setting up the local route for the service (M20c, not tested yet)
 
-The service runs the model as SYSTEM, so it only accepts an exe under `%ProgramFiles%`, and it stores models under the data directory. In an **admin** PowerShell:
-
-```powershell
-$src = (Get-ChildItem "$env:LOCALAPPDATA\ollaya-spike\bin" -Recurse -Filter ollaya.exe).DirectoryName
-Copy-Item $src "$env:ProgramFiles\Ollaya" -Recurse
-$env:OLLAYA_MODELS = "$env:ProgramData\ThermalIQ\models"; $env:OLLAYA_DEVICE = 'cpu'
-& "$env:ProgramFiles\Ollaya\ollaya.exe" pull strands-decider:2b
-Get-Process ollaya* -ErrorAction SilentlyContinue | Stop-Process
-@"
-exe = '$env:ProgramFiles\Ollaya\ollaya.exe'
-model = 'strands-decider:2b'
-"@ | Set-Content -Encoding ascii "$env:ProgramData\ThermalIQ\local-model.toml"
-```
-
-Restart the service. `GET /agent/decisions` then shows `"local": "configured"`, or why it is unusable.
+The service runs the model as SYSTEM, so it only accepts an exe under `%ProgramFiles%` that nobody but administrators can replace, and it reads models from `<data dir>\models`. The steps are in `docs/dev/m20c-pc-checks.md`, step 5. Ollaya's install is `bin`, `lib` and `share`, and all of it must be copied.
 
 ### Not done
 

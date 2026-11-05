@@ -202,6 +202,28 @@ impl LocalConfig {
         }
         Ok(())
     }
+
+    /// `check`, and for a service, that nobody but an administrator could replace the exe or the
+    /// DLLs beside it. Some installers leave a Program Files folder writable, and whoever swaps
+    /// the exe then runs as SYSTEM. M21 should also drop the rights the model runs with.
+    pub fn verify(&self, service: bool, program_files: Option<&Path>) -> Result<(), String> {
+        self.check(service, program_files)?;
+        #[cfg(windows)]
+        if let (true, Some(root)) = (service, program_files) {
+            // Lower case on both sides, as in `check`: these paths are case-insensitive.
+            let exe = PathBuf::from(self.exe.to_lowercase());
+            let root = PathBuf::from(root.to_string_lossy().to_lowercase());
+            let problems = crate::acl::replaceable_by_others(&exe, &root)
+                .map_err(|e| format!("cannot check who could replace the exe: {e}"))?;
+            if !problems.is_empty() {
+                return Err(format!(
+                    "others could replace the exe: {}",
+                    problems.join("; ")
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// SPEC §7.2: when idle, up to half the cores. Counted as logical processors, the unit these
@@ -241,6 +263,8 @@ impl Drop for Running {
 pub struct LocalProvider {
     config: LocalConfig,
     data_dir: PathBuf,
+    /// Set for the service: `%ProgramFiles%`, to check the exe again before every start.
+    service_root: Option<PathBuf>,
     /// Only tests read it: to see the process is gone.
     pub last_pid: Option<u32>,
 }
@@ -250,8 +274,16 @@ impl LocalProvider {
         Self {
             config,
             data_dir,
+            service_root: None,
             last_pid: None,
         }
+    }
+
+    /// The ACLs may have changed since startup (an update, a reinstall), and this runs as SYSTEM.
+    #[must_use]
+    pub fn for_service(mut self, program_files: PathBuf) -> Self {
+        self.service_root = Some(program_files);
+        self
     }
 
     fn start(&self) -> std::io::Result<Running> {
@@ -325,7 +357,14 @@ impl DecisionProvider for LocalProvider {
         if cancel() {
             return Err(AskError::Cancelled);
         }
-        // Whatever is there isn't the process we started and control.
+        if let Some(root) = &self.service_root {
+            self.config
+                .verify(true, Some(root))
+                .map_err(AskError::Unavailable)?;
+        }
+        // The local server has no authentication on 127.0.0.1, so whatever already listens here
+        // could be anyone's: a squatter must not be able to feed us answers. Refuse it, and only
+        // talk to a port that was free before we started our own process.
         if port_in_use(self.config.port) {
             return Err(AskError::Unavailable(format!(
                 "something already listens on port {}",
@@ -632,6 +671,31 @@ mod tests {
             ok("C:\\Users\\sam\\ollaya.exe", false),
             "dev runs as the user"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_service_refuses_an_exe_others_can_replace_and_starts_nothing() {
+        let t = tempfile::tempdir().unwrap();
+        let app = t.path().join("App");
+        std::fs::create_dir(&app).unwrap();
+        let exe = app.join("model.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+        let cfg = config(&exe.to_string_lossy());
+        // a temp folder is writable by whoever runs this, who is no Administrators-only owner
+        let why = cfg.verify(true, Some(t.path())).unwrap_err();
+        assert!(why.contains("replace"), "{why}");
+        assert!(
+            cfg.verify(false, Some(t.path())).is_ok(),
+            "dev runs as the user"
+        );
+        let d = tempfile::tempdir().unwrap();
+        let mut p = local(cfg, &d).for_service(t.path().to_owned());
+        assert!(matches!(
+            p.ask(&workload_question(state()), &never),
+            Err(AskError::Unavailable(_))
+        ));
+        assert_eq!(p.last_pid, None, "checked again before every start");
     }
 
     #[test]
