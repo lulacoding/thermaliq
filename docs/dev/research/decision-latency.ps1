@@ -30,6 +30,8 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+# .NET's default waits for a reply before sending the body, which curl doesn't do: it would inflate latency.
+[Net.ServicePointManager]::Expect100Continue = $false
 
 $HostedUrl = 'https://openrouter.ai/api/v1/systemone'
 $HostedModel = 'typesafe/jev-1.14'
@@ -225,6 +227,12 @@ function Invoke-Benchmark {
 function Invoke-HostedBenchmark {
     if ($EverySeconds -gt 0 -or $Exe) { throw '-Hosted takes no -Exe or -EverySeconds' }
     if ($Count -lt 1) { throw 'Count must be at least 1' }
+    # A new powershell.exe runs the profile first, and a profile can replace the window's key.
+    $launch = [Environment]::GetCommandLineArgs()
+    if (($launch -match '^-f(ile)?$') -and -not ($launch -match '^-nop')) {
+        Write-Host 'FAIL: started without -NoProfile, so your PowerShell profile may have replaced the key from this window. Add -NoProfile.'
+        return 1
+    }
     if (-not $env:OPENROUTER_API_KEY) { Write-Host 'FAIL: $env:OPENROUTER_API_KEY is not set'; return 1 }
     if (-not $Model) { $script:Model = $HostedModel }
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -232,7 +240,17 @@ function Invoke-HostedBenchmark {
     try {
         for ($i = 1; $i -le $Count; $i++) { $times += Invoke-Decision $i }
     } catch {
-        Write-Host "FAIL after $($times.Count)/$Count decisions: $(Hide-Key "$_")"
+        $resp = $_.Exception.Response
+        $status = if ($resp) { "HTTP $([int]$resp.StatusCode)" } else { 'no HTTP status' }
+        Write-Host "FAIL after $($times.Count)/$Count decisions: $status`: $(Hide-Key "$($_.Exception.Message)")"
+        # PowerShell 5.1 leaves ErrorDetails empty for some responses, OpenRouter's 401 included.
+        $body = $_.ErrorDetails.Message
+        if (-not $body -and $resp) {
+            $stream = $resp.GetResponseStream()
+            if ($stream.CanSeek) { $stream.Position = 0 }
+            $body = [IO.StreamReader]::new($stream).ReadToEnd()
+        }
+        if ($body) { Write-Host "response body: $(Hide-Key $body)" }
         $code = 1
     }
     if ($times.Count) {
@@ -259,7 +277,10 @@ function Invoke-FakeServer {
         $echo = if ($bad -and $FakeHosted) { $auth } else { '' }
         $json = "{`"model`":`"fake`",`"echo`":`"$echo`",`"answers`":{`"workload`":{`"type`":`"choice`",`"choice`":`"$choice`",`"confidence`":0.9},`"profile`":{`"type`":`"choice`",`"choice`":`"gaming`",`"confidence`":0.8}},`"usage`":{`"input_tokens`":1,`"output_tokens`":0,`"cost`":0.00001}}"
         if ($FakeHosted) {
-            if ($auth -ne "Bearer $env:OPENROUTER_API_KEY") { $ctx.Response.StatusCode = 401 }
+            if ($auth -ne "Bearer $env:OPENROUTER_API_KEY") {
+                $ctx.Response.StatusCode = 401
+                $json = "{`"error`":{`"message`":`"User not found for $auth`",`"code`":401}}"
+            }
         } elseif ($env:OPENROUTER_API_KEY) { $ctx.Response.StatusCode = 500 } # a local server must not inherit the key
         elseif ($served -eq 1) { $ctx.Response.StatusCode = 503 } # as llama-server does while loading
         elseif ($Escape) { (Get-Process -Id $PID).ProcessorAffinity = [IntPtr]1 }
@@ -334,9 +355,12 @@ function Invoke-SelfTestChecks {
     Check 'hosted: counts answers outside the schema and keeps going' ($r.Code -eq 1 -and $r.Out -match '5/5 answered' -and $r.Out -match 'outside the schema: 2')
     Check 'hosted: an echoed key is hidden' ($r.Out -match '\[key\]' -and $r.Out -notmatch $testKey)
     $r = RunHosted '' 'selftest-wrong-key'
-    Check 'hosted: a rejected key fails without printing it' ($r.Code -eq 1 -and $r.Out -match '401' -and $r.Out -notmatch 'selftest-wrong-key')
+    Check 'hosted: a rejected key fails without printing it' ($r.Code -eq 1 -and $r.Out -match 'HTTP 401' -and $r.Out -notmatch 'selftest-wrong-key')
+    Check 'hosted: prints the error body, key hidden' ($r.Out -match 'response body: .*User not found for Bearer \[key\]')
     $r = RunHosted '' $null
     Check 'hosted: no key, no request' ($r.Code -eq 1 -and $r.Out -match 'is not set')
+    $out = & powershell.exe -ExecutionPolicy Bypass -File $PSCommandPath -Hosted -HostedToFake -Port $fp -Count 1 -TimeoutSec 5 *>&1 | Out-String
+    Check 'hosted: refuses a start that reloads the profile' ($LASTEXITCODE -eq 1 -and $out -match 'without -NoProfile')
     if ($script:failed) { Write-Host "$script:failed self-test(s) FAILED"; return 1 }
     Write-Host 'self-test passed'
     0

@@ -111,16 +111,16 @@ uv pip install --python $py strands-decider
 Close other heavy apps. The script is `docs/dev/research/decision-latency.ps1`. It starts the server itself, sets it and its child processes to idle priority on the last logical CPU, sends one warm-up and then 50 decisions, and reports median, p95 (nearest rank), time to first answer and peak memory. It fails if any answer is outside the schema, if a process left the core, or if something was already listening on the port. Each request asks both questions (workload, profile) about a different exe.
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File docs\dev\research\decision-latency.ps1 -SelfTest    # no model needed
+powershell -NoProfile -ExecutionPolicy Bypass -File docs\dev\research\decision-latency.ps1 -SelfTest    # no model needed
 
 # Strands 2B
-powershell -ExecutionPolicy Bypass -File docs\dev\research\decision-latency.ps1 -Exe $ollaya -ExeArgs serve -Model strands-decider:2b -Port 11435
+powershell -NoProfile -ExecutionPolicy Bypass -File docs\dev\research\decision-latency.ps1 -Exe $ollaya -ExeArgs serve -Model strands-decider:2b -Port 11435
 
 # Clef-flash
-powershell -ExecutionPolicy Bypass -File docs\dev\research\decision-latency.ps1 -Exe llama-server -ExeArgs "-hf felipeTromso/clef-flash-GGUF:Q4_K_M -ngl 0 -t 1 -tb 1 -c 4096 -b 4096 -ub 4096 --parallel 1 --port 8080" -Port 8080
+powershell -NoProfile -ExecutionPolicy Bypass -File docs\dev\research\decision-latency.ps1 -Exe llama-server -ExeArgs "-hf felipeTromso/clef-flash-GGUF:Q4_K_M -ngl 0 -t 1 -tb 1 -c 4096 -b 4096 -ub 4096 --parallel 1 --port 8080" -Port 8080
 
 # Strands 2B, pip fallback. --max-batch 2: the default warm-up would run 32 shapes on one core.
-powershell -ExecutionPolicy Bypass -File docs\dev\research\decision-latency.ps1 -Exe "$env:LOCALAPPDATA\strands-spike\Scripts\strands-decider.exe" -ExeArgs "serve StrandsAgents/strands-decider-2B-qwen3.5-v1-2610 --device cpu --max-batch 2 --port 8000" -Port 8000
+powershell -NoProfile -ExecutionPolicy Bypass -File docs\dev\research\decision-latency.ps1 -Exe "$env:LOCALAPPDATA\strands-spike\Scripts\strands-decider.exe" -ExeArgs "serve StrandsAgents/strands-decider-2B-qwen3.5-v1-2610 --device cpu --max-batch 2 --port 8000" -Port 8000
 ```
 
 A request that takes over 300 s fails the run. Raise it with `-TimeoutSec` if one core really is that slow, and record that. Add the numbers to the results table.
@@ -133,12 +133,13 @@ This sends the same 50 decisions to `typesafe/jev-1.14` through [OpenRouter's `/
 
 ```powershell
 [bool]$env:OPENROUTER_API_KEY     # must print True
-powershell -ExecutionPolicy Bypass -File docs\dev\research\decision-latency.ps1 -Hosted
+powershell -NoProfile -ExecutionPolicy Bypass -File docs\dev\research\decision-latency.ps1 -Hosted
 ```
 
 - **Key:** it comes from `$env:OPENROUTER_API_KEY` only, goes only to the OpenRouter URL, and redirects are refused. It is never written to a file or printed, and local model servers don't inherit it. If you set it by hand, don't type the value at a prompt, because PSReadLine may save the line to its history file.
+- **`-NoProfile` is required:** a new `powershell` runs your profile first, and a profile that sets `OPENROUTER_API_KEY` replaces the key from your window. That gives a 401 while curl in the same window works. `-Hosted` refuses to start without it.
 - **Report:** median and p95 of all answered requests, the count over 2 s, the count outside the schema, the model snapshot that answered, and the cost. An answer outside the schema is printed and counted, and the run continues and exits 1.
-- **HTTP errors:** the first one (rate limit, no credit, bad key) stops the run, with partial numbers marked as partial. It doesn't retry, because that would hide the real latency.
+- **HTTP errors:** the first one (rate limit, no credit, bad key) stops the run, prints the status and OpenRouter's error body with the key hidden, and marks partial numbers as partial. It doesn't retry, because that would hide the real latency.
 - **Connections:** every call opens a new TLS connection, as a call every 60 s would. This is latency from your PC to OpenRouter and back, on your connection at that time.
 
 ### Measure the FPS cost
@@ -176,7 +177,7 @@ $ollaya = (Get-ChildItem "$env:LOCALAPPDATA\ollaya-spike\bin" -Recurse -Filter o
    Normal window:
 
    ```powershell
-   while ((Get-Date).Second -ne 0) { Start-Sleep -Milliseconds 100 }; powershell -ExecutionPolicy Bypass -File docs\dev\research\decision-latency.ps1 -Exe $ollaya -ExeArgs serve -Model strands-decider:2b -Port 11435 -EverySeconds 60 -Count 3
+   while ((Get-Date).Second -ne 0) { Start-Sleep -Milliseconds 100 }; powershell -NoProfile -ExecutionPolicy Bypass -File docs\dev\research\decision-latency.ps1 -Exe $ollaya -ExeArgs serve -Model strands-decider:2b -Port 11435 -EverySeconds 60 -Count 3
    ```
 
 4. **Repeat steps 2 and 3 once**, saving to `without2.csv` and `with2.csv`, so that the order is without, with, without, with. If the two runs without the model differ by more than 1%, a 2% gate can't be read from this scene: pick a steadier scene or use more runs.
