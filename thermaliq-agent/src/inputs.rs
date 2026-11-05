@@ -63,22 +63,41 @@ impl ComponentBinding {
     }
 }
 
-/// Ids of the four metrics the workload classifier reads.
-#[derive(Debug, Clone)]
+/// Ids of the metrics the workload classifier reads. HWiNFO is optional, so a machine
+/// may have no CPU load or power: leave those `None`. A bound id that is missing in a
+/// snapshot makes the whole reading unknown.
+#[derive(Debug, Clone, Default)]
 pub struct WorkloadBinding {
-    pub cpu_load: String,
-    pub gpu_load: String,
-    pub cpu_power: String,
-    pub gpu_power: String,
+    pub cpu_load: Option<String>,
+    pub gpu_load: Option<String>,
+    pub cpu_power: Option<String>,
+    pub gpu_power: Option<String>,
 }
 
 impl WorkloadBinding {
+    /// Which of [cpu load, gpu load, cpu power, gpu power] this machine has.
+    pub fn used(&self) -> [bool; 4] {
+        [
+            self.cpu_load.is_some(),
+            self.gpu_load.is_some(),
+            self.cpu_power.is_some(),
+            self.gpu_power.is_some(),
+        ]
+    }
+
+    /// The four features, 0.0 in the slots that are not bound (the classifier ignores
+    /// them). `None` if a bound metric is missing or invalid, or nothing is bound.
     pub fn features(&self, snap: &HardwareSnapshot) -> Option<[f64; 4]> {
+        let get = |id: &Option<String>, kind| match id {
+            None => Some(0.0),
+            Some(id) => metric(snap, id, kind),
+        };
+        self.used().contains(&true).then_some(())?;
         Some([
-            metric(snap, &self.cpu_load, MetricKind::CpuLoad)?,
-            metric(snap, &self.gpu_load, MetricKind::GpuLoad)?,
-            metric(snap, &self.cpu_power, MetricKind::CpuPower)?,
-            metric(snap, &self.gpu_power, MetricKind::GpuPower)?,
+            get(&self.cpu_load, MetricKind::CpuLoad)?,
+            get(&self.gpu_load, MetricKind::GpuLoad)?,
+            get(&self.cpu_power, MetricKind::CpuPower)?,
+            get(&self.gpu_power, MetricKind::GpuPower)?,
         ])
     }
 }
@@ -174,15 +193,27 @@ mod tests {
     #[test]
     fn workload_features_need_all_four() {
         let b = WorkloadBinding {
-            cpu_load: "c".into(),
-            gpu_load: "nvml_gpu0_load".into(),
-            cpu_power: "cp".into(),
-            gpu_power: "nvml_gpu0_power".into(),
+            cpu_load: Some("c".into()),
+            gpu_load: Some("nvml_gpu0_load".into()),
+            cpu_power: Some("cp".into()),
+            gpu_power: Some("nvml_gpu0_power".into()),
         };
         assert!(b.features(&snap()).is_none());
         let mut s = snap();
         s.metrics.push(m("c", MetricKind::CpuLoad, 10.0));
         s.metrics.push(m("cp", MetricKind::CpuPower, 40.0));
         assert_eq!(b.features(&s), Some([10.0, 90.0, 40.0, 120.0]));
+    }
+
+    #[test]
+    fn gpu_only_machine_still_has_features() {
+        let b = WorkloadBinding {
+            gpu_load: Some("nvml_gpu0_load".into()),
+            gpu_power: Some("nvml_gpu0_power".into()),
+            ..Default::default()
+        };
+        assert_eq!(b.used(), [false, true, false, true]);
+        assert_eq!(b.features(&snap()), Some([0.0, 90.0, 0.0, 120.0]));
+        assert!(WorkloadBinding::default().features(&snap()).is_none());
     }
 }

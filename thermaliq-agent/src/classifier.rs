@@ -38,9 +38,15 @@ struct Stump {
     right: f64,
 }
 
+/// Below this softmax probability the answer is "unknown": a forced argmax on an input
+/// unlike the training data is a confident wrong answer.
+pub const MIN_CONFIDENCE: f64 = 0.6;
+
 #[derive(Debug, Clone)]
 pub struct Classifier {
     stumps: Vec<Stump>,
+    /// Features this machine has (see `WorkloadBinding::used`); the rest are ignored.
+    used: [bool; F],
 }
 
 fn scores(stumps: &[Stump], x: &[f64; F]) -> [f64; K] {
@@ -63,10 +69,15 @@ fn softmax(s: [f64; K]) -> [f64; K] {
 }
 
 /// Best single split of `g` (the residuals) over the rows: leaf values are scaled means.
-fn fit_stump(data: &[([f64; F], Workload)], g: &[f64], class: usize) -> Option<Stump> {
+fn fit_stump(
+    data: &[([f64; F], Workload)],
+    g: &[f64],
+    class: usize,
+    used: &[bool; F],
+) -> Option<Stump> {
     let total: f64 = g.iter().sum();
     let mut best: Option<(f64, Stump)> = None;
-    for feat in 0..F {
+    for feat in (0..F).filter(|&f| used[f]) {
         let mut idx: Vec<usize> = (0..data.len()).collect();
         idx.sort_by(|&a, &b| data[a].0[feat].total_cmp(&data[b].0[feat]));
         let mut sum_l = 0.0;
@@ -99,13 +110,16 @@ fn fit_stump(data: &[([f64; F], Workload)], g: &[f64], class: usize) -> Option<S
 }
 
 impl Classifier {
-    /// `None` if there is no data, a non-finite feature, or fewer than two classes seen.
-    pub fn train(data: &[([f64; F], Workload)]) -> Option<Self> {
+    /// `used` marks the features this machine has; only those are read. `None` if no
+    /// feature is used, there is no data, a used feature is non-finite, or fewer than two
+    /// classes were seen.
+    pub fn train(data: &[([f64; F], Workload)], used: [bool; F]) -> Option<Self> {
         let classes = ALL
             .iter()
             .filter(|w| data.iter().any(|d| d.1 == **w))
             .count();
-        if data.is_empty() || classes < 2 || data.iter().any(|d| d.0.iter().any(|v| !v.is_finite()))
+        let bad = |x: &[f64; F]| (0..F).any(|i| used[i] && !x[i].is_finite());
+        if data.is_empty() || classes < 2 || !used.contains(&true) || data.iter().any(|d| bad(&d.0))
         {
             return None;
         }
@@ -121,23 +135,33 @@ impl Classifier {
                     .zip(&p)
                     .map(|(d, p)| (d.1 as usize == class) as u8 as f64 - p[class])
                     .collect();
-                stumps.extend(fit_stump(data, &g, class));
+                stumps.extend(fit_stump(data, &g, class, &used));
             }
         }
-        Some(Self { stumps })
+        Some(Self { stumps, used })
     }
 
-    pub fn predict(&self, x: &[f64; F]) -> Option<Workload> {
-        if x.iter().any(|v| !v.is_finite()) {
+    /// The workload and its probability, or `None` ("unknown") for a non-finite used
+    /// feature or a probability below `MIN_CONFIDENCE`.
+    pub fn predict(&self, x: &[f64; F]) -> Option<(Workload, f64)> {
+        if (0..F).any(|i| self.used[i] && !x[i].is_finite()) {
             return None;
         }
-        let s = scores(&self.stumps, x);
-        let best = (0..K).max_by(|&a, &b| s[a].total_cmp(&s[b]))?;
-        Some(ALL[best])
+        let p = softmax(scores(&self.stumps, x));
+        let best = (0..K).max_by(|&a, &b| p[a].total_cmp(&p[b]))?;
+        (p[best] >= MIN_CONFIDENCE).then_some((ALL[best], p[best]))
     }
 
-    /// `None` ("unknown") when any bound metric is missing or invalid.
-    pub fn classify(&self, snap: &HardwareSnapshot, b: &WorkloadBinding) -> Option<Workload> {
+    /// `None` ("unknown") when a bound metric is missing or invalid, or the binding has
+    /// different features than this classifier was trained on.
+    pub fn classify(
+        &self,
+        snap: &HardwareSnapshot,
+        b: &WorkloadBinding,
+    ) -> Option<(Workload, f64)> {
+        if b.used() != self.used {
+            return None;
+        }
         self.predict(&b.features(snap)?)
     }
 }
@@ -168,20 +192,40 @@ mod tests {
         (0..n)
             .map(|i| {
                 let (c, w) = centres[i % K];
-                (c.map(|v| (v + jitter()).clamp(0.0, 100.0)), w)
+                // Only the loads (first two) are percentages; watts are not capped.
+                let x: [f64; F] = std::array::from_fn(|k| {
+                    let v = c[k] + jitter();
+                    if k < 2 {
+                        v.clamp(0.0, 100.0)
+                    } else {
+                        v.max(0.0)
+                    }
+                });
+                (x, w)
             })
             .collect()
     }
 
+    const ALL_FEATURES: [bool; F] = [true; F];
+
+    fn class_of(c: &Classifier, x: &[f64; F]) -> Option<Workload> {
+        c.predict(x).map(|p| p.0)
+    }
+
     #[test]
     fn learns_workloads_and_predicts_fast() {
-        let c = Classifier::train(&data(600, 1)).expect("train");
+        let c = Classifier::train(&data(600, 1), ALL_FEATURES).expect("train");
         let test = data(600, 7);
         let hits = test
             .iter()
-            .filter(|(x, w)| c.predict(x) == Some(*w))
+            .filter(|(x, w)| class_of(&c, x) == Some(*w))
             .count();
         assert!(hits as f64 / test.len() as f64 > 0.95, "{hits}/600");
+        assert!(test
+            .iter()
+            .all(|(x, _)| c.predict(x).is_none_or(|p| p.1 >= MIN_CONFIDENCE)));
+        // watts above 100 reach the model unclamped
+        assert!(test.iter().any(|(x, _)| x[3] > 100.0));
         let t = Instant::now();
         for (x, _) in &test {
             c.predict(x);
@@ -194,26 +238,77 @@ mod tests {
 
     #[test]
     fn bad_training_data_gives_no_model() {
-        assert!(Classifier::train(&[]).is_none());
+        assert!(Classifier::train(&[], ALL_FEATURES).is_none());
         let one_class: Vec<_> = data(60, 1)
             .into_iter()
             .filter(|d| d.1 == Workload::Idle)
             .collect();
-        assert!(Classifier::train(&one_class).is_none());
+        assert!(Classifier::train(&one_class, ALL_FEATURES).is_none());
+        assert!(Classifier::train(&data(60, 1), [false; F]).is_none());
         let mut nan = data(60, 1);
         nan[3].0[2] = f64::NAN;
-        assert!(Classifier::train(&nan).is_none());
+        assert!(Classifier::train(&nan, ALL_FEATURES).is_none());
+        // a NaN in a feature the machine doesn't have is ignored
+        assert!(Classifier::train(&nan, [true, true, false, true]).is_some());
+    }
+
+    #[test]
+    fn ambiguous_input_is_unknown_not_a_forced_guess() {
+        let c = Classifier::train(&data(600, 1), ALL_FEATURES).expect("train");
+        // halfway between the Gaming and Rendering centres
+        assert_eq!(c.predict(&[67.5, 92.5, 90.0, 165.0]), None);
+    }
+
+    #[test]
+    fn gpu_only_machine_tells_gaming_from_idle() {
+        let gpu_only = [false, true, false, true];
+        let train: Vec<_> = data(600, 1)
+            .into_iter()
+            .filter(|d| matches!(d.1, Workload::Idle | Workload::Browsing | Workload::Gaming))
+            .collect();
+        let c = Classifier::train(&train, gpu_only).expect("train");
+        let b = WorkloadBinding {
+            gpu_load: Some("gl".into()),
+            gpu_power: Some("gp".into()),
+            ..Default::default()
+        };
+        let m = |id: &str, kind, value| MetricReading {
+            id: id.into(),
+            kind,
+            value,
+        };
+        let snap = |load, watts| HardwareSnapshot {
+            metrics: vec![
+                m("gl", MetricKind::GpuLoad, load),
+                m("gp", MetricKind::GpuPower, watts),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            c.classify(&snap(95.0, 170.0), &b).map(|p| p.0),
+            Some(Workload::Gaming)
+        );
+        assert_eq!(
+            c.classify(&snap(1.0, 8.0), &b).map(|p| p.0),
+            Some(Workload::Idle)
+        );
+        // a binding with different features than the training is unknown
+        let full = WorkloadBinding {
+            cpu_load: Some("cl".into()),
+            ..b.clone()
+        };
+        assert_eq!(c.classify(&snap(95.0, 170.0), &full), None);
     }
 
     #[test]
     fn missing_or_bad_inputs_are_unknown() {
-        let c = Classifier::train(&data(120, 1)).expect("train");
+        let c = Classifier::train(&data(120, 1), ALL_FEATURES).expect("train");
         assert_eq!(c.predict(&[f64::NAN, 0.0, 0.0, 0.0]), None);
         let b = WorkloadBinding {
-            cpu_load: "cl".into(),
-            gpu_load: "gl".into(),
-            cpu_power: "cp".into(),
-            gpu_power: "gp".into(),
+            cpu_load: Some("cl".into()),
+            gpu_load: Some("gl".into()),
+            cpu_power: Some("cp".into()),
+            gpu_power: Some("gp".into()),
         };
         let m = |id: &str, kind, value| MetricReading {
             id: id.into(),
@@ -230,6 +325,9 @@ mod tests {
         };
         assert_eq!(c.classify(&snap, &b), None); // no gpu power
         snap.metrics.push(m("gp", MetricKind::GpuPower, 12.0));
-        assert_eq!(c.classify(&snap, &b), Some(Workload::Compiling));
+        assert_eq!(
+            c.classify(&snap, &b).map(|p| p.0),
+            Some(Workload::Compiling)
+        );
     }
 }
