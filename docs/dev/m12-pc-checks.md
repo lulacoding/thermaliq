@@ -42,8 +42,8 @@ Start-Service ThermalIQ
 Start-Sleep 15
 $api = 'http://127.0.0.1:7272'
 function Show-State {
-    Invoke-RestMethod "$api/status" | Select-Object degraded, degraded_reasons, unavailable_sources | Format-List
-    Invoke-RestMethod "$api/fans" | Select-Object id, label, kind, rpm, duty_percent, curve_duty | Format-Table
+    (Invoke-RestMethod "$api/status") | Select-Object degraded, degraded_reasons, unavailable_sources | Format-List
+    (Invoke-RestMethod "$api/fans") | Select-Object id, label, kind, rpm, duty_percent, curve_duty | Format-Table
     Get-Process lhm-bridge -ErrorAction SilentlyContinue | Select-Object Id, StartTime | Format-Table
 }
 Show-State
@@ -136,7 +136,7 @@ $b = Get-Process lhm-bridge; $old = $b.Id
 $t = [Diagnostics.Stopwatch]::StartNew()
 while ((Get-Process -Id $old -ErrorAction SilentlyContinue) -and $t.Elapsed.TotalSeconds -lt 20) { Start-Sleep -Milliseconds 100 }
 "gone after $($t.Elapsed.TotalSeconds) s"
-Invoke-RestMethod "$api/status" | Select-Object degraded, degraded_reasons
+(Invoke-RestMethod "$api/status") | Select-Object degraded, degraded_reasons
 Start-Sleep 20
 Show-State
 ```
