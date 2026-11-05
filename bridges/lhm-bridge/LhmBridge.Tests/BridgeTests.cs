@@ -153,6 +153,21 @@ public sealed class BridgeTests : IDisposable
     }
 
     [Fact]
+    public void A_manual_header_message_names_the_tools_to_close_and_clears_once_it_is_free()
+    {
+        var h = FakeHardware.Case();
+        var hw = new FakeHardware(h);
+        hw.Registers[h.Id] = new Original(0x20, 0x66);
+        var b = Make(hw);
+        b.Set(h.Id, 60);
+        Assert.Contains("Fan Control", b.Degraded[h.Id]);
+        Assert.Contains("MSI Center", b.Degraded[h.Id]);
+        hw.Registers[h.Id] = new Original(0, 0x66);
+        Assert.Null(b.Set(h.Id, 60));
+        Assert.Empty(b.Degraded);
+    }
+
+    [Fact]
     public void Unreadable_registers_refuse_the_takeover()
     {
         var h = FakeHardware.Case();
@@ -220,6 +235,72 @@ public sealed class BridgeTests : IDisposable
         Assert.Contains("manual", b.Restore(h.Id));
         Assert.Contains(h.Id, b.Degraded.Keys);
         Assert.True(Store().Has(h.Id));
+    }
+
+    [Fact]
+    public void A_stuck_header_ends_at_100_percent_and_says_so()
+    {
+        var h = FakeHardware.Case();
+        var hw = new FakeHardware(h);
+        var b = Make(hw);
+        Assert.Null(b.Set(h.Id, 60));
+        hw.StuckManual.Add(h.Id);
+        Assert.Contains("100%", b.Restore(h.Id));
+        Assert.Equal(100, hw.Actual[h.Id]);
+    }
+
+    [Fact]
+    public void A_stuck_pump_ends_at_100_percent_too()
+    {
+        var p = FakeHardware.Pump();
+        var hw = new FakeHardware(p);
+        var b = Make(hw);
+        Assert.Null(b.Set(p.Id, 60));
+        hw.StuckManual.Add(p.Id);
+        Assert.NotNull(b.Restore(p.Id));
+        Assert.Equal(100, hw.Actual[p.Id]);
+    }
+
+    [Fact]
+    public void A_stuck_header_stays_at_100_percent_when_lhm_closes()
+    {
+        // LHM's Close restores every control from its save fields. With the old duty still armed,
+        // the flag stays set and the fan drops to that duty as the bridge exits.
+        var h = FakeHardware.Case();
+        var hw = new FakeHardware(h);
+        var b = Make(hw);
+        Assert.Null(b.Set(h.Id, 60));
+        hw.StuckManual.Add(h.Id);
+        Assert.NotNull(b.Restore(h.Id));
+        Assert.Equal(new Original((byte)(1 << h.Index), 0xFF), hw.Armed[h.Id]);
+        Assert.Equal(new Original(0, 0x66), Store().Get(h.Id)!.ToOriginal());
+    }
+
+    [Fact]
+    public void A_stuck_header_that_also_refuses_100_percent_says_that_instead()
+    {
+        var h = FakeHardware.Case();
+        var hw = new FakeHardware(h);
+        var b = Make(hw);
+        Assert.Null(b.Set(h.Id, 60));
+        hw.StuckManual.Add(h.Id);
+        hw.DropWrites = true;
+        var error = b.Restore(h.Id);
+        Assert.Contains("did not land", error);
+        Assert.Equal(error, b.Degraded[h.Id]);
+    }
+
+    [Fact]
+    public void A_stuck_header_recovered_by_a_restart_also_ends_at_100_percent()
+    {
+        var h = FakeHardware.Case();
+        var hw = new FakeHardware(h);
+        Assert.Null(Make(hw).Set(h.Id, 60));
+        hw.StuckManual.Add(h.Id);
+        var restarted = Make(hw);
+        restarted.Recover();
+        Assert.Equal(100, hw.Actual[h.Id]);
+        Assert.Contains("100%", restarted.Degraded[h.Id]);
     }
 
     [Fact]

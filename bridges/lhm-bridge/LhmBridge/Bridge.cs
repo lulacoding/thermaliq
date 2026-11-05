@@ -150,8 +150,20 @@ public sealed class Bridge
                     return null;
                 }
             }
-            return _degraded[fan] = $"{fan} is still manual after hand-back, or its registers can't be read";
+            return _degraded[fan] = Hold(header);
         }
+    }
+
+    /// The BIOS wouldn't take the header back, so nothing else will cool with it: 100%, per header
+    /// (SPEC §5.1). Its record stays, so a later restore or a restarted bridge can still hand it back.
+    private string Hold(Header h)
+    {
+        _hw.Write(h, 100);
+        var held = Landed(h, 100);
+        // Armed last: LHM's Close restores from these fields, and the old duty would end the 100%.
+        _hw.Arm(h, new Original((byte)(1 << h.Index), 0xFF));
+        return $"{h.Id} is still manual after hand-back, or its registers can't be read: "
+            + (held ? "holding it at 100%" : "the 100% write did not land either");
     }
 
     /// Never throws: one bad header must not leave the others on a bridge duty. Returns the failures.
@@ -190,8 +202,9 @@ public sealed class Bridge
                 if (_hw.ReadRegisters(h) is not { } now)
                     return $"cannot read the registers of {h.Id}, so its original can't be saved";
                 if (now.Mode != 0)
-                    return _degraded[h.Id] = $"{h.Id} is already manual and we hold no record of it: not ours to take";
+                    return _degraded[h.Id] = $"{h.Id} is already manual and we hold no record of it, so another fan tool probably owns it. Close Fan Control or MSI Center";
                 _store.Add(h.Id, new OriginalRecord(h.Chip, h.Index, now.Mode, now.Command));
+                _degraded.Remove(h.Id);
             }
         }
         catch (InvalidDataException e)

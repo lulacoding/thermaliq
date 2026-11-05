@@ -61,6 +61,7 @@ try
     bridge.Recover();
     foreach (var (fan, reason) in bridge.Degraded)
         Console.Error.WriteLine($"degraded {fan}: {reason}");
+    bridge.Beat(); // a slow start isn't a silent client
     PipeHost.Run(server, bridge, watchdogTick, cancel.Token);
     return bridge.Degraded.Count == 0 ? ExitOk : ExitFailed;
 }
