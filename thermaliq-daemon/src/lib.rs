@@ -5,10 +5,17 @@ pub mod acl;
 pub mod agent;
 pub mod api;
 pub mod app;
+pub mod decision_client;
+pub mod foreground;
 pub mod history;
 #[cfg(feature = "gate-tests")]
 pub mod inject;
+pub mod keychain;
 pub mod runtime;
 #[cfg(windows)]
 pub mod service;
+pub mod slow;
 pub mod store;
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod win;

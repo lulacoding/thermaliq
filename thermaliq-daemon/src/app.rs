@@ -1,18 +1,25 @@
 //! Startup and shutdown shared by interactive mode and the Windows service.
 
 use crate::api::{ApiServer, ApiState};
+use crate::decision_client::{HostedProvider, LocalConfig, LocalProvider};
+use crate::foreground::Feed;
+pub use crate::foreground::ForegroundSource;
 use crate::history::HistoryDb;
+use crate::keychain::{KeyStore, OsKeychain};
 use crate::runtime::{load_profiles, Daemon, Options};
+use crate::slow::{SlowParts, SlowShared, SlowThread};
 use crate::store;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
+use thermaliq_agent::decision::DecisionProvider;
 use thermaliq_hal::HardwareLayer;
 
 pub struct App {
     daemon: Daemon,
     api: ApiServer,
+    slow: SlowThread,
 }
 
 /// Whether startup may create `token.txt`. The installer creates it with its ACL; a service
@@ -72,7 +79,35 @@ fn backend() -> Result<Arc<dyn HardwareLayer>, String> {
     Err("no hardware backend on this OS (v2.0 controls fans on Windows only)".into())
 }
 
-pub fn start(dir: &Path, hal: Arc<dyn HardwareLayer>, token: Token) -> Result<App, String> {
+/// The local model, if `local-model.toml` names a usable one, and a line saying which it is.
+/// A bad file costs the local route, not the daemon: fans come first.
+fn local_model(dir: &Path, service: bool) -> (Option<LocalProvider>, String) {
+    let program_files = std::env::var_os("ProgramFiles").map(PathBuf::from);
+    let checked = LocalConfig::load(dir).and_then(|c| {
+        if let Some(c) = &c {
+            c.check(service, program_files.as_deref())?;
+        }
+        Ok(c)
+    });
+    match checked {
+        Ok(Some(c)) => (
+            Some(LocalProvider::new(c, dir.to_owned())),
+            "configured".into(),
+        ),
+        Ok(None) => (None, "not configured".into()),
+        Err(e) => {
+            eprintln!("local model unavailable: {e}");
+            (None, format!("unusable: {e}"))
+        }
+    }
+}
+
+pub fn start(
+    dir: &Path,
+    hal: Arc<dyn HardwareLayer>,
+    token: Token,
+    foreground: ForegroundSource,
+) -> Result<App, String> {
     let cfg = store::load_config(dir).map_err(|e| format!("config.toml: {e}"))?;
     let token = match token {
         Token::CreateIfMissing => store::load_or_create_token(dir),
@@ -105,11 +140,33 @@ pub fn start(dir: &Path, hal: Arc<dyn HardwareLayer>, token: Token) -> Result<Ap
         prune_every: Duration::from_secs(3600),
     };
     let daemon = Daemon::start(hal, &active, profiles.clone(), history.clone(), opts);
-    let state = ApiState::new(daemon.handle(), profiles, history, token, dir.to_owned());
-    // On error `daemon` is dropped here, which stops the engine and hands the fans back.
+    let keys: Arc<dyn KeyStore> = Arc::new(OsKeychain::default());
+    let (local, local_state) = local_model(dir, foreground == ForegroundSource::ActiveUserSession);
+    let shared = SlowShared::new(keys.clone(), local_state);
+    let feed = Feed::from_source(foreground);
+    let slow = SlowThread::start(SlowParts {
+        handle: daemon.handle(),
+        profiles: profiles.clone(),
+        history: history.clone(),
+        foreground: Arc::new(move || feed.latest()),
+        hosted: Some(Box::new(HostedProvider::new(keys))),
+        local: local.map(|l| Box::new(l) as Box<dyn DecisionProvider + Send>),
+        shared: shared.clone(),
+        period: SlowParts::DEFAULT_PERIOD,
+    });
+    let state = ApiState::new(
+        daemon.handle(),
+        profiles,
+        history,
+        token,
+        dir.to_owned(),
+        shared,
+    );
+    // On error `slow` and then `daemon` are dropped here. The last stops the engine and hands
+    // the fans back.
     let api = ApiServer::start(state, cfg.api_port)
         .map_err(|e| format!("cannot listen on 127.0.0.1:{}: {e}", cfg.api_port))?;
-    Ok(App { daemon, api })
+    Ok(App { daemon, api, slow })
 }
 
 impl App {
@@ -120,12 +177,16 @@ impl App {
     /// Hands the fans back (the engine is dropped, S5), then stops the API. Errors if the
     /// engine has not stopped within `budget` (a stuck HAL call); the caller then ends the process.
     pub fn stop(self, budget: Duration) -> Result<(), String> {
-        let Self { daemon, api } = self;
+        let Self { daemon, api, slow } = self;
+        // At once, so a local model unloads whatever else is going on. If the budget runs out
+        // the process ends, and the job object takes the model with it.
+        slow.request_stop();
         let (done, stopped) = mpsc::channel();
         // Off-thread so a stuck HAL call can't hold us past `budget`. The API is stopped after
         // the fans are back, and is not waited for: it holds nothing that needs flushing.
         std::thread::spawn(move || {
             let _ = done.send(daemon.shutdown());
+            slow.stop();
             api.shutdown();
         });
         stopped.recv_timeout(budget).map_err(|_| {
@@ -188,7 +249,13 @@ mod tests {
     fn start_serves_the_api_and_stop_hands_fans_back_then_closes_it() {
         let d = dir();
         let hal = mock();
-        let app = start(d.path(), hal.clone(), Token::CreateIfMissing).unwrap();
+        let app = start(
+            d.path(),
+            hal.clone(),
+            Token::CreateIfMissing,
+            ForegroundSource::Off,
+        )
+        .unwrap();
         let addr = app.api_addr();
         assert_eq!(addr.port(), load_port(d.path()));
         assert!(TcpStream::connect(addr).is_ok());
@@ -218,9 +285,14 @@ mod tests {
         )
         .unwrap();
         let hal = mock();
-        let err = start(d.path(), hal.clone(), Token::CreateIfMissing)
-            .err()
-            .unwrap();
+        let err = start(
+            d.path(),
+            hal.clone(),
+            Token::CreateIfMissing,
+            ForegroundSource::Off,
+        )
+        .err()
+        .unwrap();
         assert!(err.contains("nope"), "{err}");
         assert!(hal.writes().is_empty() && hal.restores().is_empty());
     }
@@ -228,7 +300,9 @@ mod tests {
     #[test]
     fn a_service_without_its_token_refuses_to_make_one() {
         let d = dir();
-        let err = start(d.path(), mock(), Token::MustExist).err().unwrap();
+        let err = start(d.path(), mock(), Token::MustExist, ForegroundSource::Off)
+            .err()
+            .unwrap();
         assert!(err.contains("token"), "{err}");
         assert!(!d.path().join("token.txt").exists());
     }
@@ -244,9 +318,14 @@ mod tests {
         )
         .unwrap();
         let hal = mock();
-        let err = start(d.path(), hal.clone(), Token::CreateIfMissing)
-            .err()
-            .unwrap();
+        let err = start(
+            d.path(),
+            hal.clone(),
+            Token::CreateIfMissing,
+            ForegroundSource::Off,
+        )
+        .err()
+        .unwrap();
         assert!(err.contains(&port.to_string()), "{err}");
         // an engine that already started is dropped (and joined) before start returns, which
         // hands back whatever it touched
@@ -277,7 +356,13 @@ mod tests {
     fn stop_gives_up_inside_the_budget_when_a_hal_call_is_stuck() {
         let d = dir();
         let hal = Arc::new(Stuck(AtomicBool::new(false)));
-        let app = start(d.path(), hal.clone(), Token::CreateIfMissing).unwrap();
+        let app = start(
+            d.path(),
+            hal.clone(),
+            Token::CreateIfMissing,
+            ForegroundSource::Off,
+        )
+        .unwrap();
         std::thread::sleep(Duration::from_millis(50));
         let t0 = Instant::now();
         let err = app.stop(Duration::from_millis(300)).unwrap_err();

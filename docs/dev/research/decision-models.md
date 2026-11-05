@@ -60,7 +60,7 @@ Not measured: Clef-flash (deferred) and FPS cost (test skipped). Strands 2B is a
 - **When the PC is idle,** the local model may use up to half the cores at below-normal priority. This setup hasn't been measured: the numbers above are for one core at idle priority.
 - **Clef-flash is deferred.**
 
-Still open for M20c: what counts as idle (it must rule out a game not recognised yet), how cores are counted, and the confidence thresholds. Only OpenRouter has been measured, not a TypeSafe key.
+Sam's review of PR #54 settled what counts as idle and as a game, and that thresholds are per provider and built-in answers are correctable defaults. M20c put these in SPEC §7.2 and §7.4. The threshold values are uncalibrated until M20e. Only OpenRouter has been measured, not a TypeSafe key.
 
 ### Local run: Strands 2B (Sam's PC, one run)
 
@@ -192,12 +192,30 @@ powershell -NoProfile -ExecutionPolicy Bypass -File docs\dev\research\decision-l
 - **HTTP errors:** the first one (rate limit, no credit, bad key) stops the run, prints the status and OpenRouter's error body with the key hidden, and marks partial numbers as partial. It doesn't retry, because that would hide the real latency.
 - **Connections:** every call opens a new TLS connection, as a call every 60 s would. This is latency from your PC to OpenRouter and back, on your connection at that time.
 
+### Setting up the local route for the service (M20c, not tested yet)
+
+The service runs the model as SYSTEM, so it only accepts an exe under `%ProgramFiles%`, and it stores models under the data directory. In an **admin** PowerShell:
+
+```powershell
+$src = (Get-ChildItem "$env:LOCALAPPDATA\ollaya-spike\bin" -Recurse -Filter ollaya.exe).DirectoryName
+Copy-Item $src "$env:ProgramFiles\Ollaya" -Recurse
+$env:OLLAYA_MODELS = "$env:ProgramData\ThermalIQ\models"; $env:OLLAYA_DEVICE = 'cpu'
+& "$env:ProgramFiles\Ollaya\ollaya.exe" pull strands-decider:2b
+Get-Process ollaya* -ErrorAction SilentlyContinue | Stop-Process
+@"
+exe = '$env:ProgramFiles\Ollaya\ollaya.exe'
+model = 'strands-decider:2b'
+"@ | Set-Content -Encoding ascii "$env:ProgramData\ThermalIQ\local-model.toml"
+```
+
+Restart the service. `GET /agent/decisions` then shows `"local": "configured"`, or why it is unusable.
+
 ### Not done
 
 - FPS test: skipped by Sam's decision above. The steps are in this file's git history (PR #54).
 - Accuracy on ThermalIQ's questions. The script prints each answer and confidence, but nothing is labelled.
 - Latency with the exe-centric, one-question state, and with the local model on half the cores.
-- The product side of M20c (DecisionProvider, routing, voting).
+- Running the local model on half the cores, and hosted answers on real exe-centric states. The product side of M20c does both, but neither has run on the PC yet.
 
 ## Questions the M20 brainstorm answered (see SPEC §7)
 

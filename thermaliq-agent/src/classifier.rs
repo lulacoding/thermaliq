@@ -16,14 +16,33 @@ pub enum Workload {
     Other,
 }
 
-const ALL: [Workload; 6] = [
-    Workload::Idle,
-    Workload::Browsing,
-    Workload::Gaming,
-    Workload::Compiling,
-    Workload::Rendering,
-    Workload::Other,
-];
+impl Workload {
+    pub const ALL: [Self; 6] = [
+        Self::Idle,
+        Self::Browsing,
+        Self::Gaming,
+        Self::Compiling,
+        Self::Rendering,
+        Self::Other,
+    ];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Browsing => "browsing",
+            Self::Gaming => "gaming",
+            Self::Compiling => "compiling",
+            Self::Rendering => "rendering",
+            Self::Other => "other",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|w| w.name() == name)
+    }
+}
+
+const ALL: [Workload; 6] = Workload::ALL;
 const K: usize = ALL.len();
 const F: usize = 4;
 const ROUNDS: usize = 40;

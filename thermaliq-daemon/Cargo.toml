@@ -17,11 +17,24 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "
 tower-http = { version = "0.6", features = ["cors"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+ureq = "3.5"
 
 ctrlc = { version = "3.5", features = ["termination"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Security_Credentials",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [features]
 # Fake hardware for dev and CI. A build without it refuses to start (no backend until M10).
