@@ -1,6 +1,6 @@
 # Decision models (Jev and alternatives): research notes for the M20 brainstorm
 
-Status: notes gathered 2026-11-04. The M20c spike (2026-11-05, below) has one measured result so far, hosted Jev 1.14. **Local model latency and FPS have not been measured yet.** Sam approved the SPEC §7.2 change described below on 2026-11-05, and it is now in SPEC.
+Status: notes gathered 2026-11-04. The M20c spike (2026-11-05, below) has measured hosted Jev 1.14 and local Strands 2B on Sam's PC. Hosted Jev is now the main route, the FPS test is skipped, and Clef-flash is deferred. Sam approved the SPEC changes described below on 2026-11-05, and they are now in SPEC.
 
 ## Goal (Sam, 2026-11-04)
 
@@ -44,11 +44,28 @@ PC: Ryzen 5 5600 (6 cores, 12 threads), 16 GB RAM, RTX 4060. Python is not insta
 
 ### Results
 
-| Model and route | Median | p95 | First answer after start | Peak memory | FPS cost (gate < 2%) |
-| --- | --- | --- | --- | --- | --- |
-| Strands 2B, Ollaya, idle PC | not measured | not measured | not measured | not measured | not measured |
-| Clef-flash Q4_K_M, llama-server, idle PC | not measured | not measured | not measured | not measured | not measured |
-| Jev 1.14 hosted, OpenRouter, from this PC | 560 ms | 615 ms | n/a | n/a | n/a |
+| Model and route | Median | p95 | First answer after start | Peak memory |
+| --- | --- | --- | --- | --- |
+| Jev 1.14 hosted, OpenRouter, from this PC | 560 ms | 615 ms | n/a | n/a |
+| Strands 2B, Ollaya, core 11 at idle priority | 9,460 ms | 9,544 ms | 37,548 ms | 7,766 MB |
+
+Not measured: Clef-flash (deferred) and FPS cost (test skipped). Strands 2B is about 17 times slower than hosted Jev at the median.
+
+### Decisions from these results (Sam, 2026-11-05; now in SPEC §1, §7.1, §7.2, §7.5, §10)
+
+- **Hosted Jev is the main route.** Order: Jev (key set and online) → local when idle → built-in list of well-known exes → ask the user.
+- **Keys:** each user brings their own OpenRouter or TypeSafe key, stored in the OS keychain. First-run setup asks for it prominently, with the cost. No key is shipped and there is no ThermalIQ proxy.
+- **Cost, about 3 cents a day:** $0.00002226 per decision × 1,440 decisions (one every 60 s, all day) = $0.032. The real figure should be lower, because workload answers are cached per exe.
+- **No FPS test.** The local model never runs while a game is in the foreground (7.8 GB, 37 s load).
+- **When the PC is idle,** the local model may use up to half the cores at below-normal priority. This setup hasn't been measured: the numbers above are for one core at idle priority.
+- **Clef-flash is deferred.**
+
+Still open for M20c: what counts as idle (it must rule out a game not recognised yet), how cores are counted, and the confidence thresholds. Only OpenRouter has been measured, not a TypeSafe key.
+
+### Local run: Strands 2B (Sam's PC, one run)
+
+- **Result:** 50/50 answered, median 9,460 ms, p95 9,544 ms, 37,548 ms to first answer, peak 7,766 MB. Pinned to core 11 at idle priority, with the same two-question state as the hosted run.
+- **Confidence:** mostly under 0.6, except for games (Sam's reading; nothing was labelled or scored). If §7.4's thresholds are higher than that, most non-game local answers will end up asking the user, so thresholds may need setting per provider.
 
 ### Hosted run: Jev 1.14 (Sam's PC, one run)
 
@@ -91,21 +108,19 @@ What this changes: one question per new exe, a profile choice that can be tested
 
 | Route | Windows | Memory | One-core control | Verdict |
 | --- | --- | --- | --- | --- |
-| **Ollaya `strands-decider:2b`** | Native | ~8 GB | `OLLAYA_THREADS` | **Try first.** 4.8 GB, no Python, calibrated |
+| **Ollaya `strands-decider:2b`** | Native | 7.8 GB measured | `OLLAYA_THREADS` | **Measured, see Results.** 4.8 GB, no Python, calibrated |
 | Ollaya `clef:flash` | Native | ~19 GB | `OLLAYA_THREADS` | Does not fit in 16 GB |
-| **llama-server + `felipeTromso/clef-flash-GGUF` Q4_K_M** | Native | 6.6 GiB at 374 tokens | `-t 1` | **Clef-flash route.** Third-party quantization; no CPU latency published |
+| **llama-server + `felipeTromso/clef-flash-GGUF` Q4_K_M** | Native | 6.6 GiB at 374 tokens | `-t 1` | **Deferred.** Third-party quantization; no CPU latency published |
 | Ollama `clef-flash` | Native | 11–12 GB download, ~14 GB loaded | not found for `/v1/systemone` | Too big next to a game |
 | Ollama `strands-decider` | **No** | 2.0 GB | n/a | Needs Apple silicon (MLX) |
 | `pip install strands-decider` | Unverified | ~8 GB (fp32 torso on CPU) | `OMP_NUM_THREADS` | Fallback. Upstream CI is Ubuntu and macOS only, and its docs say Linux or WSL2 |
 | WSL2 + pip | Via VM | ~8 GB + VM | Not from Windows | Avoid: Windows priority and affinity don't reach it cleanly, and the product is Windows-native |
 | `fabricant451/...-v19-GGUF` | n/a | ~2 GB | n/a | Needs a custom runtime; stock clients are not assumed compatible |
 
-Risks to check against the numbers:
+Notes:
 
-- **Latency may be seconds.** Upstream measured 1.6 s per v21 ask on a Xeon 8375C with **8 threads**. One core at idle priority will be slower. Ollaya says its `decider` models are "slow on CPU".
-- **Memory may matter more than CPU.** SPEC §7.2 loads on demand and unloads after use. Reading ~8 GB every 60 s on a 16 GB PC while a game runs can cause paging and stutter, which average FPS can hide. So the FPS test also reports 1% lows. If this is the problem, a 60 s reload cadence needs rethinking.
 - **Exact model.** Ollaya lists `strands-decider:2b` as Qwen3.5-2B, with 0.616 on its own 400-state test. Its page doesn't say which Strands release that is. Clef-flash scores 0.703 on the same test.
-- **Small fallback, if both fail:** Ollaya `laya` answers five questions in 516 ms on a CPU (Ollaya's number), but scores 0.357. Too inaccurate to trust without testing on our questions.
+- **Small model, not tested:** Ollaya `laya` answers five questions in 516 ms on a CPU (Ollaya's number), but scores 0.357. Too inaccurate to trust without testing on our questions.
 
 ### Install
 
@@ -123,7 +138,7 @@ $env:OLLAYA_DEVICE = 'cpu'
 Get-Process ollaya* -ErrorAction SilentlyContinue | Stop-Process      # pull may leave a daemon, and it wouldn't be pinned
 ```
 
-**Clef-flash through llama.cpp.** Run it once unpinned so the 5.74 GB download finishes, and stop it with Ctrl-C when it says it is listening:
+**Clef-flash through llama.cpp (deferred, not run).** Run it once unpinned so the 5.74 GB download finishes, and stop it with Ctrl-C when it says it is listening:
 
 ```powershell
 winget install llama.cpp      # open a new terminal afterwards
@@ -151,7 +166,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File docs\dev\research\decision-l
 # Strands 2B
 powershell -NoProfile -ExecutionPolicy Bypass -File docs\dev\research\decision-latency.ps1 -Exe $ollaya -ExeArgs serve -Model strands-decider:2b -Port 11435
 
-# Clef-flash
+# Clef-flash (deferred, not run)
 powershell -NoProfile -ExecutionPolicy Bypass -File docs\dev\research\decision-latency.ps1 -Exe llama-server -ExeArgs "-hf felipeTromso/clef-flash-GGUF:Q4_K_M -ngl 0 -t 1 -tb 1 -c 4096 -b 4096 -ub 4096 --parallel 1 --port 8080" -Port 8080
 
 # Strands 2B, pip fallback. --max-batch 2: the default warm-up would run 32 shapes on one core.
@@ -160,7 +175,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File docs\dev\research\decision-l
 
 A request that takes over 300 s fails the run. Raise it with `-TimeoutSec` if one core really is that slow, and record that. Add the numbers to the results table.
 
-The script refuses to run in an elevated window, so use a normal one. PresentMon is the only part that runs as admin.
+The script refuses to run in an elevated window, so use a normal one.
 
 ### Measure hosted Jev 1.14
 
@@ -177,61 +192,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File docs\dev\research\decision-l
 - **HTTP errors:** the first one (rate limit, no credit, bad key) stops the run, prints the status and OpenRouter's error body with the key hidden, and marks partial numbers as partial. It doesn't retry, because that would hide the real latency.
 - **Connections:** every call opens a new TLS connection, as a call every 60 s would. This is latency from your PC to OpenRouter and back, on your connection at that time.
 
-### Measure the FPS cost
-
-Use the model and route that passed latency. Get [PresentMon](https://github.com/GameTechDev/PresentMon/releases) (console build). This needs two windows, and both wait for the next whole minute so that they start together:
-
-**Admin window (PresentMon only).** `$pm` is the path to its exe and `$game` is the game's exe name, for example `cs2.exe`:
-
-```powershell
-$pm = "C:\path\to\PresentMon-x64.exe"; $game = "cs2.exe"
-New-Item -ItemType Directory -Force "$env:LOCALAPPDATA\fps-spike"; Set-Location "$env:LOCALAPPDATA\fps-spike"
-```
-
-**Normal window (the latency script, never elevated), in the repo:**
-
-```powershell
-$ollaya = (Get-ChildItem "$env:LOCALAPPDATA\ollaya-spike\bin" -Recurse -Filter ollaya.exe).FullName
-```
-
-1. **Set up the scene.** Pick one repeatable scene, ideally the game's built-in benchmark. Turn off V-Sync and frame caps, since a cap hides the cost. Prefer a CPU-limited setting (low resolution), because a GPU-limited scene hides a cost that lands on the CPU. Keep ThermalIQ's state and the power plan the same across runs. Let the game warm up for 2 minutes first.
-2. **Run without the model (2 min).** In the admin window only, start this right after a minute turns over. Then alt-tab to the game and start the scene as the minute turns:
-
-   ```powershell
-   while ((Get-Date).Second -ne 0) { Start-Sleep -Milliseconds 100 }; & $pm --process_name $game --output_file without1.csv --timed 120 --terminate_after_timed --stop_existing_session --v1_metrics
-   ```
-
-3. **Run with the model (2 min, same scene).** Start both commands right after a minute turns over, then alt-tab to the game. The script loads, decides and unloads at 0, 60 and 120 s, so it covers the on-demand load in SPEC §7.2.
-
-   Admin window:
-
-   ```powershell
-   while ((Get-Date).Second -ne 0) { Start-Sleep -Milliseconds 100 }; & $pm --process_name $game --output_file with1.csv --timed 120 --terminate_after_timed --stop_existing_session --v1_metrics
-   ```
-
-   Normal window:
-
-   ```powershell
-   while ((Get-Date).Second -ne 0) { Start-Sleep -Milliseconds 100 }; powershell -NoProfile -ExecutionPolicy Bypass -File docs\dev\research\decision-latency.ps1 -Exe $ollaya -ExeArgs serve -Model strands-decider:2b -Port 11435 -EverySeconds 60 -Count 3
-   ```
-
-4. **Repeat steps 2 and 3 once**, saving to `without2.csv` and `with2.csv`, so that the order is without, with, without, with. If the two runs without the model differ by more than 1%, a 2% gate can't be read from this scene: pick a steadier scene or use more runs.
-5. **Compute the results** (admin window, where the CSVs are):
-
-   ```powershell
-   function Fps($f) { $ms = (Import-Csv $f).MsBetweenPresents | ForEach-Object { [double]$_ } | Sort-Object
-     "{0}: average {1:N1} FPS, 1% low {2:N1} FPS" -f $f, (1000 / ($ms | Measure-Object -Average).Average), (1000 / $ms[[int]($ms.Count * 0.99)]) }
-   'without1.csv','with1.csv','without2.csv','with2.csv' | ForEach-Object { Fps $_ }
-   ```
-
-   Cost % = (average without − average with) / average without × 100, using the mean of the two runs on each side.
-
-**Gate (SPEC §7.5):** a cost under 2% on average FPS passes. Otherwise the local model doesn't run while a game is in the foreground, and its calls queue until the game closes. 1% lows are not part of the gate, but report them. A clear drop there is a reason to raise the design with Sam even if the average passes.
-
 ### Not done
 
+- FPS test: skipped by Sam's decision above. The steps are in this file's git history (PR #54).
 - Accuracy on ThermalIQ's questions. The script prints each answer and confidence, but nothing is labelled.
-- The product side of M20c (DecisionProvider, routing, voting), which waits for these numbers.
+- Latency with the exe-centric, one-question state, and with the local model on half the cores.
+- The product side of M20c (DecisionProvider, routing, voting).
 
 ## Questions the M20 brainstorm answered (see SPEC §7)
 
@@ -273,6 +239,5 @@ $ollaya = (Get-ChildItem "$env:LOCALAPPDATA\ollaya-spike\bin" -Recurse -Filter o
 - [Hugging Face: felipeTromso/clef-flash-GGUF](https://huggingface.co/felipeTromso/clef-flash-GGUF)
 - [Hugging Face: Pitaya1219/Clef-Flash-GGUF (minimum llama.cpp build)](https://huggingface.co/Pitaya1219/Clef-Flash-GGUF)
 - [Hugging Face: fabricant451 Strands GGUF](https://huggingface.co/fabricant451/strands-decider-2B-hobson-v19-GGUF)
-- [PresentMon console docs](https://github.com/GameTechDev/PresentMon/blob/main/README-ConsoleApplication.md)
 - [OpenRouter: TypeSafe SDK and /api/v1/systemone](https://openrouter.ai/docs/guides/community/typesafe-sdk)
 - [TypeSafe API reference: choice answers](https://docs.typesafe.ai/api)
