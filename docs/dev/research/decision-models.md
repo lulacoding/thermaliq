@@ -1,6 +1,6 @@
 # Decision models (Jev and alternatives): research notes for the M20 brainstorm
 
-Status: notes gathered 2026-11-04. The M20c spike (2026-11-05, below) has its research and tooling ready, but **no latency or FPS has been measured yet**.
+Status: notes gathered 2026-11-04. The M20c spike (2026-11-05, below) has one measured result so far, hosted Jev 1.14. **Local model latency and FPS have not been measured yet.** A SPEC §7.2 change is proposed below and awaits Sam's approval.
 
 ## Goal (Sam, 2026-11-04)
 
@@ -48,9 +48,46 @@ PC: Ryzen 5 5600 (6 cores, 12 threads), 16 GB RAM, RTX 4060. Python is not insta
 | --- | --- | --- | --- | --- | --- |
 | Strands 2B, Ollaya, idle PC | not measured | not measured | not measured | not measured | not measured |
 | Clef-flash Q4_K_M, llama-server, idle PC | not measured | not measured | not measured | not measured | not measured |
-| Jev 1.14 hosted, OpenRouter, from this PC | not measured | not measured | n/a | n/a | n/a |
+| Jev 1.14 hosted, OpenRouter, from this PC | 560 ms | 615 ms | n/a | n/a | n/a |
 
-Hosted answers outside the schema: not measured. Hosted decisions over 2 s (the SPEC §7.2 fallback limit): not measured.
+### Hosted run: Jev 1.14 (Sam's PC, one run)
+
+- **Result:** 50/50 answered, median 560 ms, p95 615 ms, 0 answers outside the schema.
+- **Cost:** $0.001113 for 50, about $0.00002 per decision. Each request asked both questions.
+- **SPEC §7.2 limit of 2 s:** p95 is well inside it. The count over 2 s wasn't recorded for this run, so the slowest call is unknown.
+- **Limits of this run:** it's one run on one connection at one time. The readings were generated, not real.
+
+**Earlier 401, now fixed:** the first runs got a 401 while curl in the same window worked with the same key. The documented command started a new `powershell` without `-NoProfile`, and the PowerShell profile on that PC set `OPENROUTER_API_KEY` to an older key, replacing the one from the window. The key and URL were fine. The commands now use `-NoProfile`, `-Hosted` refuses to start without it, and failures print the HTTP status and OpenRouter's error body with the key hidden.
+
+### Findings from the hosted answers (Sam's review)
+
+These come from reading the 50 printed answers. Nothing was labelled or scored, so there is no accuracy or Brier figure yet (SPEC §7.5).
+
+- **Workload answers work:** confident and right for clear apps, low-confidence for ambiguous ones. That is what the confidence threshold in SPEC §7.4 needs.
+- **Profile answers are unreliable.** The model shouldn't be trusted to pick a profile.
+- **The state is wrong for the real question.** The script's state is one random reading per request, which can contradict the exe. The real state should centre on the exe, with recent averages. These random readings may also have contributed to the unreliable profile answers, so that cause isn't isolated.
+
+### Proposal for Sam's approval: SPEC §7.2 change (not applied)
+
+SPEC is unchanged until Sam approves this.
+
+1. **Drop the "which profile to use" question** from the slow layer's typed questions. Accepting a learned curve or a new profile stays as it is.
+2. **Map workload to profile with a fixed rule.** A confident workload answer selects the profile, with no second model call. A low-confidence answer changes nothing and follows SPEC §7.4 (ask). The mapping below is a draft for Sam to edit:
+
+   | Workload | Profile |
+   | --- | --- |
+   | idle | silent |
+   | browsing | efficiency |
+   | gaming | gaming |
+   | compiling | performance |
+   | rendering | performance |
+   | other | balanced |
+
+3. **Make the state exe-centric:** the exe name plus recent averages of load, power and temperature, not one instant reading. It stays numbers and exe names only (SPEC §7.2). The averaging window is still to be chosen.
+
+What this changes: one question per new exe, a profile choice that can be tested and explained ("gaming → gaming"), and M20c's typed questions and tests.
+
+Still to decide: whether the local runs keep the script's current two-question state, so they compare directly with this hosted run, or move to the new state first. The workload answers should also be rechecked with the new state, since this run didn't test it.
 
 ### What runs on this PC (from upstream docs, not tested here)
 
