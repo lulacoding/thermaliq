@@ -217,17 +217,27 @@ pub(crate) fn parse(buf: &[u8], now: i64) -> Result<HardwareSnapshot, HwinfoErro
         if let (Some(ty), Some(rid)) = (u32_at(r, 0), u32_at(r, 8)) {
             // HWiNFO's own label (not the user-renamed one) and unit pick the metric.
             let unit = r[268..284].split(|&c| c == 0).next().unwrap_or_default();
+            // GPU power only: NVML gives the other GPU metrics, but not power on every card
+            // (an RTX 4060 answers "not available"); the combined layer prefers NVML's.
             let metric = match (ty, text(&r[12..140]).as_str(), unit) {
-                (READING_TYPE_USAGE, "Total CPU Usage", b"%") => Some(MetricKind::CpuLoad),
-                (READING_TYPE_POWER, "CPU Package Power", b"W") => Some(MetricKind::CpuPower),
+                (READING_TYPE_USAGE, "Total CPU Usage", b"%") => {
+                    Some((MetricKind::CpuLoad, SensorKind::Cpu))
+                }
+                (READING_TYPE_POWER, "CPU Package Power", b"W") => {
+                    Some((MetricKind::CpuPower, SensorKind::Cpu))
+                }
                 (READING_TYPE_CLOCK, "Average Effective Clock", b"MHz") => {
-                    Some(MetricKind::CpuClock)
+                    Some((MetricKind::CpuClock, SensorKind::Cpu))
+                }
+                // "(Total)" is what an RTX 4060 shows; plain "GPU Power" is from memory.
+                (READING_TYPE_POWER, "GPU Power (Total)" | "GPU Power", b"W") => {
+                    Some((MetricKind::GpuPower, SensorKind::Gpu))
                 }
                 _ => None,
             };
-            if let Some(kind) = metric {
+            if let Some((kind, group_kind)) = metric {
                 let value = f64::from_le_bytes(r[284..292].try_into().unwrap_or_default());
-                if kind_of(&name) == SensorKind::Cpu && kind.is_valid(value) {
+                if kind_of(&name) == group_kind && kind.is_valid(value) {
                     if let (Some(sid), Some(inst)) = (u32_at(group, 0), u32_at(group, 4)) {
                         snap.metrics.push(MetricReading {
                             id: format!("hwinfo_{sid:08x}_{inst}_{rid:08x}"),
@@ -423,6 +433,34 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn parses_gpu_power_from_the_gpu_group_only() {
+        let gpu = |label| {
+            vec![(
+                0xE000_0000,
+                0,
+                "dGPU [#0]: NVIDIA GeForce RTX 4060: PNY RTX 4060 VERTO",
+                vec![
+                    (POWER, label, 51.8),
+                    (POWER, "GPU Power Limit (max)", 115.0),
+                ],
+            )]
+        };
+        for label in ["GPU Power (Total)", "GPU Power"] {
+            let got = metrics(&gpu(label));
+            assert_eq!(
+                got,
+                [(
+                    "hwinfo_e0000000_0_00000100".into(),
+                    MetricKind::GpuPower,
+                    51.8
+                )]
+            );
+        }
+        // The same label in a CPU group is not GPU power.
+        assert!(metrics(&cpu_group(vec![(POWER, "GPU Power (Total)", 5.0)])).is_empty());
     }
 
     #[test]

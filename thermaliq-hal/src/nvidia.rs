@@ -1,7 +1,9 @@
 //! NVIDIA GPU backend over NVML (SPEC §2, M10).
 
 use crate::{Capabilities, HalError, HardwareLayer};
+use std::collections::HashSet;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 use thermaliq_common::{
@@ -46,6 +48,8 @@ pub struct Nvidia {
     timeout: Duration,
     /// (fan id, gpu index, fan index) for every fan found at startup.
     fans: Vec<(String, u32, u32)>,
+    /// Metric warnings already logged, so a permanent failure prints once, not every tick.
+    warned: Mutex<HashSet<String>>,
 }
 
 fn fan_id(gpu: u32, fan: u32) -> String {
@@ -62,8 +66,10 @@ fn enumerate(api: &mut dyn Nvml) -> Result<Vec<(String, u32, u32)>, String> {
     Ok(fans)
 }
 
-fn read_all(api: &mut dyn Nvml) -> Result<HardwareSnapshot, String> {
+/// The snapshot plus why any metric was left out (the caller logs each reason once).
+fn read_all(api: &mut dyn Nvml) -> Result<(HardwareSnapshot, Vec<String>), String> {
     let mut snap = HardwareSnapshot::default();
+    let mut warnings = Vec::new();
     for gpu in 0..api.gpu_count()? {
         snap.sensors.push(SensorReading {
             id: format!("nvml_gpu{gpu}_temp"),
@@ -95,12 +101,13 @@ fn read_all(api: &mut dyn Nvml) -> Result<HardwareSnapshot, String> {
             ),
         ];
         for (name, kind, value) in metrics {
-            if let Some(value) = value.ok().filter(|&v| kind.is_valid(v)) {
-                snap.metrics.push(MetricReading {
-                    id: format!("nvml_gpu{gpu}_{name}"),
-                    kind,
-                    value,
-                });
+            let id = format!("nvml_gpu{gpu}_{name}");
+            match value {
+                Ok(value) if kind.is_valid(value) => {
+                    snap.metrics.push(MetricReading { id, kind, value })
+                }
+                Ok(value) => warnings.push(format!("{id}: out-of-range value {value}")),
+                Err(e) => warnings.push(format!("{id}: {e}")),
             }
         }
         for fan in 0..api.fan_count(gpu)? {
@@ -114,7 +121,7 @@ fn read_all(api: &mut dyn Nvml) -> Result<HardwareSnapshot, String> {
             });
         }
     }
-    Ok(snap)
+    Ok((snap, warnings))
 }
 
 impl Nvidia {
@@ -148,6 +155,7 @@ impl Nvidia {
             jobs,
             timeout,
             fans: Vec::new(),
+            warned: Mutex::default(),
         };
         nvidia.fans = nvidia.call(true, enumerate)?;
         Ok(nvidia)
@@ -194,7 +202,14 @@ impl Nvidia {
 
 impl HardwareLayer for Nvidia {
     fn snapshot(&self) -> Result<HardwareSnapshot, HalError> {
-        self.call(true, read_all)
+        let (snap, warnings) = self.call(true, read_all)?;
+        let mut warned = self.warned.lock().unwrap_or_else(|e| e.into_inner());
+        for w in warnings {
+            if warned.insert(w.clone()) {
+                eprintln!("thermaliq: NVML metric skipped: {w}");
+            }
+        }
+        Ok(snap)
     }
 
     fn set_fan_duty(&self, fan: &str, duty: u8) -> Result<(), HalError> {
@@ -510,6 +525,26 @@ mod tests {
         );
         assert_eq!(snap.sensors.len(), 1);
         assert_eq!(snap.fans.len(), 1);
+    }
+
+    #[test]
+    fn a_metric_nvml_does_not_support_is_logged_once_per_gpu_not_every_tick() {
+        let fake = Fake::new(&[(55, &[]), (60, &[])]);
+        fake.fail("power");
+        let n = nvidia(&fake);
+        for _ in 0..5 {
+            let snap = n.snapshot().unwrap();
+            assert!(!metrics(&snap).iter().any(|(id, _)| id.ends_with("power")));
+        }
+        let mut warned: Vec<_> = n.warned.lock().unwrap().iter().cloned().collect();
+        warned.sort();
+        assert_eq!(
+            warned,
+            [
+                "nvml_gpu0_power: injected power failure",
+                "nvml_gpu1_power: injected power failure"
+            ]
+        );
     }
 
     #[test]

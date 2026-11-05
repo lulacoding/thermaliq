@@ -3,7 +3,7 @@
 use crate::{Capabilities, HalError, HardwareLayer};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
-use thermaliq_common::HardwareSnapshot;
+use thermaliq_common::{HardwareSnapshot, MetricKind};
 
 pub struct CombinedHardwareLayer {
     backends: Vec<Arc<dyn HardwareLayer>>,
@@ -75,9 +75,16 @@ impl HardwareLayer for CombinedHardwareLayer {
         for (name, b) in &self.optional {
             match b.snapshot() {
                 Ok(s) => {
+                    // shortcut: all-or-nothing, not per GPU; match readings to GPUs when a
+                    // multi-GPU machine has NVML power on one card and not the other.
+                    let have_gpu_power = all.metrics.iter().any(|m| m.kind == MetricKind::GpuPower);
                     all.sensors.extend(s.sensors);
                     all.fans.extend(s.fans);
-                    all.metrics.extend(s.metrics);
+                    all.metrics.extend(
+                        s.metrics
+                            .into_iter()
+                            .filter(|m| !(have_gpu_power && m.kind == MetricKind::GpuPower)),
+                    );
                 }
                 Err(_) => down.push(name.clone()),
             }
@@ -163,6 +170,41 @@ mod tests {
         let ids: Vec<_> = snap.metrics.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, ["a", "b"]);
         assert_eq!(snap.fans[0].kind, FanKind::Pump);
+    }
+
+    fn gpu_power(id: &str, w: f64) -> Vec<thermaliq_common::MetricReading> {
+        vec![thermaliq_common::MetricReading {
+            id: id.into(),
+            kind: thermaliq_common::MetricKind::GpuPower,
+            value: w,
+        }]
+    }
+
+    fn with_gpu_power(required: Option<f64>) -> Vec<(String, f64)> {
+        let req = mock(&[], "gpu", SensorKind::Gpu);
+        let req = Arc::new(
+            Arc::into_inner(req)
+                .unwrap()
+                .metrics(required.map_or(vec![], |w| gpu_power("nvml", w))),
+        );
+        let opt = mock(&[], "hw", SensorKind::Cpu);
+        let opt = Arc::new(
+            Arc::into_inner(opt)
+                .unwrap()
+                .metrics(gpu_power("hwinfo", 50.0)),
+        );
+        let c = CombinedHardwareLayer::new(vec![req])
+            .unwrap()
+            .with_optional("hwinfo", opt)
+            .unwrap();
+        let snap = c.snapshot().unwrap();
+        snap.metrics.into_iter().map(|m| (m.id, m.value)).collect()
+    }
+
+    #[test]
+    fn hwinfo_gpu_power_fills_in_only_when_the_required_backend_has_none() {
+        assert_eq!(with_gpu_power(None), [("hwinfo".to_string(), 50.0)]);
+        assert_eq!(with_gpu_power(Some(120.0)), [("nvml".to_string(), 120.0)]);
     }
 
     #[test]
