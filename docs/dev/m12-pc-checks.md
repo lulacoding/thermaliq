@@ -1,6 +1,23 @@
 # M12 checks on the Windows PC
 
-**None has been run yet.** Do these in order, on branch `m12-daemon`. M12 is ticked only after they pass and both PRs are approved. Paste each step's output into chat, and stop at the first failure.
+**Results, 2026-11-06, MSI B550M PRO-VDH WIFI (NCT6687D): checks 1–7 passed. Check 8 (real FACEIT) was not run.**
+
+| Step | Result |
+|---|---|
+| 1. Install and start | Passed, after the `service.log` and `degraded` fixes in #58 |
+| 2. Takeover | Passed |
+| 3. Hand-back on stop | Passed |
+| 4. Hard kill, then recover | Passed |
+| 5. Hung bridge | Passed with the agent running: bridge killed at 6.0 s, restarted, profile stayed `m12` |
+| 6. Bridge watchdog | Passed: bridge exited at 5.2 s with the daemon frozen, `0A00 = 00` |
+| 7. Anti-cheat mode, parts A, B and C | Passed as specified, with a fake `faceitclient.exe` |
+| 8. Real FACEIT | **Not run.** A pre-release item (PORTING M21), see below |
+
+Check 5 found a real fault on the way: a bridge restart made a profile fan briefly absent, and the agent switched profiles and dropped it. Fixed in the slow layer (a 10 s wait for steady hardware, and fans ever listed still count as the profile's). Checks 2–7 pause the agent so M12 is tested on its own.
+
+**Still open before release:** does `FACEITService` run constantly (anti-cheat mode would never end), and does FACEIT accept PawnIO 2.2? Run step 8 on a PC with FACEIT installed. G3 (a case fan following its curve for 24 h) still needs a case fan with a tach signal.
+
+Do these in order, on branch `m12-daemon`. Paste each step's output into chat, and stop at the first failure.
 
 These steps write to one case-fan header on the real board and hard-kill the service on purpose. They leave that header on the BIOS at the end. They never write to the CPU fan or a pump, as long as you pick a case header in step 1. Don't commit `out\` dumps.
 
@@ -29,6 +46,9 @@ cargo build -p thermaliq-daemon
 $pf = "$env:ProgramFiles\ThermalIQ"
 $dir = "$env:ProgramData\ThermalIQ"
 if (Get-Service ThermalIQ -ErrorAction SilentlyContinue) { Stop-Service ThermalIQ; & "$PWD\target\debug\thermaliq-daemon.exe" uninstall-service }
+# Stop-Service can return while the daemon and its foreground helper still hold the exe, and the copy below then fails.
+Wait-Process -Name thermaliq-daemon -Timeout 30 -ErrorAction SilentlyContinue
+if (Get-Process thermaliq-daemon -ErrorAction SilentlyContinue) { throw 'thermaliq-daemon is still running: wait or end it, then run this step again' }
 Get-Process lhm-bridge -ErrorAction SilentlyContinue | Stop-Process -Force
 Remove-Item -Recurse -Force "$pf\lhm-bridge" -ErrorAction SilentlyContinue
 Remove-Item "$dir\lhm-bridge.log", "$dir\service.log" -ErrorAction SilentlyContinue
@@ -227,9 +247,9 @@ Remove-Item "$env:TEMP\faceitclient.exe"
 
 **Pass:** before the start, PawnIO is `Disabled` and the marker is there. After it, PawnIO is `Started`, the marker is gone and the fan is at about 60%, with no 30 s wait.
 
-## 8. Real FACEIT
+## 8. Real FACEIT (not run: a pre-release item, PORTING M21)
 
-This is the only check that needs FACEIT installed. Report what you see: nothing here is assumed to be right yet.
+This is the only check that needs FACEIT installed, and it has not been run. The two questions that matter: does `FACEITService` run all the time (then anti-cheat mode would never end), and does FACEIT accept PawnIO 2.2? Report what you see: nothing here is assumed to be right yet.
 
 ```powershell
 Get-Service FACEITService | Select-Object Name, Status, StartType
@@ -246,6 +266,8 @@ Get-Process | Where-Object Name -like '*faceit*' | Select-Object Name, Path
 ```powershell
 Stop-Service ThermalIQ
 & "$pf\thermaliq-daemon.exe" uninstall-service
+Wait-Process -Name thermaliq-daemon -Timeout 30 -ErrorAction SilentlyContinue
+if (Get-Process thermaliq-daemon -ErrorAction SilentlyContinue) { throw 'thermaliq-daemon is still running: wait or end it, then run this step again' }
 Remove-Item "$dir\profiles\m12.toml"
 if (Test-Path "$dir\config.toml.m12bak") { Move-Item "$dir\config.toml.m12bak" "$dir\config.toml" -Force } else { Remove-Item "$dir\config.toml" }
 Remove-Item -Recurse $pf

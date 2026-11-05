@@ -2,7 +2,7 @@
 
 .NET sidecar for motherboard fans (SPEC §5.1). The daemon starts it and talks to it over a named pipe. Only the bridge touches LibreHardwareMonitorLib and PawnIO.
 
-**Status:** tests pass with fake hardware and against LHM's real types. It has never run on real hardware. `LhmHardware.cs` is not covered by CI, because it needs the chip.
+**Status:** tests pass with fake hardware and against LHM's real types. It ran on one board (MSI B550M PRO-VDH WIFI, NCT6687D) on 2026-11-06, and the checks below passed except real FACEIT. `LhmHardware.cs` is not covered by CI, because it needs the chip.
 
 ## Build and test
 
@@ -56,7 +56,7 @@ One JSON object per line, in each direction, at most 64 KiB per line. Every requ
 
 ## Hardware checks before first use
 
-None has been run. The commands and pass criteria, in the order to run them, are in `docs/dev/m12-pc-checks.md`. It also covers killing a hung bridge. `lhm-bridge.log` records `GetReport` times and slow write landings for checks 3 and 6. A header held at 100% after a failed hand-back can't be provoked on real hardware, so only tests cover it.
+Checks 1–8 passed on 2026-11-06; check 9 (real FACEIT) has not been run. The commands and pass criteria, in the order to run them, are in `docs/dev/m12-pc-checks.md`. It also covers killing a hung bridge. `lhm-bridge.log` records `GetReport` times and slow write landings for checks 3 and 6. A header held at 100% after a failed hand-back can't be provoked on real hardware, so only tests cover it.
 
 1. **Takeover and hand-back:** on a case fan or an empty header, `set` then `restore`: `0xA00` ends clear and the duty returns to the BIOS's.
 2. **No low first write:** watch a header during its first `set`: it must not dip.
