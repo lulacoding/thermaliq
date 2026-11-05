@@ -46,6 +46,13 @@ function Show-State {
     (Invoke-RestMethod "$api/fans") | Select-Object id, label, kind, rpm, duty_percent, curve_duty | Format-Table
     Get-Process lhm-bridge -ErrorAction SilentlyContinue | Select-Object Id, StartTime | Format-Table
 }
+# The agent also switches profiles by app, and a restart brings it back, so every service start
+# below is followed by this. It keeps M12 tested on its own.
+function Pause-Agent {
+    $h = @{ Authorization = "Bearer $((Get-Content "$dir\token.txt" -Raw).Trim())" }
+    Invoke-RestMethod "$api/agent/pause" -Method Post -Headers $h | Out-Null
+    "agent: $((Invoke-RestMethod "$api/status").agent)"
+}
 Show-State
 Get-Content "$dir\service.log", "$dir\lhm-bridge.log" -ErrorAction SilentlyContinue
 ```
@@ -54,11 +61,14 @@ Get-Content "$dir\service.log", "$dir\lhm-bridge.log" -ErrorAction SilentlyConti
 
 **If it fails,** it now says why in three places, so paste all three: `degraded_reasons` (a bridge that should have started and didn't shows as `lhm-bridge: <reason>`), `unavailable_sources`, and `service.log` (everything the service prints, bridge start-up included; before this fix it was thrown away). An engine with no fans at all reports `degraded` too.
 
-Then pick a **case-fan** header you can hear, not `CPU` or `Pump`. Last time that was control 5:
+Then pick a **case-fan** header you can hear, not `CPU` or `Pump`. Last time that was control 5. Pause the agent for everything after this, so the agent can't switch profiles while the bridge restarts. In check 5 it did, and dropped a fan:
 
 ```powershell
 $fan = 'lhm_nct6687d_0_fan_5'
+Pause-Agent
 ```
+
+**Pass:** it prints `agent: paused`. Run `Pause-Agent` again after every `Start-Service` or `Restart-Service` below; the steps do it for you. A freeze or kill of the bridge alone doesn't need it.
 
 ## 2. Takeover
 
@@ -70,6 +80,7 @@ Set-Content -Encoding ascii "$dir\profiles\m12.toml" "name = `"m12`"`n[[curves]]
 Set-Content -Encoding ascii "$dir\config.toml" 'default_profile = "m12"'
 Restart-Service ThermalIQ
 Start-Sleep 15
+Pause-Agent
 Show-State
 Get-Content "$dir\bridge-originals.json"
 Get-Content "$dir\lhm-bridge.log"
@@ -98,7 +109,7 @@ cd docs\dev\research\m12-spike; dotnet run -c Release -- list | Out-Null; Select
 The bridge goes first, so nothing gets to hand back. Setting the service to Disabled stops the SCM restarting it, so the chip can be read in between.
 
 ```powershell
-Start-Service ThermalIQ; Start-Sleep 15
+Start-Service ThermalIQ; Start-Sleep 15; Pause-Agent
 Set-Service ThermalIQ -StartupType Disabled
 Stop-Process -Name lhm-bridge -Force; Stop-Process -Name thermaliq-daemon -Force
 Start-Sleep 2
@@ -113,13 +124,13 @@ Now start without the header in the profile, so the engine doesn't take it back:
 ```powershell
 Set-Content -Encoding ascii "$dir\config.toml" 'default_profile = "balanced"'
 Set-Service ThermalIQ -StartupType Automatic
-Start-Service ThermalIQ; Start-Sleep 15
+Start-Service ThermalIQ; Start-Sleep 15; Pause-Agent
 Get-Content "$dir\bridge-originals.json"
 Show-State
 Stop-Service ThermalIQ
 cd docs\dev\research\m12-spike; dotnet run -c Release -- list | Out-Null; Select-String '0A00' out\list.txt; cd ..\..\..\..
 Set-Content -Encoding ascii "$dir\config.toml" 'default_profile = "m12"'
-Start-Service ThermalIQ; Start-Sleep 15
+Start-Service ThermalIQ; Start-Sleep 15; Pause-Agent
 ```
 
 **Pass:** the file no longer holds the header, its `0A00` bit is clear, and `degraded` is false. If `balanced` is missing, the service reports it: tell me rather than working around it.
@@ -189,12 +200,12 @@ Part B: a service restart in the middle.
 ```powershell
 $fake = Start-Process "$env:TEMP\faceitclient.exe" -ArgumentList '-n','600','127.0.0.1' -WindowStyle Hidden -PassThru
 Start-Sleep 12
-Restart-Service ThermalIQ; Start-Sleep 10
+Restart-Service ThermalIQ; Start-Sleep 10; Pause-Agent
 Show-Pawn
 Stop-Process -Id $fake.Id -Force
 Start-Sleep 40
 Show-Pawn
-Restart-Service ThermalIQ; Start-Sleep 15
+Restart-Service ThermalIQ; Start-Sleep 15; Pause-Agent
 Show-State
 ```
 
@@ -208,7 +219,7 @@ Start-Sleep 12
 Stop-Service ThermalIQ
 Stop-Process -Id $fake.Id -Force
 Show-Pawn
-Start-Service ThermalIQ; Start-Sleep 15
+Start-Service ThermalIQ; Start-Sleep 15; Pause-Agent
 Show-Pawn
 Show-State
 Remove-Item "$env:TEMP\faceitclient.exe"

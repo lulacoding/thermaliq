@@ -205,6 +205,7 @@ pub fn start(
         local: local.map(|l| Box::new(l) as Box<dyn DecisionProvider + Send>),
         shared: shared.clone(),
         period: SlowParts::DEFAULT_PERIOD,
+        stable_for: SlowParts::DEFAULT_STABLE,
     });
     let state = ApiState::new(
         daemon.handle(),
