@@ -18,6 +18,9 @@ param(
     [int]$ProfileMin = 40,
     [string]$Csv = '',
     [int]$WaitMinutes = 10,
+    # Quiet curve: duty only climbs from $ProfileMin to 45%, so a GPU stress test runs hot enough
+    # (over the agent's 72.5 C target) to make it boost. Use with OCCT/FurMark; watch the temps.
+    [switch]$Quiet,
     [switch]$SelfTest,
     [string]$CheckCsv = ''
 )
@@ -259,6 +262,7 @@ function Format-Cell($v) {
 if ($DataDir -like "$env:ProgramData\ThermalIQ*") { throw "refusing to use the real service data dir ($DataDir): use a temp dir" }
 if (-not $Csv) { $Csv = Join-Path $DataDir ("agent-run-{0}.csv" -f (Get-Date -Format 'yyyyMMdd-HHmmss')) }
 
+$MaxPwm = if ($Quiet) { 45 } else { 100 }
 New-Item -ItemType Directory -Force (Join-Path $DataDir 'profiles') | Out-Null
 Set-Content -Path (Join-Path $DataDir 'profiles\agent_run.toml') -Encoding ascii -Value @"
 name = "agent_run"
@@ -269,7 +273,7 @@ source = "$GpuSensor"
 min_temp = 30.0
 max_temp = 90.0
 min_pwm = $ProfileMin
-max_pwm = 100
+max_pwm = $MaxPwm
 [[controls]]
 fan = "$Fan"
 curve = "c"
@@ -278,7 +282,8 @@ step_up_pct = 100
 step_down_pct = 100
 "@
 Set-Content -Path (Join-Path $DataDir 'config.toml') -Encoding ascii -Value "api_port = $Port`npolling_interval_ms = 1000`ndefault_profile = `"agent_run`"`n"
-Write-Host "Data dir ready: $DataDir  (profile agent_run: linear on $GpuSensor -> $Fan, $ProfileMin-100%)"
+Write-Host "Data dir ready: $DataDir  (profile agent_run: linear on $GpuSensor -> $Fan, $ProfileMin-$MaxPwm%$(if ($Quiet) { ', QUIET' }))"
+if ($Quiet) { Write-Host 'Quiet curve: the fan stays near 45% until the agent boosts it. Watch the GPU temp; stop the stress test if it passes 85 C (at 90 C the safety latch forces 100%).' -ForegroundColor Yellow }
 Write-Host ''
 Write-Host 'Start the daemon yourself in another terminal (stop the ThermalIQ service first):'
 Write-Host "  `$env:THERMALIQ_DATA_DIR='$DataDir'; cargo run -p thermaliq-daemon" -ForegroundColor Cyan
