@@ -587,6 +587,7 @@ mod tests {
 
     // ---- local: configuration ----
 
+    #[cfg(windows)]
     fn config(exe: &str) -> LocalConfig {
         LocalConfig {
             exe: exe.into(),

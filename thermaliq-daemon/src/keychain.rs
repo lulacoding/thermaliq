@@ -63,10 +63,12 @@ impl Key {
         &self.secret
     }
 
+    #[cfg(any(windows, test))]
     fn encode(&self) -> String {
         format!("{}\n{}", self.account.name(), self.secret)
     }
 
+    #[cfg(any(windows, test))]
     fn decode(stored: &str) -> Option<Self> {
         let (account, secret) = stored.split_once('\n')?;
         Self::new(Account::from_name(account)?, secret)

@@ -5,6 +5,7 @@
 //! the local model out and decides nothing.
 
 use serde::Deserialize;
+#[cfg(any(windows, test))]
 use serde_json::json;
 use std::io::{self, BufRead, BufReader, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,6 +35,7 @@ fn parse_line(line: &str) -> Option<Foreground> {
     })
 }
 
+#[cfg(any(windows, test))]
 fn format_line(f: &Foreground) -> String {
     json!({"exe": f.exe, "fullscreen": f.fullscreen}).to_string()
 }
