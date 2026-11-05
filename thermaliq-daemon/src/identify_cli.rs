@@ -179,7 +179,8 @@ fn heard(answer: &str) -> Option<Heard> {
     }
 }
 
-/// Walks the user through the fans. Saves only after a yes; the end of input or `q` saves nothing.
+/// Walks the user through the fans. Saves on `y` or a bare Enter at "Save these? [Y/n]"; `n`, `q`
+/// or the end of input saves nothing.
 pub fn run(api: &dyn Api, input: &mut dyn BufRead, out: &mut dyn Write) -> Result<(), String> {
     let mut t = Term { input, out };
     let v = api.identity()?;
