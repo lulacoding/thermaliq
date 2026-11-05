@@ -17,6 +17,7 @@ const RIDGE: f64 = 0.01;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ThermalModel {
+    ahead: usize,
     w: [f64; N],
 }
 
@@ -29,6 +30,11 @@ fn finite(s: &Sample) -> bool {
 }
 
 impl ThermalModel {
+    #[cfg(test)]
+    pub(crate) fn with_weights(ahead: usize, w: [f64; N]) -> Self {
+        Self { ahead, w }
+    }
+
     /// `history` must be **consecutive 1-tick samples**: restarts and missing ticks make
     /// `ahead` mean something else, so the caller splits history at every gap and fits
     /// one gap-free run. `None` if the run is too short, has a non-finite value, has a
@@ -96,16 +102,31 @@ impl ThermalModel {
             w[i + 1] = a[i][P] / a[i][i] / std[i];
         }
         w[0] = mean_y - (0..P).map(|i| w[i + 1] * mean[i]).sum::<f64>();
-        (w.iter().all(|v| v.is_finite()) && w[2] <= 0.0 && w[4] >= 0.0).then_some(Self { w })
+        (w.iter().all(|v| v.is_finite()) && w[2] <= 0.0 && w[4] >= 0.0).then_some(Self { ahead, w })
     }
 
-    /// Temperature `ahead` ticks from now, or `None` for a non-finite input.
-    pub fn predict(&self, now: &Sample) -> Option<f64> {
-        if !finite(now) {
+    /// Temperature `ahead` ticks from now. `None` for a non-finite input or an `ahead`
+    /// other than the one this model was fitted for.
+    pub fn predict(&self, now: &Sample, ahead: usize) -> Option<f64> {
+        if ahead != self.ahead || !finite(now) {
             return None;
         }
         let d: f64 = row(now).iter().zip(&self.w).map(|(x, w)| x * w).sum();
         Some(now.temp + d).filter(|t| t.is_finite())
+    }
+
+    /// May a fan be turned *down* on this model's word? Only if dropping its duty 10 points
+    /// visibly warms the part (>= 0.1 °C at `ahead`). The fit allows `w[duty] == 0`, which
+    /// would make every drop look free (M20a review).
+    pub fn lowering_is_safe(&self, now: &Sample, ahead: usize) -> bool {
+        let lower = Sample {
+            duty: now.duty - 10.0,
+            ..*now
+        };
+        match (self.predict(now, ahead), self.predict(&lower, ahead)) {
+            (Some(a), Some(b)) => b - a >= 0.1,
+            _ => false,
+        }
     }
 }
 
@@ -181,7 +202,7 @@ mod tests {
                 .filter(|(now, later)| {
                     !steady_only || (now.duty, now.load) == (later.duty, later.load)
                 })
-                .map(|(now, later)| (model.predict(now).expect("predict") - later.temp).abs())
+                .map(|(now, later)| (model.predict(now, 20).expect("predict") - later.temp).abs())
                 .collect();
             errs.iter().sum::<f64>() / errs.len() as f64
         };
@@ -246,6 +267,40 @@ mod tests {
         let m = ThermalModel::fit(&h, 20).expect("fit");
         let mut s = h[0];
         s.load = f64::INFINITY;
-        assert!(m.predict(&s).is_none());
+        assert!(m.predict(&s, 20).is_none());
+    }
+
+    #[test]
+    fn a_prediction_for_a_different_horizon_is_refused() {
+        let h = simulate(&COOLING, 600, 1);
+        let m = ThermalModel::fit(&h, 20).expect("fit");
+        assert!(m.predict(&h[0], 20).is_some());
+        assert!(m.predict(&h[0], 10).is_none());
+        assert!(!m.lowering_is_safe(&h[0], 10));
+    }
+
+    #[test]
+    fn only_a_clearly_cooling_fan_may_be_lowered() {
+        let h = simulate(&COOLING, 3000, 1);
+        let m = ThermalModel::fit(&h, 20).expect("fit");
+        assert!(m.lowering_is_safe(&h[0], 20));
+        // duty effect of exactly 0 (the fit accepts w[duty] == 0): 10 points must show >= 0.1 °C
+        let flat = Plant {
+            duty_gain: 0.0,
+            ..COOLING
+        };
+        if let Some(m) = ThermalModel::fit(&simulate(&flat, 3000, 1), 20) {
+            assert!(!m.lowering_is_safe(&h[0], 20), "no real duty effect");
+        }
+        let weak = ThermalModel {
+            ahead: 20,
+            w: [0.0, 0.0, -0.009, 0.0, 0.0],
+        };
+        assert!(!weak.lowering_is_safe(&h[0], 20), "-0.09 °C per 10 points");
+        let enough = ThermalModel {
+            ahead: 20,
+            w: [0.0, 0.0, -0.011, 0.0, 0.0],
+        };
+        assert!(enough.lowering_is_safe(&h[0], 20));
     }
 }

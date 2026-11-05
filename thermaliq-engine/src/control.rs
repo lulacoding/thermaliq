@@ -93,6 +93,17 @@ impl FanControl {
         self.requests.len() != before
     }
 
+    /// Raises an Agent request up to `floor` (SPEC §7.2: never far below the curve).
+    pub(crate) fn floor_agent(&mut self, floor: u8) {
+        for r in self
+            .requests
+            .iter_mut()
+            .filter(|r| r.source == Source::Agent)
+        {
+            r.duty = r.duty.max(floor);
+        }
+    }
+
     /// Start ramping from the fan's real state (first snapshot) instead of jumping.
     pub fn seed(&mut self, duty: u8, spinning: bool) {
         self.last = Some(duty.min(100));

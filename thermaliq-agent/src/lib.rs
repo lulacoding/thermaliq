@@ -3,3 +3,4 @@
 pub mod classifier;
 pub mod inputs;
 pub mod model;
+pub mod optimiser;
