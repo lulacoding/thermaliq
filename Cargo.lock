@@ -901,6 +901,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "thermaliq-agent"
+version = "2.0.0-dev.0"
+dependencies = [
+ "thermaliq-common",
+]
+
+[[package]]
 name = "thermaliq-cli"
 version = "2.0.0-dev.0"
 
