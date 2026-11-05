@@ -10,7 +10,9 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use thermaliq_common::{bundled_profiles, FanReading, HardwareSnapshot, Profile, SensorReading};
+use thermaliq_common::{
+    bundled_profiles, FanReading, HardwareSnapshot, MetricReading, Profile, SensorReading,
+};
 use thermaliq_engine::{Engine, Source};
 use thermaliq_hal::HardwareLayer;
 use tokio::sync::{oneshot, watch};
@@ -57,14 +59,17 @@ pub fn clamp_override(duty: i64, seconds: u64) -> Option<(u8, Duration)> {
 
 fn apply(engine: &mut Engine, began: Instant, cache: &RwLock<Cache>, cmd: Cmd) {
     let (result, reply) = match cmd {
-        Cmd::SetProfile(p, reply) => {
-            engine.set_profile(&p);
-            cache
-                .write()
-                .unwrap_or_else(PoisonError::into_inner)
-                .active_profile = p.name;
-            (Ok(None), reply)
-        }
+        Cmd::SetProfile(p, reply) => match engine.check_profile(&p) {
+            Ok(()) => {
+                engine.set_profile(&p);
+                cache
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .active_profile = p.name;
+                (Ok(None), reply)
+            }
+            Err(e) => (Err(CommandError::Rejected(e)), reply),
+        },
         Cmd::Override(fan, duty, dur, reply) => {
             let r = if engine.can_control(&fan) {
                 engine
@@ -173,7 +178,7 @@ pub struct Cache {
     pub active_profile: String,
 }
 
-type HistoryTick = (i64, Vec<SensorReading>, Vec<FanReading>);
+type HistoryTick = (i64, Vec<SensorReading>, Vec<FanReading>, Vec<MetricReading>);
 
 pub struct Daemon {
     cache: Arc<RwLock<Cache>>,
@@ -234,8 +239,12 @@ impl Daemon {
                                 .cloned()
                                 .collect();
                             // A full queue drops this tick's history rather than stall the engine.
-                            let _ =
-                                history_tx.try_send((unix_now(), sensors, snapshot.fans.clone()));
+                            let _ = history_tx.try_send((
+                                unix_now(),
+                                sensors,
+                                snapshot.fans.clone(),
+                                snapshot.metrics.clone(),
+                            ));
                         }
                         let status = Status {
                             engine_running: true,
@@ -330,11 +339,11 @@ fn history_loop(rx: &mpsc::Receiver<HistoryTick>, db: &Mutex<HistoryDb>, prune_e
     let mut last_prune = Instant::now();
     loop {
         match rx.recv_timeout(prune_every.saturating_sub(last_prune.elapsed())) {
-            Ok((now, sensors, fans)) => {
+            Ok((now, sensors, fans, metrics)) => {
                 let _ = db
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .record_tick(now, &sensors, &fans);
+                    .record_tick(now, &sensors, &fans, &metrics);
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
@@ -643,6 +652,7 @@ mod tests {
                     temp_celsius: 30.0,
                 }],
                 &[],
+                &[],
             )
             .unwrap();
         let opts = Options {
@@ -744,6 +754,49 @@ mod tests {
             .unwrap();
         assert_eq!(d.cache().active_profile, "sixty");
         wait_until(|| last_write(&hal) == Some(("f1".into(), 60)));
+        d.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn set_profile_rejects_0_rpm_on_a_pump_and_keeps_the_running_profile() {
+        let hal = Arc::new(MockHardwareLayer::new(&["f1", "f2"], vec![at(40.0)]).pump("f1"));
+        let active = Profile::from_toml(FLAT).unwrap();
+        let d = Daemon::start(hal, &active, vec![], db(), fast());
+        wait_until(|| d.cache().ticks > 0);
+        let zero_rpm = FLAT.replace("name = \"flat\"", "name = \"zero\"").replace(
+            "step_down_pct = 100\n",
+            "step_down_pct = 100\nstart_percent = 40\nstop_percent = 30\n",
+        );
+        let r = d
+            .handle()
+            .set_profile(Profile::from_toml(&zero_rpm).unwrap())
+            .await;
+        assert!(matches!(r, Err(CommandError::Rejected(m)) if m.contains("pump")));
+        assert_eq!(d.cache().active_profile, "flat");
+        d.shutdown().unwrap();
+    }
+
+    #[test]
+    fn metrics_reach_the_cache_and_the_history() {
+        use thermaliq_common::{MetricKind, MetricReading};
+        let m = MetricReading {
+            id: "gpu_load".into(),
+            kind: MetricKind::GpuLoad,
+            value: 55.0,
+        };
+        let hal =
+            Arc::new(MockHardwareLayer::new(&["f1"], vec![at(40.0)]).metrics(vec![m.clone()]));
+        let db = db();
+        let active = Profile::from_toml(FLAT).unwrap();
+        let d = Daemon::start(hal, &active, vec![], db.clone(), fast());
+        wait_until(|| {
+            !db.lock()
+                .unwrap()
+                .metric_rows("gpu_load")
+                .unwrap()
+                .is_empty()
+        });
+        assert_eq!(d.cache().snapshot.metrics, [m]);
         d.shutdown().unwrap();
     }
 

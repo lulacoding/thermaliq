@@ -1,7 +1,9 @@
 use crate::{Capabilities, HalError, HardwareLayer};
 use std::collections::VecDeque;
 use std::sync::{Mutex, MutexGuard};
-use thermaliq_common::{FanReading, HardwareSnapshot, SensorKind, SensorReading};
+use thermaliq_common::{
+    FanKind, FanReading, HardwareSnapshot, MetricReading, SensorKind, SensorReading,
+};
 
 /// One scripted `snapshot()` outcome.
 #[derive(Debug, Clone)]
@@ -20,6 +22,8 @@ struct State {
     read_only: Vec<String>,
     fail_writes: Vec<String>,
     fail_restores: Vec<String>,
+    pumps: Vec<String>,
+    metrics: Vec<MetricReading>,
 }
 
 /// Scriptable fake hardware. Each `snapshot()` consumes the next scripted tick;
@@ -48,6 +52,18 @@ impl MockHardwareLayer {
     /// Fan shows in snapshots but is not controllable; writes and restores error.
     pub fn read_only(self, fan: &str) -> Self {
         self.state().read_only.push(fan.to_string());
+        self
+    }
+
+    /// This fan shows up as a pump (`FanKind::Pump`) in snapshots.
+    pub fn pump(self, fan: &str) -> Self {
+        self.state().pumps.push(fan.to_string());
+        self
+    }
+
+    /// Every snapshot carries these metrics.
+    pub fn metrics(self, metrics: Vec<MetricReading>) -> Self {
+        self.state().metrics = metrics;
         self
     }
 
@@ -99,8 +115,14 @@ impl HardwareLayer for MockHardwareLayer {
                     label: id.clone(),
                     rpm: u32::from(*duty) * 20,
                     duty_percent: *duty,
+                    kind: if s.pumps.contains(id) {
+                        FanKind::Pump
+                    } else {
+                        FanKind::Fan
+                    },
                 })
                 .collect(),
+            metrics: s.metrics.clone(),
         })
     }
 
@@ -171,6 +193,22 @@ mod tests {
         let m = MockHardwareLayer::new(&["f1"], vec![temps(40.0), temps(50.0), temps(60.0)]);
         let got: Vec<_> = (0..5).map(|_| cpu_temp(&m).unwrap()).collect();
         assert_eq!(got, [40.0, 50.0, 60.0, 60.0, 60.0]);
+    }
+
+    #[test]
+    fn pumps_and_metrics_show_in_snapshots() {
+        let load = MetricReading {
+            id: "cpu_load".into(),
+            kind: thermaliq_common::MetricKind::CpuLoad,
+            value: 12.0,
+        };
+        let m = MockHardwareLayer::new(&["f1", "p1"], vec![temps(40.0)])
+            .pump("p1")
+            .metrics(vec![load.clone()]);
+        let s = m.snapshot().unwrap();
+        let kinds: Vec<_> = s.fans.iter().map(|f| f.kind).collect();
+        assert_eq!(kinds, [FanKind::Fan, FanKind::Pump]);
+        assert_eq!(s.metrics, [load]);
     }
 
     #[test]

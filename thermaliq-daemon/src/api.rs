@@ -119,6 +119,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/status", get(status))
         .route("/sensors", get(sensors))
         .route("/fans", get(fans))
+        .route("/metrics", get(metrics))
         .route("/profiles", get(profiles))
         .route("/config", get(get_config))
         .route("/history/sensors/{id}", get(history_sensor))
@@ -230,6 +231,10 @@ async fn sensors(State(s): State<ApiState>) -> Json<Value> {
 
 async fn fans(State(s): State<ApiState>) -> Json<Value> {
     Json(json!(s.handle.cache().snapshot.fans))
+}
+
+async fn metrics(State(s): State<ApiState>) -> Json<Value> {
+    Json(json!(s.handle.cache().snapshot.metrics))
 }
 
 async fn profiles(State(s): State<ApiState>) -> Json<Value> {
@@ -352,6 +357,7 @@ fn frame(c: &Cache) -> Message {
     });
     v["sensors"] = json!(c.snapshot.sensors);
     v["fans"] = json!(c.snapshot.fans);
+    v["metrics"] = json!(c.snapshot.metrics);
     Message::Text(v.to_string().into())
 }
 
@@ -488,7 +494,11 @@ mod tests {
     }
 
     fn rig(script: Vec<Tick>) -> Rig {
-        let hal = Arc::new(MockHardwareLayer::new(&["f1", "f2"], script));
+        rig_with(MockHardwareLayer::new(&["f1", "f2"], script))
+    }
+
+    fn rig_with(hal: MockHardwareLayer) -> Rig {
+        let hal = Arc::new(hal);
         let flat = Profile::from_toml(FLAT).unwrap();
         let sixty = FLAT
             .replace("pwm = 30", "pwm = 60")
@@ -656,6 +666,37 @@ mod tests {
             .map(|f| f["id"].clone())
             .collect();
         assert_eq!(ids, [json!("f1"), json!("f2")]);
+    }
+
+    #[tokio::test]
+    async fn metrics_and_fan_kinds_come_from_the_cache_and_the_socket_frame() {
+        use thermaliq_common::{MetricKind, MetricReading};
+        let load = MetricReading {
+            id: "gpu_load".into(),
+            kind: MetricKind::GpuLoad,
+            value: 55.0,
+        };
+        let hal = MockHardwareLayer::new(&["f1", "f2"], vec![at(40.0)])
+            .pump("f2")
+            .metrics(vec![load]);
+        let r = rig_with(hal);
+        ticked(&r).await;
+        let (code, m) = get(&r, "/metrics").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(
+            m[0],
+            json!({"id": "gpu_load", "kind": "gpu_load", "value": 55.0})
+        );
+        let (_, f) = get(&r, "/fans").await;
+        assert_eq!(
+            (f[0]["kind"].clone(), f[1]["kind"].clone()),
+            (json!("fan"), json!("pump"))
+        );
+        let Message::Text(t) = frame(&r.daemon.cache()) else {
+            panic!("not text")
+        };
+        let v: Value = serde_json::from_str(&t).unwrap();
+        assert_eq!(v["metrics"][0]["id"], "gpu_load");
     }
 
     #[tokio::test]
@@ -1067,6 +1108,7 @@ mod tests {
                 ("GET", "/status"),
                 ("GET", "/sensors"),
                 ("GET", "/fans"),
+                ("GET", "/metrics"),
                 ("GET", "/profiles"),
                 ("GET", "/config"),
                 ("GET", "/history/sensors/cpu"),
