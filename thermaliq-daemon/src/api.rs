@@ -1524,6 +1524,8 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
+        // The first frame goes out on connect: before the first tick it rightly has no sensors.
+        rt.block_on(ticked(&r));
         let ticks: Vec<u64> = rt.block_on(async {
             let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
             let mut ticks = vec![];
