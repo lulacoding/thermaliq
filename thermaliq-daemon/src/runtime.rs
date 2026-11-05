@@ -75,6 +75,8 @@ impl AgentState {
 struct AgentFlags {
     paused: AtomicBool,
     crashed: AtomicBool,
+    /// Reasons set from outside the engine thread (the identity check); shown with every cache read.
+    notes: Mutex<Vec<String>>,
 }
 
 impl AgentFlags {
@@ -197,7 +199,25 @@ impl Handle {
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
         c.status.agent = self.flags.state(); // read live, so pause shows at once
+        let notes = self
+            .flags
+            .notes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !notes.is_empty() {
+            c.status.degraded = true;
+            c.status.degraded_reasons.extend(notes.iter().cloned());
+        }
         c
+    }
+
+    /// Adds a reason that stays in `/status` `degraded_reasons` until the service restarts.
+    pub fn note_degraded(&self, why: String) {
+        self.flags
+            .notes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(why);
     }
 
     /// Withdraws the agent's requests and ignores it until `resume_agent`.
@@ -1059,6 +1079,22 @@ mod tests {
         ));
         d.shutdown().unwrap();
         assert!(hal.writes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_noted_reason_shows_in_the_cache_and_marks_it_degraded() {
+        let (_, d) = start(vec![at(40.0)], vec![], &db(), fast());
+        wait_until(|| d.cache().ticks > 0);
+        assert!(!d.cache().status.degraded);
+        d.handle().note_degraded("the board changed".into());
+        let c = d.cache();
+        assert!(
+            c.status.degraded
+                && c.status
+                    .degraded_reasons
+                    .contains(&"the board changed".into())
+        );
+        d.shutdown().unwrap();
     }
 
     #[tokio::test]

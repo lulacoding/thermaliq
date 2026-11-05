@@ -1,7 +1,7 @@
 //! Fan identity wiring (SPEC §5.2): `roles.toml` and `inventory.json` in the data dir, the
 //! start-up checks, and the first-run probe. The rules themselves are in `thermaliq_common::identity`.
 
-use crate::runtime::{Cache, CommandError, Handle};
+use crate::runtime::{AgentState, Cache, CommandError, Handle};
 use crate::store::write_atomic;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -33,8 +33,11 @@ pub struct Identity {
     problems: Vec<String>,
     /// Problems the inventory check found.
     late: Mutex<Vec<String>>,
-    probing: tokio::sync::Mutex<()>,
+    /// Owned by the probe task, so it is held until the profile is back even if the request drops.
+    probing: std::sync::Arc<tokio::sync::Mutex<()>>,
     probe_for: Duration,
+    /// Set at load when the saved inventory is for another board; every role is then unmapped.
+    board_reason: Option<String>,
 }
 
 #[derive(Debug)]
@@ -82,9 +85,15 @@ impl Identity {
             diff: Mutex::default(),
             problems: Vec::new(),
             late: Mutex::default(),
-            probing: tokio::sync::Mutex::new(()),
+            probing: Default::default(),
             probe_for: PROBE_FOR,
+            board_reason: None,
         }
+    }
+
+    /// Why every role was left unmapped, if the board changed (SPEC §5.2).
+    pub fn board_reason(&self) -> Option<&str> {
+        self.board_reason.as_deref()
     }
 
     pub fn with_probe_time(mut self, d: Duration) -> Self {
@@ -103,11 +112,34 @@ impl Identity {
         let mut id = Self::empty(dir.to_owned());
         id.controllable = hal.capabilities().controllable_fans;
         id.board = hal.board();
-        let roles = read_roles(dir).unwrap_or_else(|e| {
-            id.problems
-                .push(format!("roles.toml: {e}; no role is mapped"));
+        // The same ids on another board can be other fans, so the saved mapping is not trusted.
+        let moved = match read_inventory(dir) {
+            Ok(Some(saved)) => {
+                diff(
+                    &saved,
+                    &Inventory::of(&HardwareSnapshot::default(), id.board.clone()),
+                )
+                .board_changed
+            }
+            _ => None,
+        };
+        let roles = if let Some((was, now)) = moved {
+            let show = |b: Option<String>| b.unwrap_or_else(|| "none".into());
+            let why = format!(
+                "the board changed (saved: {}, now: {}); no role is mapped. Run `thermaliq-daemon identify`",
+                show(was),
+                show(now)
+            );
+            id.problems.push(why.clone());
+            id.board_reason = Some(why);
             Roles::default()
-        });
+        } else {
+            read_roles(dir).unwrap_or_else(|e| {
+                id.problems
+                    .push(format!("roles.toml: {e}; no role is mapped"));
+                Roles::default()
+            })
+        };
         let resolved: Vec<Profile> = profiles
             .iter()
             .map(|p| {
@@ -250,6 +282,10 @@ impl Identity {
 
     /// Holds `fan` at 100% for `probe_for` through the engine, then puts the profile back
     /// (SPEC §5.2). It only raises a fan, so a pump is only ever raised.
+    ///
+    /// The hold and the restore run in their own task: if the request drops (Ctrl-C in
+    /// `identify`), the profile still comes back. The agent is paused meanwhile, so a profile
+    /// switch cannot land inside the hold and be undone by the restore.
     pub async fn probe(
         &self,
         handle: &Handle,
@@ -259,50 +295,82 @@ impl Identity {
         if !self.controllable.iter().any(|f| f == fan) {
             return Err(ProbeError::UnknownFan(fan.to_owned()));
         }
-        let Ok(_one_at_a_time) = self.probing.try_lock() else {
+        let Ok(one_at_a_time) = self.probing.clone().try_lock_owned() else {
             return Err(ProbeError::Busy);
         };
         let before = handle.cache();
         if before.status.latched {
             return Err(ProbeError::Latched);
         }
-        let Some(original) = profiles.iter().find(|p| p.name == before.active_profile) else {
+        let Some(original) = profiles
+            .iter()
+            .find(|p| p.name == before.active_profile)
+            .cloned()
+        else {
             return Err(ProbeError::Engine(CommandError::Rejected(format!(
                 "the active profile '{}' is not a known profile",
                 before.active_profile
             ))));
         };
-        handle
-            .set_profile(with_probe(original, fan))
-            .await
-            .map_err(ProbeError::Engine)?;
-        tokio::time::sleep(self.probe_for).await;
-        let during = handle.cache();
-        handle.set_profile(original.clone()).await.map_err(|e| {
-            ProbeError::NotRestored(format!(
-                "could not put profile '{}' back ({e:?}); fan '{fan}' may stay at 100% until you \
-                 switch profile",
-                original.name
-            ))
-        })?;
-        if during.status.latched {
-            return Err(ProbeError::Latched);
-        }
-        let (was, now) = (rpms(&before), rpms(&during));
-        let label = during
-            .snapshot
-            .fans
-            .iter()
-            .find(|f| f.id == fan)
-            .map(|f| f.label.clone());
-        Ok(json!({
-            "fan": fan,
-            "label": label,
-            "rpm_before": was,
-            "rpm_after": now,
-            "pairing": pair(fan, &was, &now),
-        }))
+        let (handle, fan, hold) = (handle.clone(), fan.to_owned(), self.probe_for);
+        tokio::spawn(async move {
+            let _one_at_a_time = one_at_a_time;
+            hold_and_restore(&handle, original, before, &fan, hold).await
+        })
+        .await
+        .unwrap_or_else(|e| {
+            Err(ProbeError::NotRestored(format!(
+                "the probe task failed ({e}); fan may stay at 100% until you switch profile"
+            )))
+        })
     }
+}
+
+async fn hold_and_restore(
+    handle: &Handle,
+    original: Profile,
+    before: Cache,
+    fan: &str,
+    hold: Duration,
+) -> Result<Value, ProbeError> {
+    // A running agent is paused for the hold; one that was already paused stays paused. A
+    // crashed agent cannot be paused, and cannot switch either.
+    let paused_here =
+        before.status.agent == AgentState::Running && handle.pause_agent().await.is_ok();
+    let held = handle.set_profile(with_probe(&original, fan)).await;
+    if held.is_ok() {
+        tokio::time::sleep(hold).await;
+    }
+    let during = handle.cache();
+    let restored = handle.set_profile(original.clone()).await;
+    if paused_here {
+        let _ = handle.resume_agent().await;
+    }
+    held.map_err(ProbeError::Engine)?;
+    restored.map_err(|e| {
+        ProbeError::NotRestored(format!(
+            "could not put profile '{}' back ({e:?}); fan '{fan}' may stay at 100% until you \
+             switch profile",
+            original.name
+        ))
+    })?;
+    if during.status.latched {
+        return Err(ProbeError::Latched);
+    }
+    let (was, now) = (rpms(&before), rpms(&during));
+    let label = during
+        .snapshot
+        .fans
+        .iter()
+        .find(|f| f.id == fan)
+        .map(|f| f.label.clone());
+    Ok(json!({
+        "fan": fan,
+        "label": label,
+        "rpm_before": was,
+        "rpm_after": now,
+        "pairing": pair(fan, &was, &now),
+    }))
 }
 
 fn rpms(c: &Cache) -> Vec<(String, u32)> {
@@ -614,6 +682,94 @@ mod tests {
             .iter()
             .filter(|(f, _)| f == "f1")
             .all(|(_, duty)| *duty == 30));
+    }
+
+    // Multi-thread: `wait_until` blocks, and the probe's own task has to keep running meanwhile.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_probe_dropped_mid_hold_still_puts_the_profile_back() {
+        let (h, d, profiles) = running(&["f1", "f2"]);
+        let id = identity_for(&["f1", "f2"]);
+        // The client leaves (Ctrl-C in identify) after the 100% write; axum drops the future.
+        let r = tokio::time::timeout(
+            Duration::from_millis(60),
+            id.probe(&d.handle(), &profiles, "f2"),
+        )
+        .await;
+        assert!(r.is_err(), "the probe should still be holding");
+        wait_until(|| h.writes().iter().any(|(f, duty)| f == "f2" && *duty == 100));
+        // `flat` never controls f2, so the original profile back means f2 is handed to the BIOS.
+        wait_until(|| h.restores().contains(&"f2".to_owned()));
+        // And a new probe is refused until the first has finished, dropped or not.
+        assert!(id.probe(&d.handle(), &profiles, "f1").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_agent_is_paused_for_a_probe_and_resumed_only_if_it_was_running() {
+        let (_, d, profiles) = running(&["f1", "f2"]);
+        let id = std::sync::Arc::new(identity_for(&["f1", "f2"]));
+        for was_paused in [false, true] {
+            if was_paused {
+                d.handle().pause_agent().await.unwrap();
+            }
+            let run = tokio::spawn({
+                let (id, h, p) = (id.clone(), d.handle(), profiles.clone());
+                async move { id.probe(&h, &p, "f2").await }
+            });
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(d.cache().status.agent, crate::runtime::AgentState::Paused);
+            run.await.unwrap().unwrap();
+            let after = d.cache().status.agent;
+            assert_eq!(after == crate::runtime::AgentState::Paused, was_paused);
+        }
+    }
+
+    /// Wraps a mock with a board name.
+    struct Boarded(Arc<MockHardwareLayer>, &'static str);
+    impl HardwareLayer for Boarded {
+        fn snapshot(&self) -> Result<HardwareSnapshot, thermaliq_hal::HalError> {
+            self.0.snapshot()
+        }
+        fn set_fan_duty(&self, f: &str, d: u8) -> Result<(), thermaliq_hal::HalError> {
+            self.0.set_fan_duty(f, d)
+        }
+        fn restore_auto(&self, f: &str) -> Result<(), thermaliq_hal::HalError> {
+            self.0.restore_auto(f)
+        }
+        fn capabilities(&self) -> thermaliq_hal::Capabilities {
+            self.0.capabilities()
+        }
+        fn board(&self) -> Option<String> {
+            Some(self.1.into())
+        }
+    }
+
+    #[test]
+    fn a_changed_board_loads_every_role_unmapped_and_says_what_to_run() {
+        let d = dir();
+        let roles = "[roles]\ncase_front = \"f1\"\ncase_rear = \"f2\"\ncpu_temp = \"cpu\"\n";
+        fs::write(d.path().join("roles.toml"), roles).unwrap();
+        let old = Boarded(hal(&["f1", "f2"]), "OLD BOARD");
+        let (first, mapped) = Identity::load(d.path(), &old, bal());
+        assert_eq!(mapped[0].controls.len(), 2);
+        first.check_inventory(&old.snapshot().unwrap());
+
+        let new = Boarded(hal(&["f1", "f2"]), "NEW BOARD");
+        let (id, profiles) = Identity::load(d.path(), &new, bal());
+        assert!(profiles[0].controls.is_empty(), "same ids, other board");
+        assert!(id.roles().iter().next().is_none());
+        let why = id.board_reason().unwrap();
+        assert!(
+            why.contains("NEW BOARD") && why.contains("thermaliq-daemon identify"),
+            "{why}"
+        );
+
+        // Still so on the next start; accepting makes it the saved board, so roles load again.
+        let (again, _) = Identity::load(d.path(), &new, bal());
+        assert!(again.board_reason().is_some());
+        again.accept_inventory(&new.snapshot().unwrap()).unwrap();
+        let (ok, profiles) = Identity::load(d.path(), &new, bal());
+        assert!(ok.board_reason().is_none());
+        assert_eq!(profiles[0].controls.len(), 2);
     }
 
     #[tokio::test]

@@ -195,6 +195,9 @@ pub fn start(
     };
     let daemon = Daemon::start(hal, &active, profiles.clone(), history.clone(), opts);
     identity.check_when_ready(daemon.handle());
+    if let Some(why) = identity.board_reason() {
+        daemon.handle().note_degraded(why.to_owned());
+    }
     let keys: Arc<dyn KeyStore> = Arc::new(OsKeychain::default());
     let (local, local_state) = local_model(dir, foreground == ForegroundSource::ActiveUserSession);
     let shared = SlowShared::new(keys.clone(), local_state);

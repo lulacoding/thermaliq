@@ -118,6 +118,8 @@ While the bridge is stopped, its sensors are gone. S3 still applies: a GPU fan w
 
 **Inventory.** `inventory.json` in the data dir: the board fingerprint and every fan (id, label, kind). Checked at every start against the first snapshot: `new`, `missing`, `changed` (label, kind, or the board) are logged and listed in `GET /identity`. The first run saves the baseline. After that it changes only when the user accepts it (`POST /inventory/accept`, or finishing `identify`), so a fan that stays missing is reported until someone decides.
 
+**A different board.** If the saved inventory's board is not the board the bridge reports now (both known, names differ), the same IDs may be other fans. The daemon then loads with every role unmapped (so every role-based control is dropped and those fans go to the BIOS or driver), logs it, and adds a `degraded_reasons` line saying the board changed and to run `thermaliq-daemon identify`. It stays that way across restarts until `identify` finishes or `POST /inventory/accept` saves the new board. An unknown board now (no bridge) is not a change.
+
 **Roles.** Bundled profiles name roles, not hardware. Fan roles: `cpu_fan`, `pump`, `case_front`, `case_rear`, `case_top`, `gpu_fan`. Sensor roles: `cpu_temp`, `gpu_temp`. `roles.toml` in the data dir maps a role to a real ID. When a profile loads, each role becomes its mapped ID. An unmapped role is skipped and reported by name, never silently:
 
 - a control on an unmapped fan role is dropped;
@@ -137,7 +139,7 @@ A dropped fan goes to the BIOS or driver, not to a guess.
 2. **RPM pairing** (fans with a tach): the probe puts the fan at 100% for 5 s and compares every RPM. The fan whose RPM rose is the one it drives. A rise on another fan's tach is reported, never guessed.
 3. **Listen** (fans with no tach reading, or no rise): the probe puts the fan at 100% for 5 s and the user answers front, rear, top or none. `none` leaves the fan unmapped.
 
-A probe adds one flat-100% control for that fan to the active profile for 5 s, then restores the profile, so the engine stays the only writer (S1) and S2–S4 still win. Nothing is saved until the user confirms, and `roles.toml` is written atomically.
+A probe adds one flat-100% control for that fan to the active profile for 5 s, then restores the profile, so the engine stays the only writer (S1) and S2–S4 still win. The hold and the restore run in their own task, so a dropped request (Ctrl-C) still restores. The agent is paused for the probe and resumed afterwards only if it was running, so no profile switch can land inside the hold and be undone. Nothing is saved until the user confirms, and `roles.toml` is written atomically.
 
 M13 is identity only. Which fan cools which component is M20d.
 
