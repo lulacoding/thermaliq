@@ -158,7 +158,7 @@ static int Fan(string id)
 
         var moved = before.Keys.Where(fan => Moved(before[fan], held.GetValueOrDefault(fan))).ToList();
         foreach (var fan in moved)
-            Console.WriteLine($"moved at {Duty}%: {fan} {Show(before[fan], "")} -> {Show(held[fan], " RPM")}");
+            Console.WriteLine($"RPM changed while held: {fan} {Show(before[fan], "")} -> {Show(held[fan], " RPM")} (a BIOS curve can do this too, so it only counts on the fan you set)");
         if (moved.Count == 0)
             Console.WriteLine($"NO fan moved by {MovedRpm} RPM or more. Inconclusive unless it already ran near {Duty}%.");
 

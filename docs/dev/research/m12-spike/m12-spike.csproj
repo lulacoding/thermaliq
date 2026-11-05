@@ -9,8 +9,9 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- Exact version, so a newer build can't arrive unnoticed: this library writes to fan registers. -->
-    <PackageReference Include="LibreHardwareMonitorLib" Version="[0.9.6]" />
+    <!-- Exact version: this library writes to fan registers. pre742 is the first build with the NCT6687D
+         restore fix (dc51e75, LHM #2527). 0.9.6 leaves a header taken from the BIOS in manual. -->
+    <PackageReference Include="LibreHardwareMonitorLib" Version="[0.9.7-pre742]" />
   </ItemGroup>
 
 </Project>

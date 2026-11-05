@@ -1,8 +1,8 @@
 # M12 spike: prove one case fan moves
 
-Throwaway console app, not product code. It answers three questions on Sam's PC before any bridge code is written. It has not been run against real hardware yet: only `selftest` has run.
+Throwaway console app, not product code. It answers three questions on Sam's PC before any bridge code is written. Results so far are at the end of this file. No fan has been shown to move yet.
 
-The fan step writes to a real fan header. Pick a case fan, never the CPU fan or a pump. The spike refuses headers named CPU or pump, but many boards only say `Fan #2`, so check the header first. If the process is hard-killed or the power goes out during the 10 s, that fan keeps 60% until the next reboot. Ctrl-C and closing the window hand it back.
+The fan step writes to a real fan header. Pick a case fan, never the CPU fan or a pump. The spike refuses headers named CPU or pump, but many boards only say `Fan #2`, so check the header first. If the process is hard-killed or the power goes out during the 10 s, that fan keeps 60% until the next reboot. Ctrl-C and closing the window run the hand-back, and on an NCT6687D the check that it worked is `0A00` in `out\fan-after.txt` (see Results).
 
 ## 1. Install
 
@@ -90,8 +90,32 @@ Paste this into chat. Don't commit `out\`, because the reports can include board
 
 ## Why these checks
 
-From the LibreHardwareMonitorLib 0.9.6 source:
+From the LibreHardwareMonitorLib source:
 
 - `SetDefault()` writes back the register values saved at the **first** `SetSoftware` of that process, not a fixed "BIOS" value. So `fan-before` against `fan-after` is the real test of the hand-back.
 - Those saved values live only in memory. A bridge that dies loses them (PORTING M12).
 - `Computer.Close()` restores all controls. `driver` opens the library only after the unload, so nothing in this process can hold PawnIO open. The same holds for the bridge once it has exited, since Windows closes a dead process's handles.
+
+## Results
+
+Sam's PC, 2026-11-05: MSI B550M PRO-VDH WIFI, NCT6687D, PawnIO 2.2.0. On this chip `0xA00` holds one manual flag per header (bit 5 is control 5) and `0x160`–`0x167` hold the actual duty.
+
+**LHM 0.9.6, control 5, starting from the BIOS (bug confirmed):**
+
+| Run | Before | After | Meaning |
+|---|---|---|---|
+| 1 | `0A00 = 00`, duty 100% | `0A00 = 20`, duty 40% (`66`) | Stayed manual at a stale duty, BIOS curve off for that header |
+| 2 | `0A00 = 20`, duty 40% | `0A00 = 00`, duty 100% (`FF`) | Back on the BIOS |
+
+Cause: 0.9.6 restores with `mode & ~initial`, so it clears the flag only if it was already set when saved. Fixed in LHM `dc51e75` (#2527). `0.9.7-pre742` was built from exactly that commit (its nuspec records it), and pre741 is behind it.
+
+**LHM `0.9.7-pre742`:** not run yet. Pass means both runs from the BIOS end with `0A00 = 00`.
+
+**Fan movement:** not proven. Only the CPU fan reports RPM on this board, HWiNFO agrees, and no USB fan controller was found. The `moved` line in run 2 was the CPU fan following its BIOS curve, not the spike.
+
+**PawnIO unload (HWiNFO closed, LHM 0.9.6):**
+
+- `sc stop PawnIO` is refused with error 1052.
+- `pnputil /disable-device "ROOT\PAWNIO\0000"` stops the service with no reboot (`STATE 1 STOPPED`, exit code 31).
+- `pnputil /enable-device "ROOT\PAWNIO\0000"` brings it back with no reboot (`STATE 4 RUNNING`), and `list` then reads the chip and the CPU fan.
+- Not tested: disabling while another program holds PawnIO open, or whether FACEIT then starts.
