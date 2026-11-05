@@ -245,6 +245,21 @@ impl Engine {
         self.fans.iter().find(|f| f.id == fan)?.curve_duty
     }
 
+    /// The agent's live request on this fan as the engine holds it (already clamped to the
+    /// 15-point floor). `None` when it has none or it expired.
+    pub fn agent_request(&self, fan: &str) -> Option<u8> {
+        self.fans
+            .iter()
+            .find(|f| f.id == fan)?
+            .ctl
+            .request(Source::Agent)
+    }
+
+    /// The last duty a fan accepted from us (what the engine commanded, not what NVML reads back).
+    pub fn written(&self, fan: &str) -> Option<u8> {
+        self.written.get(fan).copied()
+    }
+
     /// Drops one source's requests on every fan: pause and agent crash withdraw `Source::Agent`.
     pub fn withdraw_all(&mut self, source: Source) {
         for f in &mut self.fans {
@@ -1233,6 +1248,29 @@ mod agent_tests {
         agent(&mut e, 90, 99); // pump set is still empty, so submit accepts it
         e.tick(secs(0));
         assert_eq!(last(&hal), 50, "the curve, not the agent's 90");
+    }
+
+    #[test]
+    fn the_engine_reports_the_agents_live_request_and_the_last_commanded_duty() {
+        let (_, mut e) = rig(); // curve 50, min_pwm 45
+        assert_eq!((e.agent_request("f1"), e.written("f1")), (None, None));
+        e.tick(secs(0));
+        assert_eq!((e.agent_request("f1"), e.written("f1")), (None, Some(50)));
+        agent(&mut e, 0, 3);
+        e.tick(secs(1));
+        assert_eq!(e.agent_request("f1"), Some(35), "as clamped, not as asked");
+        assert_eq!(
+            e.written("f1"),
+            Some(45),
+            "the profile minimum wins at the end"
+        );
+        e.tick(secs(3));
+        assert_eq!(e.agent_request("f1"), None, "expired");
+        agent(&mut e, 90, 99);
+        e.withdraw_all(Source::Agent);
+        e.tick(secs(4));
+        assert_eq!(e.agent_request("f1"), None);
+        assert_eq!((e.agent_request("nope"), e.written("nope")), (None, None));
     }
 
     #[test]

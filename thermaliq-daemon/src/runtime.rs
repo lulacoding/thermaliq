@@ -286,6 +286,17 @@ pub struct Cache {
     /// Ticks since `snapshot` was read from the hardware; 0 = fresh (S4 starts at 3).
     pub snapshot_age: u64,
     pub active_profile: String,
+    /// Per fan in the snapshot: what the curve, the agent and the engine's last write say.
+    pub fan_info: HashMap<String, FanInfo>,
+}
+
+/// Why a fan is where it is. `None` = no such thing right now (never 0). `commanded` is what
+/// the engine last wrote, not NVML's readback, which lags a slewing fan by seconds.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FanInfo {
+    pub curve: Option<u8>,
+    pub agent: Option<u8>,
+    pub commanded: Option<u8>,
 }
 
 type HistoryTick = (i64, Vec<SensorReading>, Vec<FanReading>, Vec<MetricReading>);
@@ -428,11 +439,22 @@ impl Daemon {
                         };
                         // Only fresh data: the agent never acts on an old snapshot. A full queue
                         // drops this tick for it; its requests expire in 3 s.
+                        let fan_info: HashMap<String, FanInfo> = snapshot
+                            .fans
+                            .iter()
+                            .map(|f| {
+                                let info = FanInfo {
+                                    curve: engine.curve_output(&f.id),
+                                    agent: engine.agent_request(&f.id),
+                                    commanded: engine.written(&f.id),
+                                };
+                                (f.id.clone(), info)
+                            })
+                            .collect();
                         if engine.snapshot_fresh() && !shared.flags.paused.load(Ordering::SeqCst) {
-                            let curve = snapshot
-                                .fans
+                            let curve = fan_info
                                 .iter()
-                                .filter_map(|f| Some((f.id.clone(), engine.curve_output(&f.id)?)))
+                                .filter_map(|(id, i)| Some((id.clone(), i.curve?)))
                                 .collect();
                             let _ = agent_tx.try_send(AgentTick {
                                 snapshot: snapshot.clone(),
@@ -441,6 +463,7 @@ impl Daemon {
                         }
                         {
                             let mut c = cache.write().unwrap_or_else(PoisonError::into_inner);
+                            c.fan_info = fan_info;
                             (c.snapshot, c.status) = (snapshot, status);
                             (c.ticks, c.snapshot_age) = (ticks, snapshot_age);
                         }
@@ -1101,6 +1124,24 @@ mod tests {
             hal.writes().iter().all(|(_, d)| *d >= 15),
             "never below the clamp"
         );
+    }
+
+    #[tokio::test]
+    async fn the_cache_shows_each_fans_curve_the_agents_ask_and_the_commanded_duty() {
+        let hal = mock();
+        let d = with_brain(hal.clone(), asks("f1", 80, None));
+        let info = |d: &Daemon| d.cache().fan_info.get("f1").cloned().unwrap_or_default();
+        wait_until(|| info(&d).agent == Some(80));
+        let i = info(&d);
+        assert_eq!((i.curve, i.commanded), (Some(30), Some(80)));
+        assert_eq!(
+            d.cache().fan_info.get("f2"),
+            Some(&FanInfo::default()),
+            "no control, nothing to say"
+        );
+        d.handle().pause_agent().await.unwrap();
+        wait_until(|| info(&d).agent.is_none() && info(&d).commanded == Some(30));
+        d.shutdown().unwrap();
     }
 
     #[test]

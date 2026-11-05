@@ -232,8 +232,22 @@ async fn sensors(State(s): State<ApiState>) -> Json<Value> {
     Json(json!(s.handle.cache().snapshot.sensors))
 }
 
+/// Fans plus why they are there: the profile curve's duty, the agent's live ask and the duty
+/// the engine last commanded (null = none; NVML's own `duty_percent` lags a slewing fan).
+fn fans_json(c: &Cache) -> Value {
+    let one = |f: &thermaliq_common::FanReading| {
+        let i = c.fan_info.get(&f.id).cloned().unwrap_or_default();
+        let mut v = json!(f);
+        v["curve_duty"] = json!(i.curve);
+        v["agent_duty"] = json!(i.agent);
+        v["commanded_duty"] = json!(i.commanded);
+        v
+    };
+    Value::Array(c.snapshot.fans.iter().map(one).collect())
+}
+
 async fn fans(State(s): State<ApiState>) -> Json<Value> {
-    Json(json!(s.handle.cache().snapshot.fans))
+    Json(fans_json(&s.handle.cache()))
 }
 
 async fn metrics(State(s): State<ApiState>) -> Json<Value> {
@@ -375,7 +389,7 @@ fn frame(c: &Cache) -> Message {
         "agent": c.status.agent.as_str(),
     });
     v["sensors"] = json!(c.snapshot.sensors);
-    v["fans"] = json!(c.snapshot.fans);
+    v["fans"] = fans_json(c);
     v["metrics"] = json!(c.snapshot.metrics);
     Message::Text(v.to_string().into())
 }
@@ -729,6 +743,26 @@ mod tests {
             .map(|f| f["id"].clone())
             .collect();
         assert_eq!(ids, [json!("f1"), json!("f2")]);
+    }
+
+    #[tokio::test]
+    async fn fans_show_the_curve_the_agents_ask_and_the_commanded_duty() {
+        let r = rig(vec![at(40.0)]);
+        ticked(&r).await;
+        until(|| r.daemon.cache().fan_info["f1"].commanded == Some(30)).await;
+        let (_, f) = get(&r, "/fans").await;
+        let pick =
+            |i: usize| ["curve_duty", "agent_duty", "commanded_duty"].map(|k| f[i][k].clone());
+        assert_eq!(
+            pick(0),
+            [json!(30), Value::Null, json!(30)],
+            "f1 follows the flat curve"
+        );
+        assert_eq!(
+            pick(1),
+            [Value::Null, Value::Null, Value::Null],
+            "f2 has no control: null, not 0"
+        );
     }
 
     #[tokio::test]
