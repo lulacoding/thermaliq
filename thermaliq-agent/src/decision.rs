@@ -3,7 +3,7 @@
 //! the rest of this crate: the daemon supplies the providers, the clock and the observations.
 
 use crate::classifier::Workload;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::time::Duration;
 use thermaliq_common::{Curve, CustomSensor, HardwareSnapshot, Profile};
 
@@ -582,6 +582,12 @@ impl SlowLayer {
     }
 
     /// The profile was already active: nothing changed, so nothing counts.
+    /// The change was held back only because the hardware wasn't steady: offer it again next
+    /// second, not at the next cycle. A known exe costs no provider call.
+    pub fn retry(&mut self) {
+        self.due = true;
+    }
+
     pub fn already_active(&mut self, c: &Change) {
         self.settled = Some(c.profile);
     }
@@ -769,17 +775,65 @@ impl SlowLayer {
     }
 }
 
+/// Hardware that has just changed, restarted or gone degraded is no basis for swapping profiles:
+/// the snapshot may be missing fans or sensors that come back a moment later. A switch waits
+/// until the fans, sensors and unavailable sources have been the same, and healthy, for a while.
+#[derive(Default)]
+pub struct Settled {
+    shape: Option<BTreeSet<String>>,
+    since: Duration,
+    steady: bool,
+}
+
+impl Settled {
+    pub const FOR: Duration = Duration::from_secs(10);
+
+    pub fn observe(
+        &mut self,
+        now: Duration,
+        snap: &HardwareSnapshot,
+        unavailable: &[String],
+        degraded: bool,
+        snapshot_age: u64,
+    ) {
+        let shape: BTreeSet<String> = snap
+            .fans
+            .iter()
+            .map(|f| format!("fan:{}", f.id))
+            .chain(snap.sensors.iter().map(|s| format!("sensor:{}", s.id)))
+            .chain(unavailable.iter().map(|u| format!("down:{u}")))
+            .collect();
+        let steady = !degraded && snapshot_age == 0;
+        if !steady || !self.steady || self.shape.as_ref() != Some(&shape) {
+            self.since = now;
+        }
+        self.steady = steady;
+        self.shape = Some(shape);
+    }
+
+    pub fn is_settled(&self, now: Duration, wait: Duration) -> bool {
+        self.steady && self.shape.is_some() && now.saturating_sub(self.since) >= wait
+    }
+}
+
 /// Why a rule-selected profile must not replace the active one, if so. `set_profile` hands back
 /// any fan the new profile drops, and a curve on a missing sensor trips S3 (100%). Bundled
 /// profiles use role ids until M13, so without this a switch could release the real fan.
-pub fn why_not_switch(next: &Profile, active: &Profile, snap: &HardwareSnapshot) -> Option<String> {
+///
+/// `ever_seen` holds every fan any snapshot has listed since start. A fan the active profile
+/// controls that is missing right now (a bridge restarting) still counts as its fan; only an id
+/// that never existed (a role id) is ignored.
+pub fn why_not_switch(
+    next: &Profile,
+    active: &Profile,
+    snap: &HardwareSnapshot,
+    ever_seen: &HashSet<String>,
+) -> Option<String> {
     let controlled: HashSet<&str> = next.controls.iter().map(|c| c.fan.as_str()).collect();
     let real = |id: &str| snap.fans.iter().any(|f| f.id == id);
-    if let Some(c) = active
-        .controls
-        .iter()
-        .find(|c| real(&c.fan) && !controlled.contains(c.fan.as_str()))
-    {
+    if let Some(c) = active.controls.iter().find(|c| {
+        (real(&c.fan) || ever_seen.contains(&c.fan)) && !controlled.contains(c.fan.as_str())
+    }) {
         return Some(format!(
             "profile '{}' does not control fan '{}'",
             next.name, c.fan
@@ -1368,6 +1422,26 @@ mod tests {
     }
 
     #[test]
+    fn a_change_held_back_only_for_unsteady_hardware_is_offered_again_next_second() {
+        let mut r = Rig::new(Fake::down(), Fake::down());
+        r.s.set_known(
+            "a.exe",
+            Known {
+                workload: Gaming,
+                source: Source::User,
+                confidence: None,
+            },
+        );
+        assert!(r.step(0, &seen("a.exe")).change.is_some());
+        assert!(
+            r.step(1, &seen("a.exe")).change.is_none(),
+            "not retried by itself"
+        );
+        r.s.retry();
+        assert!(r.step(2, &seen("a.exe")).change.is_some());
+    }
+
+    #[test]
     fn a_change_that_could_not_be_applied_is_retried_at_the_next_cycle_not_every_second() {
         let mut r = Rig::new(Fake::down(), Fake::down());
         r.s.set_known(
@@ -1666,14 +1740,17 @@ mod tests {
     fn a_profile_that_covers_this_pcs_fans_may_replace_the_active_one() {
         let active = profile("a", &["nvml_gpu0_fan0"], "nvml_gpu0_temp");
         let next = profile("b", &["nvml_gpu0_fan0"], "nvml_gpu0_temp");
-        assert_eq!(why_not_switch(&next, &active, &snapshot()), None);
+        assert_eq!(
+            why_not_switch(&next, &active, &snapshot(), &HashSet::new()),
+            None
+        );
     }
 
     #[test]
     fn a_bundled_profile_with_role_ids_would_hand_the_real_fan_back_and_is_refused() {
         let active = profile("a", &["nvml_gpu0_fan0"], "nvml_gpu0_temp");
         let bundled = profile("gaming", &["gpu1"], "nvml_gpu0_temp");
-        let why = why_not_switch(&bundled, &active, &snapshot()).unwrap();
+        let why = why_not_switch(&bundled, &active, &snapshot(), &HashSet::new()).unwrap();
         assert!(why.contains("nvml_gpu0_fan0"), "{why}");
     }
 
@@ -1681,8 +1758,105 @@ mod tests {
     fn a_profile_reading_a_missing_sensor_would_trip_s3_and_is_refused() {
         let active = profile("a", &["nvml_gpu0_fan0"], "nvml_gpu0_temp");
         let next = profile("b", &["nvml_gpu0_fan0"], "cpu_package");
-        let why = why_not_switch(&next, &active, &snapshot()).unwrap();
+        let why = why_not_switch(&next, &active, &snapshot(), &HashSet::new()).unwrap();
         assert!(why.contains("cpu_package"), "{why}");
+    }
+
+    fn with_fans(ids: &[&str]) -> HardwareSnapshot {
+        let mut s = snapshot();
+        s.fans = ids
+            .iter()
+            .map(|id| thermaliq_common::FanReading {
+                id: (*id).into(),
+                label: (*id).into(),
+                rpm: 1000,
+                duty_percent: 40,
+                kind: thermaliq_common::FanKind::Fan,
+            })
+            .collect();
+        s
+    }
+
+    fn fans_ever(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_fan_that_is_gone_for_a_moment_still_counts_as_the_profiles_fan() {
+        // A bridge restarting drops its fans from the snapshot. The profile still controls them.
+        let active = profile("a", &["f1", "f2"], "nvml_gpu0_temp");
+        let next = profile("b", &["f1"], "nvml_gpu0_temp");
+        let now = with_fans(&["f1"]);
+        let why = why_not_switch(&next, &active, &now, &fans_ever(&["f1", "f2"])).unwrap();
+        assert!(why.contains("f2"), "{why}");
+    }
+
+    #[test]
+    fn a_fan_never_seen_does_not_block_a_switch_so_role_id_profiles_can_still_leave() {
+        let active = profile("a", &["gpu1"], "nvml_gpu0_temp");
+        let next = profile("b", &["f1"], "nvml_gpu0_temp");
+        let now = with_fans(&["f1"]);
+        assert_eq!(
+            why_not_switch(&next, &active, &now, &fans_ever(&["f1"])),
+            None
+        );
+    }
+
+    const TEN: Duration = Duration::from_secs(10);
+
+    fn at(s: u64) -> Duration {
+        Duration::from_secs(s)
+    }
+
+    fn calm(w: &mut Settled, now: u64, fans: &[&str]) {
+        w.observe(at(now), &with_fans(fans), &[], false, 0);
+    }
+
+    #[test]
+    fn nothing_is_settled_until_the_hardware_has_been_the_same_for_the_whole_wait() {
+        let mut w = Settled::default();
+        calm(&mut w, 0, &["f1"]);
+        assert!(!w.is_settled(at(9), TEN));
+        calm(&mut w, 9, &["f1"]);
+        assert!(w.is_settled(at(10), TEN));
+    }
+
+    #[test]
+    fn a_fan_vanishing_and_coming_back_starts_the_wait_over() {
+        let mut w = Settled::default();
+        calm(&mut w, 0, &["f1", "f2"]);
+        calm(&mut w, 20, &["f1", "f2"]);
+        assert!(w.is_settled(at(20), TEN));
+        calm(&mut w, 21, &["f1"]);
+        assert!(!w.is_settled(at(21), TEN));
+        calm(&mut w, 27, &["f1", "f2"]);
+        assert!(!w.is_settled(at(31), TEN), "newly back counts as changed");
+        calm(&mut w, 36, &["f1", "f2"]);
+        assert!(w.is_settled(at(37), TEN));
+    }
+
+    #[test]
+    fn degraded_a_stale_snapshot_or_a_source_going_down_each_break_it() {
+        let mut w = Settled::default();
+        calm(&mut w, 0, &["f1"]);
+        w.observe(at(20), &with_fans(&["f1"]), &[], true, 0);
+        assert!(!w.is_settled(at(40), TEN), "degraded is never settled");
+        w.observe(at(41), &with_fans(&["f1"]), &[], false, 1);
+        assert!(
+            !w.is_settled(at(60), TEN),
+            "a stale snapshot is never settled"
+        );
+        w.observe(at(61), &with_fans(&["f1"]), &[], false, 0);
+        assert!(!w.is_settled(at(65), TEN));
+        assert!(w.is_settled(at(71), TEN));
+        w.observe(
+            at(72),
+            &with_fans(&["f1"]),
+            &["lhm-bridge".into()],
+            false,
+            0,
+        );
+        assert!(!w.is_settled(at(75), TEN), "the unavailable list changed");
     }
 
     #[test]

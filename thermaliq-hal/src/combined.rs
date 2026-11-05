@@ -7,11 +7,13 @@ use thermaliq_common::{HardwareSnapshot, MetricKind};
 
 pub struct CombinedHardwareLayer {
     backends: Vec<Arc<dyn HardwareLayer>>,
-    /// Controllable fan id -> index of the backend that owns it.
-    owner: HashMap<String, usize>,
+    /// Controllable fan id -> the backend that owns it.
+    owner: HashMap<String, Arc<dyn HardwareLayer>>,
     optional: Vec<(String, Arc<dyn HardwareLayer>)>,
     /// Optional sources whose last snapshot failed.
     unavailable: Mutex<Vec<String>>,
+    /// Sources that never started, and why if that was a failure rather than a choice.
+    unstarted: Vec<(String, Option<String>)>,
 }
 
 impl CombinedHardwareLayer {
@@ -21,9 +23,9 @@ impl CombinedHardwareLayer {
             return Err(HalError("no hardware backends".into()));
         }
         let mut owner = HashMap::new();
-        for (i, b) in backends.iter().enumerate() {
+        for b in &backends {
             for fan in b.capabilities().controllable_fans {
-                if owner.insert(fan.clone(), i).is_some() {
+                if owner.insert(fan.clone(), b.clone()).is_some() {
                     return Err(HalError(format!("fan '{fan}' is claimed by two backends")));
                 }
             }
@@ -33,7 +35,16 @@ impl CombinedHardwareLayer {
             owner,
             optional: Vec::new(),
             unavailable: Mutex::new(Vec::new()),
+            unstarted: Vec::new(),
         })
+    }
+
+    /// Records a source that never started, so an engine without it doesn't look healthy (S8). It
+    /// shows in `unavailable_sources`. `Some(why)` is a failure and also in `degraded_reasons`;
+    /// `None` means it was left off on purpose (not installed, anti-cheat mode).
+    pub fn with_unstarted(mut self, name: &str, fault: Option<String>) -> Self {
+        self.unstarted.push((name.to_string(), fault));
+        self
     }
 
     /// Adds a read-only source that may be missing: if its snapshot fails, only its own
@@ -52,10 +63,28 @@ impl CombinedHardwareLayer {
         Ok(self)
     }
 
+    /// A source that may be missing and owns fans (the LHM bridge). If its snapshot fails, its
+    /// readings drop out as with `with_optional`, and S4 stays out of it: its own watchdog gives
+    /// its fans to the BIOS, or it is killed and its replacement does (S6). Writes to them fail
+    /// until it is back.
+    pub fn with_optional_owner(
+        mut self,
+        name: &str,
+        backend: Arc<dyn HardwareLayer>,
+    ) -> Result<Self, HalError> {
+        for fan in backend.capabilities().controllable_fans {
+            if self.owner.insert(fan.clone(), backend.clone()).is_some() {
+                return Err(HalError(format!("fan '{fan}' is claimed by two backends")));
+            }
+        }
+        self.optional.push((name.to_string(), backend));
+        Ok(self)
+    }
+
     fn owner_of(&self, fan: &str) -> Result<&dyn HardwareLayer, HalError> {
         self.owner
             .get(fan)
-            .map(|&i| self.backends[i].as_ref())
+            .map(AsRef::as_ref)
             .ok_or_else(|| HalError(format!("no backend controls fan '{fan}'")))
     }
 }
@@ -101,10 +130,26 @@ impl HardwareLayer for CombinedHardwareLayer {
     }
 
     fn unavailable_sources(&self) -> Vec<String> {
-        self.unavailable
+        let mut all = self
+            .unavailable
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+            .clone();
+        all.extend(self.unstarted.iter().map(|(name, _)| name.clone()));
+        all
+    }
+
+    fn degraded_reasons(&self) -> Vec<String> {
+        self.backends
+            .iter()
+            .chain(self.optional.iter().map(|(_, b)| b))
+            .flat_map(|b| b.degraded_reasons())
+            .chain(
+                self.unstarted
+                    .iter()
+                    .filter_map(|(name, fault)| Some(format!("{name}: {}", fault.as_ref()?))),
+            )
+            .collect()
     }
 
     fn set_fan_duty(&self, fan: &str, duty: u8) -> Result<(), HalError> {
@@ -120,6 +165,7 @@ impl HardwareLayer for CombinedHardwareLayer {
             controllable_fans: self
                 .backends
                 .iter()
+                .chain(self.optional.iter().map(|(_, b)| b))
                 .flat_map(|b| b.capabilities().controllable_fans)
                 .collect(),
         }
@@ -374,6 +420,126 @@ mod tests {
             .err()
             .unwrap();
         assert!(err.0.contains("hwinfo"), "{err}");
+    }
+
+    #[test]
+    fn an_optional_owner_can_be_written_and_its_failure_only_drops_itself() {
+        let req = mock(&["a1"], "gpu", SensorKind::Gpu);
+        let opt = Arc::new(MockHardwareLayer::new(
+            &["b1"],
+            vec![
+                Tick::Temps(vec![("hw".into(), SensorKind::Cpu, 40.0)]),
+                Tick::Fail,
+            ],
+        ));
+        let c = CombinedHardwareLayer::new(vec![req])
+            .unwrap()
+            .with_optional_owner("lhm-bridge", opt.clone())
+            .unwrap();
+        assert_eq!(c.capabilities().controllable_fans, ["a1", "b1"]);
+        c.set_fan_duty("b1", 70).unwrap();
+        c.restore_auto("b1").unwrap();
+        assert_eq!(opt.writes(), [("b1".into(), 70)]);
+        assert_eq!(opt.restores(), ["b1"]);
+        assert_eq!(c.snapshot().unwrap().fans.len(), 2);
+        let snap = c.snapshot().unwrap();
+        assert_eq!(snap.sensors.len(), 1, "the GPU reading survives");
+        assert_eq!(snap.fans.len(), 1);
+        assert_eq!(c.unavailable_sources(), ["lhm-bridge"]);
+    }
+
+    #[test]
+    fn an_optional_owner_cannot_claim_a_fan_another_backend_owns() {
+        let req = mock(&["f"], "gpu", SensorKind::Gpu);
+        let opt = mock(&["f"], "hw", SensorKind::Cpu);
+        let err = CombinedHardwareLayer::new(vec![req])
+            .unwrap()
+            .with_optional_owner("lhm-bridge", opt)
+            .err()
+            .unwrap();
+        assert!(err.0.contains("'f'"), "{err}");
+    }
+
+    #[test]
+    fn builtin_cpu_load_still_wins_over_an_optional_owner() {
+        use thermaliq_common::{MetricKind, MetricReading};
+        let load = |id: &str| {
+            vec![MetricReading {
+                id: id.into(),
+                kind: MetricKind::CpuLoad,
+                value: 10.0,
+            }]
+        };
+        let builtin = Arc::new(
+            Arc::into_inner(mock(&[], "x", SensorKind::Other))
+                .unwrap()
+                .metrics(load("builtin")),
+        );
+        let bridge = Arc::new(
+            Arc::into_inner(mock(&["b1"], "y", SensorKind::Other))
+                .unwrap()
+                .metrics(load("lhm")),
+        );
+        let c = CombinedHardwareLayer::new(vec![mock(&["a1"], "gpu", SensorKind::Gpu)])
+            .unwrap()
+            .with_optional("cpu-load", builtin)
+            .unwrap()
+            .with_optional_owner("lhm-bridge", bridge)
+            .unwrap();
+        let ids: Vec<_> = c
+            .snapshot()
+            .unwrap()
+            .metrics
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(ids, ["builtin"]);
+    }
+
+    #[test]
+    fn degraded_reasons_come_from_every_backend() {
+        struct Faulty;
+        impl HardwareLayer for Faulty {
+            fn snapshot(&self) -> Result<HardwareSnapshot, HalError> {
+                Ok(HardwareSnapshot::default())
+            }
+            fn set_fan_duty(&self, _: &str, _: u8) -> Result<(), HalError> {
+                Ok(())
+            }
+            fn restore_auto(&self, _: &str) -> Result<(), HalError> {
+                Ok(())
+            }
+            fn capabilities(&self) -> Capabilities {
+                Capabilities::default()
+            }
+            fn degraded_reasons(&self) -> Vec<String> {
+                vec!["header still manual".into()]
+            }
+        }
+        let c = CombinedHardwareLayer::new(vec![mock(&["a1"], "gpu", SensorKind::Gpu)])
+            .unwrap()
+            .with_optional_owner("lhm-bridge", Arc::new(Faulty))
+            .unwrap();
+        assert_eq!(c.degraded_reasons(), ["header still manual"]);
+    }
+
+    #[test]
+    fn a_source_that_never_started_is_unavailable_and_a_fault_is_degraded() {
+        let c = CombinedHardwareLayer::new(vec![mock(&["a1"], "gpu", SensorKind::Gpu)])
+            .unwrap()
+            .with_unstarted("lhm-bridge", Some("cannot open the pipe".into()))
+            .with_unstarted("hwinfo-off", None);
+        c.snapshot().unwrap();
+        assert_eq!(c.unavailable_sources(), ["lhm-bridge", "hwinfo-off"]);
+        assert_eq!(c.degraded_reasons(), ["lhm-bridge: cannot open the pipe"]);
+    }
+
+    #[test]
+    fn unstarted_and_failing_sources_are_both_listed_without_repeats() {
+        let opt = Arc::new(MockHardwareLayer::new(&[], vec![Tick::Fail]));
+        let c = required_plus(opt).with_unstarted("lhm-bridge", None);
+        c.snapshot().unwrap();
+        assert_eq!(c.unavailable_sources(), ["hwinfo", "lhm-bridge"]);
     }
 
     #[test]

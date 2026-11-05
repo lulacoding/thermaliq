@@ -8,12 +8,14 @@ mod hwinfo;
 #[cfg(windows)]
 #[allow(unsafe_code)]
 mod hwinfo_win;
+mod lhm;
 mod mock;
 mod nvidia;
 
 pub use combined::CombinedHardwareLayer;
 pub use cpu_load::CpuLoad;
 pub use hwinfo::{Hwinfo, HwinfoError};
+pub use lhm::{BridgeConnection, BridgeStarter, LhmBridge, Timing};
 pub use mock::{MockHardwareLayer, Tick};
 pub use nvidia::{Nvidia, Nvml};
 
@@ -46,6 +48,11 @@ pub trait HardwareLayer: Send + Sync {
     fn capabilities(&self) -> Capabilities;
     /// Names of optional sources that failed on the last snapshot and were left out of it.
     fn unavailable_sources(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// Hardware faults the daemon must report as `degraded`, such as a fan header that would not
+    /// go back to the BIOS (SPEC §5.1).
+    fn degraded_reasons(&self) -> Vec<String> {
         Vec::new()
     }
 }

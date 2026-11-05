@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 thermaliq-common = { path = "../thermaliq-common" }
+serde_json = "1"
 
 [lints]
 workspace = true

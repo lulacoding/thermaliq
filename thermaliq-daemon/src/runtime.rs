@@ -267,6 +267,9 @@ pub struct Status {
     pub engine_running: bool,
     pub latched: bool,
     pub degraded: bool,
+    /// Hardware faults behind `degraded` that aren't S4, such as a fan header that would not go
+    /// back to the BIOS (SPEC §5.1). Empty while `degraded` comes from S4 alone.
+    pub degraded_reasons: Vec<String>,
     /// CPU/GPU sensors the latch is waiting on to cool down or come back.
     pub waiting_on: Vec<String>,
     /// Optional sensor sources (e.g. "hwinfo") that failed on the last tick and are missing
@@ -429,10 +432,18 @@ impl Daemon {
                                 snapshot.metrics.clone(),
                             ));
                         }
+                        let mut degraded_reasons = sources.degraded_reasons();
+                        // A fresh snapshot with no fan at all means every fan backend failed to
+                        // start or lost its fans. An empty engine must not look healthy (S8).
+                        if engine.snapshot_fresh() && snapshot.fans.is_empty() {
+                            degraded_reasons
+                                .push("no fans found: no hardware backend is providing any".into());
+                        }
                         let status = Status {
                             engine_running: true,
                             latched: engine.latched(),
-                            degraded: engine.degraded(),
+                            degraded: engine.degraded() || !degraded_reasons.is_empty(),
+                            degraded_reasons,
                             waiting_on: engine.latch_waiting_on().to_vec(),
                             unavailable_sources: sources.unavailable_sources(),
                             agent: AgentState::default(),
@@ -725,6 +736,67 @@ mod tests {
             "not a health claim"
         );
         assert!(d.shutdown().is_err());
+    }
+
+    #[test]
+    fn a_hardware_fault_reports_degraded_with_its_reason_but_is_not_s4() {
+        struct Stuck(Arc<MockHardwareLayer>);
+        impl HardwareLayer for Stuck {
+            fn snapshot(&self) -> Result<HardwareSnapshot, HalError> {
+                self.0.snapshot()
+            }
+            fn set_fan_duty(&self, fan: &str, duty: u8) -> Result<(), HalError> {
+                self.0.set_fan_duty(fan, duty)
+            }
+            fn restore_auto(&self, fan: &str) -> Result<(), HalError> {
+                self.0.restore_auto(fan)
+            }
+            fn capabilities(&self) -> Capabilities {
+                self.0.capabilities()
+            }
+            fn degraded_reasons(&self) -> Vec<String> {
+                vec!["lhm_fan_5: still manual".into()]
+            }
+        }
+        let mock = Arc::new(MockHardwareLayer::new(&["f1"], vec![at(40.0)]));
+        let active = Profile::from_toml(FLAT).unwrap();
+        let d = Daemon::start(Arc::new(Stuck(mock.clone())), &active, vec![], db(), fast());
+        wait_until(|| d.cache().ticks > 3);
+        let c = d.cache();
+        assert!(c.status.degraded);
+        assert_eq!(c.status.degraded_reasons, ["lhm_fan_5: still manual"]);
+        assert!(
+            mock.writes().iter().all(|(_, duty)| *duty == 30),
+            "one stuck header must not send every fan to 100%: {:?}",
+            mock.writes()
+        );
+    }
+
+    #[test]
+    fn a_snapshot_with_no_fans_is_degraded_and_says_so_never_a_healthy_empty_engine() {
+        let hal = Arc::new(MockHardwareLayer::new(&[], vec![at(40.0)]));
+        let active = Profile::from_toml(FLAT).unwrap();
+        let d = Daemon::start(hal, &active, vec![], db(), fast());
+        wait_until(|| d.cache().ticks > 3);
+        let c = d.cache();
+        assert!(c.status.degraded);
+        assert!(
+            c.status
+                .degraded_reasons
+                .iter()
+                .any(|r| r.contains("no fans")),
+            "{:?}",
+            c.status.degraded_reasons
+        );
+    }
+
+    #[test]
+    fn fans_present_means_no_missing_fans_reason() {
+        let hal = Arc::new(MockHardwareLayer::new(&["f1"], vec![at(40.0)]));
+        let active = Profile::from_toml(FLAT).unwrap();
+        let d = Daemon::start(hal, &active, vec![], db(), fast());
+        wait_until(|| d.cache().ticks > 3);
+        assert!(d.cache().status.degraded_reasons.is_empty());
     }
 
     #[test]

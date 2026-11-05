@@ -225,6 +225,7 @@ fn status_json(c: &Cache) -> Value {
         "engine_running": c.status.engine_running,
         "latched": c.status.latched,
         "degraded": c.status.degraded,
+        "degraded_reasons": c.status.degraded_reasons,
         "waiting_on": c.status.waiting_on,
         "unavailable_sources": c.status.unavailable_sources,
         "snapshot_age": c.snapshot_age,
@@ -467,6 +468,7 @@ fn frame(c: &Cache) -> Message {
         "engine_running": c.status.engine_running,
         "latched": c.status.latched,
         "degraded": c.status.degraded,
+        "degraded_reasons": c.status.degraded_reasons,
         "waiting_on": c.status.waiting_on,
         "unavailable_sources": c.status.unavailable_sources,
         "agent": c.status.agent.as_str(),
@@ -859,6 +861,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn status_and_stream_frames_show_the_degraded_reasons() {
+        let mut c = Cache::default();
+        c.status.degraded_reasons = vec!["fan: still manual".into()];
+        assert_eq!(
+            status_json(&c)["degraded_reasons"],
+            json!(["fan: still manual"])
+        );
+        let Message::Text(t) = frame(&c) else {
+            panic!("frame is text")
+        };
+        let v: Value = serde_json::from_str(t.as_str()).unwrap();
+        assert_eq!(
+            v["status"]["degraded_reasons"],
+            json!(["fan: still manual"])
+        );
     }
 
     #[test]

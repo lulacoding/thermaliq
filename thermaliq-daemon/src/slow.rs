@@ -6,7 +6,7 @@ use crate::history::HistoryDb;
 use crate::keychain::KeyStore;
 use crate::runtime::{AgentState, Handle};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use thermaliq_agent::classifier::Workload;
 use thermaliq_agent::decision::{
     builtin_workload, clean_exe, game_like, why_not_switch, Change, Decision, DecisionProvider,
-    Foreground, Known, Observation, SlowLayer, Source,
+    Foreground, Known, Observation, Settled, SlowLayer, Source,
 };
 use thermaliq_common::{HardwareSnapshot, MetricKind, Profile, SensorKind};
 
@@ -171,10 +171,13 @@ pub struct SlowParts {
     pub local: Option<Box<dyn DecisionProvider + Send>>,
     pub shared: SlowShared,
     pub period: Duration,
+    /// How long the hardware must stay the same and healthy before a profile switch.
+    pub stable_for: Duration,
 }
 
 impl SlowParts {
     pub const DEFAULT_PERIOD: Duration = STEP;
+    pub const DEFAULT_STABLE: Duration = Settled::FOR;
 }
 
 pub struct SlowThread {
@@ -265,6 +268,14 @@ fn push_log(v: &mut View, e: LogEntry) {
     v.decisions.push(e);
 }
 
+/// When it is, whether the hardware has been steady for long enough, and every fan it has ever
+/// listed.
+struct Gate<'a> {
+    now: Duration,
+    stable: bool,
+    ever_seen: &'a HashSet<String>,
+}
+
 /// Puts the rule's profile in place through the engine. `Err` says why it wasn't.
 fn apply(
     c: &Change,
@@ -273,22 +284,27 @@ fn apply(
     rt: &tokio::runtime::Runtime,
     handle: &Handle,
     layer: &mut SlowLayer,
-    now: Duration,
+    gate: &Gate,
 ) -> Result<bool, String> {
     if cache.active_profile == c.profile {
         layer.already_active(c);
         return Ok(false);
     }
+    // A restarting or degraded backend may be missing fans that come back a moment later.
+    if !gate.stable {
+        layer.retry();
+        return Err("hardware is changing or degraded: waiting for a stable snapshot".into());
+    }
     let find = |name: &str| profiles.iter().find(|p| p.name == name);
     let next = find(c.profile).ok_or_else(|| format!("no profile '{}' is saved", c.profile))?;
     let active = find(&cache.active_profile)
         .ok_or_else(|| format!("the active profile '{}' is unknown", cache.active_profile))?;
-    if let Some(why) = why_not_switch(next, active, &cache.snapshot) {
+    if let Some(why) = why_not_switch(next, active, &cache.snapshot, gate.ever_seen) {
         return Err(why);
     }
     rt.block_on(handle.set_profile(next.clone()))
         .map_err(|e| format!("the engine refused '{}': {e:?}", c.profile))?;
-    layer.applied(now, c);
+    layer.applied(gate.now, c);
     Ok(true)
 }
 
@@ -302,6 +318,7 @@ fn run(parts: SlowParts, stopping: &AtomicBool) {
         mut local,
         shared,
         period,
+        stable_for,
     } = parts;
     let Ok(rt) = tokio::runtime::Builder::new_current_thread()
         .enable_time()
@@ -312,6 +329,8 @@ fn run(parts: SlowParts, stopping: &AtomicBool) {
     };
     let mut layer = SlowLayer::new(load_known(&history));
     let began = Instant::now();
+    let mut settled = Settled::default();
+    let mut ever_seen: HashSet<String> = HashSet::new();
     let mut last_note: Option<String> = None;
     while !stopping.load(Ordering::SeqCst) {
         std::thread::sleep(period);
@@ -326,6 +345,15 @@ fn run(parts: SlowParts, stopping: &AtomicBool) {
             );
         }
         let cache = handle.cache();
+        // Before anything can `continue`: a pause or a stopped engine is part of what changed.
+        ever_seen.extend(cache.snapshot.fans.iter().map(|f| f.id.clone()));
+        settled.observe(
+            began.elapsed(),
+            &cache.snapshot,
+            &cache.status.unavailable_sources,
+            cache.status.degraded || !cache.status.engine_running,
+            cache.snapshot_age,
+        );
         let seen = foreground();
         shared.update(|v| v.foreground = seen.is_some());
         if !cache.status.engine_running || cache.status.agent != AgentState::Running {
@@ -391,7 +419,12 @@ fn run(parts: SlowParts, stopping: &AtomicBool) {
         }
         let mut logged = step.decision.as_ref().map(entry);
         if let Some(c) = &step.change {
-            match apply(c, &cache, &profiles, &rt, &handle, &mut layer, now) {
+            let gate = Gate {
+                now,
+                stable: settled.is_settled(now, stable_for),
+                ever_seen: &ever_seen,
+            };
+            match apply(c, &cache, &profiles, &rt, &handle, &mut layer, &gate) {
                 Ok(changed) => {
                     last_note = None;
                     if changed {
@@ -453,6 +486,9 @@ mod tests {
     use crate::runtime::{Daemon, Options};
     use thermaliq_common::{FanKind, FanReading, MetricReading, SensorReading};
     use thermaliq_hal::{MockHardwareLayer, Tick};
+
+    /// The wait for a stable snapshot, short for the tests (10 s in the service).
+    const STABLE: Duration = Duration::from_millis(400);
 
     fn toml(name: &str, fan: &str) -> Profile {
         Profile::from_toml(&format!(
@@ -557,6 +593,138 @@ mod tests {
     fn rig(profiles: Vec<Profile>, known: &[(&str, &str)]) -> Rig {
         let cpu = Tick::Temps(vec![("cpu".into(), SensorKind::Cpu, 40.0)]);
         let hal = Arc::new(MockHardwareLayer::new(&["f1"], vec![cpu]));
+        rig_on(hal, profiles, known)
+    }
+
+    /// Hardware that can lose `f2` (a bridge restarting) or report a fault, as the tests ask.
+    struct Flaky {
+        inner: MockHardwareLayer,
+        hide_f2: Arc<AtomicBool>,
+        fault: Arc<AtomicBool>,
+    }
+
+    impl thermaliq_hal::HardwareLayer for Flaky {
+        fn snapshot(&self) -> Result<HardwareSnapshot, thermaliq_hal::HalError> {
+            let mut s = self.inner.snapshot()?;
+            if self.hide_f2.load(Ordering::SeqCst) {
+                s.fans.retain(|f| f.id != "f2");
+            }
+            Ok(s)
+        }
+        fn set_fan_duty(&self, fan: &str, duty: u8) -> Result<(), thermaliq_hal::HalError> {
+            self.inner.set_fan_duty(fan, duty)
+        }
+        fn restore_auto(&self, fan: &str) -> Result<(), thermaliq_hal::HalError> {
+            self.inner.restore_auto(fan)
+        }
+        fn capabilities(&self) -> thermaliq_hal::Capabilities {
+            self.inner.capabilities()
+        }
+        fn degraded_reasons(&self) -> Vec<String> {
+            if self.fault.load(Ordering::SeqCst) {
+                vec!["lhm-bridge: restarting".into()]
+            } else {
+                vec![]
+            }
+        }
+    }
+
+    fn flaky() -> (Arc<Flaky>, Arc<AtomicBool>, Arc<AtomicBool>) {
+        let cpu = Tick::Temps(vec![("cpu".into(), SensorKind::Cpu, 40.0)]);
+        let (hide_f2, fault) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let hal = Arc::new(Flaky {
+            inner: MockHardwareLayer::new(&["f1", "f2"], vec![cpu]),
+            hide_f2: hide_f2.clone(),
+            fault: fault.clone(),
+        });
+        (hal, hide_f2, fault)
+    }
+
+    fn toml2(name: &str, fans: &[&str]) -> Profile {
+        let controls: String = fans
+            .iter()
+            .map(|f| format!("[[controls]]\nfan = \"{f}\"\ncurve = \"c\"\nstep_up_pct = 100\nstep_down_pct = 100\n"))
+            .collect();
+        Profile::from_toml(&format!(
+            "name = \"{name}\"\n[[curves]]\ntype = \"flat\"\nid = \"c\"\npwm = 30\n{controls}"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_bridge_restart_mid_idle_never_causes_a_switch_that_drops_a_profile_fan() {
+        let (hal, hide_f2, _) = flaky();
+        let r = rig_on(
+            hal,
+            vec![toml2("balanced", &["f1", "f2"]), toml2("gaming", &["f1"])],
+            &[("game.exe", "gaming")],
+        );
+        wait_until(|| r.daemon.handle().cache().ticks > 0);
+        // Long enough for the stable wait, so only the restart itself can be what lets it switch.
+        std::thread::sleep(STABLE * 3);
+        hide_f2.store(true, Ordering::SeqCst); // the bridge is restarting: f2 is gone
+        std::thread::sleep(STABLE);
+        show(&r, "game.exe");
+        std::thread::sleep(STABLE * 3);
+        assert_eq!(active(&r), "balanced", "switched while f2 was missing");
+        hide_f2.store(false, Ordering::SeqCst);
+        std::thread::sleep(STABLE * 4);
+        assert_eq!(active(&r), "balanced", "gaming would drop f2");
+        assert!(
+            r.shared
+                .view()
+                .decisions
+                .iter()
+                .any(|d| d.note.as_deref().is_some_and(|n| n.contains("f2"))),
+            "the refusal names f2: {:?}",
+            r.shared.view().decisions
+        );
+    }
+
+    #[test]
+    fn no_switch_while_degraded_or_newly_back_then_it_switches_once_stable() {
+        let (hal, _, fault) = flaky();
+        let r = rig_on(
+            hal,
+            vec![
+                toml2("balanced", &["f1", "f2"]),
+                toml2("gaming", &["f1", "f2"]),
+            ],
+            &[("game.exe", "gaming")],
+        );
+        wait_until(|| r.daemon.handle().cache().ticks > 0);
+        std::thread::sleep(STABLE * 3);
+        fault.store(true, Ordering::SeqCst);
+        std::thread::sleep(STABLE / 2);
+        show(&r, "game.exe");
+        std::thread::sleep(STABLE * 3);
+        assert_eq!(active(&r), "balanced", "switched while degraded");
+        fault.store(false, Ordering::SeqCst);
+        std::thread::sleep(STABLE / 4);
+        assert_eq!(active(&r), "balanced", "switched the moment it came back");
+        wait_until(|| active(&r) == "gaming");
+    }
+
+    #[test]
+    fn a_fresh_start_waits_for_a_stable_snapshot_before_the_first_switch() {
+        let r = rig(
+            vec![toml("balanced", "f1"), toml("gaming", "f1")],
+            &[("game.exe", "gaming")],
+        );
+        show(&r, "game.exe");
+        std::thread::sleep(STABLE / 3);
+        assert_eq!(active(&r), "balanced");
+        wait_until(|| active(&r) == "gaming");
+    }
+
+    fn rig_on(
+        hal: Arc<dyn thermaliq_hal::HardwareLayer>,
+        profiles: Vec<Profile>,
+        known: &[(&str, &str)],
+    ) -> Rig {
         let db = Arc::new(Mutex::new(HistoryDb::in_memory().unwrap()));
         for (exe, w) in known {
             db.lock()
@@ -581,6 +749,7 @@ mod tests {
             local: None,
             shared: shared.clone(),
             period: Duration::from_millis(1),
+            stable_for: STABLE,
         });
         Rig {
             daemon,
@@ -627,6 +796,14 @@ mod tests {
         wait_until(|| r.daemon.handle().cache().ticks > 0);
         show(&r, "game.exe");
         wait_until(|| active(&r) == "gaming");
+        // The profile switches before the decision is logged.
+        wait_until(|| {
+            r.shared
+                .view()
+                .decisions
+                .iter()
+                .any(|d| d.exe == "game.exe")
+        });
         let log = r.shared.view().decisions;
         let d = log.iter().find(|d| d.exe == "game.exe").unwrap();
         assert_eq!(d.source.as_deref(), Some("user"));

@@ -1072,6 +1072,7 @@ name = "thermaliq-hal"
 version = "2.0.0-dev.0"
 dependencies = [
  "nvml-wrapper",
+ "serde_json",
  "thermaliq-common",
  "windows-sys 0.61.2",
 ]

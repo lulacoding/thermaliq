@@ -1,6 +1,6 @@
 //! The daemon's only `unsafe` code: the OS keychain, the foreground window, a helper in the
-//! user's session (a service in session 0 can't see the desktop), and a job object so that a
-//! local model can't outlive the daemon.
+//! user's session (a service in session 0 can't see the desktop), a job object so that a
+//! local model can't outlive the daemon, and the LHM bridge's pipe and process checks.
 
 use std::ffi::OsStr;
 use std::fs::File;
@@ -11,8 +11,8 @@ use std::path::Path;
 use std::process::Child;
 use std::ptr::{null, null_mut};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, SetHandleInformation, SetLastError, ERROR_NOT_FOUND, HANDLE,
-    HANDLE_FLAG_INHERIT, RECT,
+    CloseHandle, GetLastError, SetHandleInformation, SetLastError, ERROR_NOT_FOUND,
+    ERROR_SERVICE_DOES_NOT_EXIST, HANDLE, HANDLE_FLAG_INHERIT, RECT,
 };
 use windows_sys::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
@@ -21,14 +21,22 @@ use windows_sys::Win32::Security::Credentials::{
     CredDeleteW, CredFree, CredReadW, CredWriteW, CREDENTIALW, CRED_PERSIST_LOCAL_MACHINE,
     CRED_TYPE_GENERIC,
 };
+use windows_sys::Win32::System::Console::{SetStdHandle, STD_ERROR_HANDLE};
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+};
 use windows_sys::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
     SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
-use windows_sys::Win32::System::Pipes::CreatePipe;
+use windows_sys::Win32::System::Pipes::{CreatePipe, GetNamedPipeServerProcessId};
 use windows_sys::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
+use windows_sys::Win32::System::Services::{
+    CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatus, SC_MANAGER_CONNECT,
+    SERVICE_QUERY_STATUS, SERVICE_STATUS, SERVICE_STOPPED,
+};
 use windows_sys::Win32::System::Threading::{
     CreateProcessAsUserW, DeleteProcThreadAttributeList, InitializeProcThreadAttributeList,
     OpenProcess, QueryFullProcessImageNameW, TerminateProcess, UpdateProcThreadAttribute,
@@ -325,6 +333,81 @@ fn create_with_handle_list(
     }
 }
 
+// ---- LHM bridge: who serves a pipe, and which programs are running ----
+
+pub fn pipe_server_pid(pipe: &File) -> io::Result<u32> {
+    let mut pid = 0u32;
+    if unsafe { GetNamedPipeServerProcessId(pipe.as_raw_handle() as HANDLE, &raw mut pid) } == 0 {
+        return Err(last_error());
+    }
+    Ok(pid)
+}
+
+/// The exe name of every running process.
+pub fn process_names() -> io::Result<Vec<String>> {
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+        return Err(last_error());
+    }
+    let mut entry: PROCESSENTRY32W = unsafe { core::mem::zeroed() };
+    entry.dwSize = core::mem::size_of::<PROCESSENTRY32W>() as u32;
+    let mut names = Vec::new();
+    let mut more = unsafe { Process32FirstW(snapshot, &raw mut entry) };
+    while more != 0 {
+        let len = entry
+            .szExeFile
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(entry.szExeFile.len());
+        names.push(String::from_utf16_lossy(&entry.szExeFile[..len]));
+        more = unsafe { Process32NextW(snapshot, &raw mut entry) };
+    }
+    unsafe { CloseHandle(snapshot) };
+    Ok(names)
+}
+
+/// Sends everything `eprintln!` writes to `path` from now on. A service has no console, so without
+/// this every startup and bridge message is lost, and the daemon can fail with nothing to read.
+pub fn redirect_stderr(path: &Path) -> io::Result<()> {
+    use std::os::windows::io::IntoRawHandle;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    // The process keeps this handle for good, so it is leaked on purpose.
+    if unsafe { SetStdHandle(STD_ERROR_HANDLE, file.into_raw_handle() as HANDLE) } == 0 {
+        return Err(last_error());
+    }
+    Ok(())
+}
+
+/// Whether a service is in any state but stopped. One that isn't installed counts as stopped.
+pub fn service_active(name: &str) -> io::Result<bool> {
+    let manager = unsafe { OpenSCManagerW(null(), null(), SC_MANAGER_CONNECT) };
+    if manager.is_null() {
+        return Err(last_error());
+    }
+    let name = wide(OsStr::new(name));
+    let service = unsafe { OpenServiceW(manager, name.as_ptr(), SERVICE_QUERY_STATUS) };
+    let active = if service.is_null() {
+        match unsafe { GetLastError() } {
+            ERROR_SERVICE_DOES_NOT_EXIST => Ok(false),
+            _ => Err(last_error()),
+        }
+    } else {
+        let mut status: SERVICE_STATUS = unsafe { core::mem::zeroed() };
+        let read = if unsafe { QueryServiceStatus(service, &raw mut status) } == 0 {
+            Err(last_error())
+        } else {
+            Ok(status.dwCurrentState != SERVICE_STOPPED)
+        };
+        unsafe { CloseServiceHandle(service) };
+        read
+    };
+    unsafe { CloseServiceHandle(manager) };
+    active
+}
+
 // ---- a local model can't outlive the daemon ----
 
 /// Closing it (drop, or the process ending in any way) kills everything assigned to it,
@@ -484,6 +567,31 @@ mod tests {
             .find(|l| l.contains("probe leaked="))
             .map(str::to_owned);
         Some(line.unwrap_or_else(|| panic!("the child never reported: {text}")))
+    }
+
+    #[test]
+    fn redirected_stderr_lands_in_the_file() {
+        use std::io::Write;
+        use windows_sys::Win32::System::Console::GetStdHandle;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("service.log");
+        let before = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
+        redirect_stderr(&log).unwrap();
+        // `io::stderr()`, not `eprintln!`: the test harness captures the macro before it gets here.
+        writeln!(io::stderr(), "bridge said hello").unwrap();
+        unsafe { SetStdHandle(STD_ERROR_HANDLE, before) };
+        assert!(std::fs::read_to_string(&log)
+            .unwrap()
+            .contains("bridge said hello"));
+    }
+
+    #[test]
+    fn a_running_service_is_active_and_a_missing_one_is_not() {
+        assert!(
+            service_active("RpcSs").unwrap(),
+            "Windows can't run without it"
+        );
+        assert!(!service_active("thermaliq-no-such-service").unwrap());
     }
 
     #[test]
