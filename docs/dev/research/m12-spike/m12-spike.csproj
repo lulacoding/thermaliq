@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>M12Spike</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Exact version, so a newer build can't arrive unnoticed: this library writes to fan registers. -->
+    <PackageReference Include="LibreHardwareMonitorLib" Version="[0.9.6]" />
+  </ItemGroup>
+
+</Project>

@@ -20,7 +20,7 @@ All of this happens inside the SPEC §3 safety rules, which the agent can never 
 | --- | --- |
 | Windows 10/11 x64 | macOS (helper, SMC) |
 | NVIDIA GPU fans (NVML) | AMD GPU fans (ADLX) |
-| Motherboard fans via LHM bridge (LibreHardwareMonitorLib + PawnIO) | Laptop EC / NBFC |
+| Motherboard fans via LHM bridge (LibreHardwareMonitorLib + PawnIO, optional: §5.1) | Laptop EC / NBFC |
 | | Linux (hwmon) — v2.1 |
 | | File custom sensor — v2.1 |
 | | Battery-based switching |
@@ -44,7 +44,7 @@ Every one of these has an automated test before any code that writes to real fan
 - **S3 Sensor loss.** If a fan's controlling sensor is missing or invalid (NaN, < -20 °C, > 150 °C) for 3 consecutive ticks, that fan goes to 100% until the sensor is back for 3 ticks.
 - **S4 HAL failure.** If a snapshot fails 3 ticks in a row, every fan goes to 100% (best effort) and the daemon reports `degraded`.
 - **S5 Hand back on exit.** On normal exit, service stop, Ctrl-C or panic, the engine calls `restore_auto()` for every fan it has touched (NVML default fan speed, original `pwm_enable`, bridge reset).
-- **S6 Watchdog.** Any out-of-process helper (LHM bridge) restores auto control by itself if it gets no heartbeat from the daemon for 5 s.
+- **S6 Watchdog.** Any out-of-process helper (LHM bridge) restores auto control by itself if it gets no heartbeat from the daemon for 5 s (the daemon sends one every 1 s, §5.1).
 - **S7 Clamp.** Every duty is clamped 0–100 before it reaches a HAL. Profile minimums and safety floors apply after curves, before ramping.
 - **S8 No fake success.** No handler, setting or feature returns success without doing the thing.
 
@@ -70,7 +70,7 @@ thermaliq-engine   control loop: curves, sensors, priority, safety, ramping (pur
 thermaliq-agent    agent logic (§7): thermal model, classifier, live optimiser, decision routing (no HAL; submits to the engine)
 thermaliq-daemon   wiring: config/paths, history DB, HTTP API, WebSocket, service, agent thread
 thermaliq-cli      `tq` — talks to the daemon over HTTP
-bridges/lhm-bridge (later) .NET sidecar for Windows motherboard fans, JSON over a named pipe
+bridges/lhm-bridge (later) .NET sidecar for Windows motherboard fans (§5.1), JSON lines over a named pipe
 thermaliq-ui       (later) Tauri 2 + React
 ```
 
@@ -78,6 +78,22 @@ thermaliq-ui       (later) Tauri 2 + React
 It is synchronous; the engine runs on its own thread (no async in the HAL).
 
 One snapshot per tick, cached and shared. API reads use the cache, never the hardware directly.
+
+### 5.1 LHM bridge (M12 brainstorm, Sam, 2026-11-05)
+
+**Why a sidecar.** A .NET sidecar on LibreHardwareMonitorLib, not LHM's web server. That server has no watchdog, and in LHM 0.9.6 anyone who can reach it can set fan values, because its login is off by default.
+
+**Shipping.** Self-contained .NET 10, with LibreHardwareMonitorLib pinned to stable 0.9.6. The bridge exe lives under Program Files and must pass the M20c ACL check (`acl::replaceable_by_others`) before the daemon starts it, because it runs as SYSTEM.
+
+**PawnIO.** Offered at setup using the official signed installer, never installed silently. Motherboard fans are optional: without PawnIO, the GPU and the agent work as normal.
+
+**Protocol.**
+
+- A named pipe only SYSTEM can open, carrying JSON lines.
+- The daemon sends a heartbeat every 1 s. After 5 s with none, the bridge hands the fans back to the BIOS by itself (S6).
+- Every bridge call has a 2 s timeout and returns an error instead of blocking.
+
+**Anti-cheat mode.** FACEIT has blocked PawnIO. PawnIO's maintainer reports that release 2.1.0 fixes this with a new signing certificate, which we have not tested yet. On detecting FACEIT or another blocker, ThermalIQ hands motherboard fans to the BIOS, stops the bridge, and unloads PawnIO if that works without a reboot (M12 spike). NVML GPU control continues.
 
 ## 6. Data, paths, auth
 

@@ -12,7 +12,7 @@ Stop and talk these through with Sam (in claude.ai) before any code for the modu
 
 - [x] **M20 / Agent:** brainstormed with Sam on 2026-11-04. The result is SPEC §7 and modules M20a–M20e below.
 - [x] **Metrics (small, after the agent brainstorm):** inputs settled in SPEC §7, so no separate brainstorm is needed. the snapshot currently has temperatures only. Add CPU/GPU load %, power (W) and maybe clocks: HWiNFO already exposes them, NVML has GPU load and power. Extend M10, M11 and history. M12 should report load from day one.
-- [ ] **M12 (large):** sidecar .NET vs LHM's built-in web server; shipping .NET (self-contained vs runtime); PawnIO install flow and anti-cheat conflicts; protocol and watchdog. Run a spike on Sam's PC first: prove one case fan moves.
+- [x] **M12:** brainstormed with Sam on 2026-11-05. The result is SPEC §5.1 and the M12 module below. Still required before any bridge code: run the spike on Sam's PC and prove one case fan moves (`docs/dev/research/m12-spike/`).
 - [ ] **M13 (medium):** first-run fan identification UX (spin each header, "which fan moved?"); stable ID scheme across hardware changes.
 - [ ] **M18 (medium):** which screens matter; onboarding; keep v0 design or restyle; how a standard-user account gets the token. **Design in Claude Design first, code second:**
     1. Make a Design System artifact (colours, type, components): restyle from v0's look (dark, neon-green accent) or a fresh direction.
@@ -56,7 +56,7 @@ Order: Metrics → M20a → CPU load → M20b → M20c → Phase 3. New crate `t
 
 ## Phase 3 — Windows motherboard fans
 
-- [ ] **M12 LHM bridge** — new · .NET sidecar on LibreHardwareMonitorLib + PawnIO, JSON over a named pipe, 5 s watchdog (S6) · test: protocol tests; watchdog restores auto; every bridge call has a timeout (~2 s) and errors instead of blocking, else shutdown hangs (M8a review)
+- [ ] **M12 LHM bridge** — new · SPEC §5.1 · **first:** spike results from `docs/dev/research/m12-spike/` · self-contained .NET 10 sidecar on LibreHardwareMonitorLib 0.9.6 (pinned) + PawnIO, JSON lines over a SYSTEM-only named pipe, 1 s heartbeat, 5 s watchdog (S6), bridge exe under Program Files with the M20c ACL check · test: protocol tests; watchdog restores auto; every bridge call has a 2 s timeout and errors instead of blocking, else shutdown hangs (M8a review); no PawnIO → GPU and agent run, motherboard fans absent; PawnIO never installed silently; anti-cheat mode hands fans to the BIOS, stops the bridge, unloads PawnIO if the spike shows it can, and NVML control continues · **open, not settled in the brainstorm:** (1) bridge killed or crashed: LHM keeps its saved BIOS registers only in memory, so a dead bridge leaves a fan at its last duty and a new one saves that duty as the "original"; (2) anti-cheat mode removes bridge sensors: S3 sends a GPU fan bound to one to 100%, and CPU temps (S2) need HWiNFO or go missing; (3) when to leave anti-cheat mode and how to detect blockers; (4) pipe squatting: the daemon must verify the server is the real SYSTEM bridge
 - [ ] **M13 Stable fan IDs + first-run mapping** — new · v0 lesson: HWiNFO IDs shift with sensor index · test: IDs survive reorder; bundled-profile role IDs (`cpu_package`, `chassis1`, ...) map to real hardware IDs; NVIDIA ids (`nvml_gpu{index}_...`, M10) depend on NVML enumeration order, so key them on the GPU UUID (M10 review); first-run mapping must make a bundled profile drive the real fan (G1 needed a temporary profile); switch g1.ps1 to the mapped profile
 
 > **G3** on the Windows PC.
