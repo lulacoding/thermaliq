@@ -161,28 +161,43 @@ impl HistoryDb {
 
     /// `(recorded_at, temp_celsius)` oldest first.
     pub fn sensor_rows(&self, id: &str) -> rusqlite::Result<Vec<(i64, f32)>> {
-        let mut q = self.0.prepare(
-            "SELECT recorded_at, temp_celsius FROM sensor_readings WHERE sensor_id = ?1 ORDER BY recorded_at, id",
+        self.sensor_rows_since(id, i64::MIN)
+    }
+
+    /// Like `sensor_rows`, from `since` (unix seconds, inclusive) on.
+    pub fn sensor_rows_since(&self, id: &str, since: i64) -> rusqlite::Result<Vec<(i64, f32)>> {
+        let mut q = self.0.prepare_cached(
+            "SELECT recorded_at, temp_celsius FROM sensor_readings WHERE sensor_id = ?1 AND recorded_at >= ?2 ORDER BY recorded_at, id",
         )?;
-        let rows = q.query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let rows = q.query_map(params![id, since], |r| Ok((r.get(0)?, r.get(1)?)))?;
         rows.collect()
     }
 
     /// `(recorded_at, value)` oldest first.
     pub fn metric_rows(&self, id: &str) -> rusqlite::Result<Vec<(i64, f64)>> {
-        let mut q = self.0.prepare(
-            "SELECT recorded_at, value FROM metric_readings WHERE metric_id = ?1 ORDER BY recorded_at, id",
+        self.metric_rows_since(id, i64::MIN)
+    }
+
+    pub fn metric_rows_since(&self, id: &str, since: i64) -> rusqlite::Result<Vec<(i64, f64)>> {
+        let mut q = self.0.prepare_cached(
+            "SELECT recorded_at, value FROM metric_readings WHERE metric_id = ?1 AND recorded_at >= ?2 ORDER BY recorded_at, id",
         )?;
-        let rows = q.query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let rows = q.query_map(params![id, since], |r| Ok((r.get(0)?, r.get(1)?)))?;
         rows.collect()
     }
 
     /// `(recorded_at, rpm, duty_percent)` oldest first.
     pub fn fan_rows(&self, id: &str) -> rusqlite::Result<Vec<(i64, u32, u8)>> {
-        let mut q = self.0.prepare(
-            "SELECT recorded_at, rpm, duty_percent FROM fan_readings WHERE fan_id = ?1 ORDER BY recorded_at, id",
+        self.fan_rows_since(id, i64::MIN)
+    }
+
+    pub fn fan_rows_since(&self, id: &str, since: i64) -> rusqlite::Result<Vec<(i64, u32, u8)>> {
+        let mut q = self.0.prepare_cached(
+            "SELECT recorded_at, rpm, duty_percent FROM fan_readings WHERE fan_id = ?1 AND recorded_at >= ?2 ORDER BY recorded_at, id",
         )?;
-        let rows = q.query_map([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        let rows = q.query_map(params![id, since], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
         rows.collect()
     }
 }
@@ -253,6 +268,24 @@ mod tests {
         db.prune(NOW).unwrap();
         assert_eq!(db.metric_rows("old").unwrap(), vec![(base, 5.0)]);
         assert_eq!(db.metric_rows("load").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn rows_since_returns_only_rows_at_or_after_the_cutoff() {
+        let mut db = HistoryDb::in_memory().unwrap();
+        for t in [NOW - 2, NOW - 1, NOW] {
+            db.record_tick(
+                t,
+                &[s("cpu", 50.0)],
+                &[f("fan1", 1000, 30)],
+                &[m("load", MetricKind::GpuLoad, 5.0)],
+            )
+            .unwrap();
+        }
+        assert_eq!(db.sensor_rows_since("cpu", NOW - 1).unwrap().len(), 2);
+        assert_eq!(db.fan_rows_since("fan1", NOW).unwrap().len(), 1);
+        assert_eq!(db.metric_rows_since("load", NOW + 1).unwrap().len(), 0);
+        assert_eq!(db.sensor_rows("cpu").unwrap().len(), 3, "unbounded variant");
     }
 
     #[test]

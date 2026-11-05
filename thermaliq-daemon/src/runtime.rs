@@ -1,15 +1,18 @@
 //! Daemon wiring (SPEC §5): the engine thread, the shared snapshot cache the API reads,
 //! and the history thread. Only `thermaliq-engine` writes to fans.
 
+use crate::agent::{Agent, AgentTick, Brain, DEFAULT_SLIDER};
 use crate::history::{recorded_sensor_ids, HistoryDb};
 use std::collections::HashMap;
 use std::fs;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use thermaliq_agent::optimiser::REQUEST_TTL;
 use thermaliq_common::{
     bundled_profiles, FanReading, HardwareSnapshot, MetricReading, Profile, SensorReading,
 };
@@ -42,6 +45,48 @@ enum Cmd {
     SetProfile(Profile, Reply),
     Override(String, u8, Duration, Reply),
     Cancel(String, Reply),
+    /// The agent's wish for this tick: replaces its previous requests (S1: it only submits).
+    Agent(Vec<(String, u8)>),
+    /// Pause and agent crash: drop every Agent request now.
+    WithdrawAgent(Reply),
+}
+
+/// What `/status` says about the agent thread. A crashed agent stays crashed until the
+/// service restarts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AgentState {
+    #[default]
+    Running,
+    Paused,
+    Crashed,
+}
+
+impl AgentState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Paused => "paused",
+            Self::Crashed => "crashed",
+        }
+    }
+}
+
+#[derive(Default)]
+struct AgentFlags {
+    paused: AtomicBool,
+    crashed: AtomicBool,
+}
+
+impl AgentFlags {
+    fn state(&self) -> AgentState {
+        if self.crashed.load(Ordering::SeqCst) {
+            AgentState::Crashed
+        } else if self.paused.load(Ordering::SeqCst) {
+            AgentState::Paused
+        } else {
+            AgentState::Running
+        }
+    }
 }
 
 enum Msg {
@@ -57,11 +102,37 @@ pub fn clamp_override(duty: i64, seconds: u64) -> Option<(u8, Duration)> {
     })
 }
 
-fn apply(engine: &mut Engine, began: Instant, cache: &RwLock<Cache>, cmd: Cmd) {
+fn apply(
+    engine: &mut Engine,
+    began: Instant,
+    cache: &RwLock<Cache>,
+    agent: &AgentShared,
+    cmd: Cmd,
+) {
     let (result, reply) = match cmd {
+        Cmd::Agent(asks) => {
+            // A paused agent's late asks are dropped here, so pause can't be raced.
+            if !agent.flags.paused.load(Ordering::SeqCst) {
+                engine.withdraw_all(Source::Agent);
+                let until = began.elapsed() + REQUEST_TTL;
+                for (fan, duty) in asks {
+                    // The engine refuses pumps and unknown fans, and clamps the duty.
+                    let _ = engine.submit(&fan, Source::Agent, duty, Some(until));
+                }
+            }
+            return;
+        }
+        Cmd::WithdrawAgent(reply) => {
+            engine.withdraw_all(Source::Agent);
+            (Ok(None), reply)
+        }
         Cmd::SetProfile(p, reply) => match engine.check_profile(&p) {
             Ok(()) => {
                 engine.set_profile(&p);
+                *agent
+                    .profile
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner) = p.clone();
                 cache
                     .write()
                     .unwrap_or_else(PoisonError::into_inner)
@@ -97,12 +168,20 @@ fn apply(engine: &mut Engine, began: Instant, cache: &RwLock<Cache>, cmd: Cmd) {
     let _ = reply.send(result);
 }
 
+/// What the engine thread shares with the agent: the pause/crash flags and the active profile.
+#[derive(Clone)]
+struct AgentShared {
+    flags: Arc<AgentFlags>,
+    profile: Arc<RwLock<Profile>>,
+}
+
 /// A cheap, cloneable way for the API to read the cache and talk to the engine thread.
 #[derive(Clone)]
 pub struct Handle {
     cache: Arc<RwLock<Cache>>,
     tx: mpsc::Sender<Msg>,
     ticks: watch::Receiver<u64>,
+    flags: Arc<AgentFlags>,
 }
 
 impl Handle {
@@ -112,10 +191,39 @@ impl Handle {
     }
 
     pub fn cache(&self) -> Cache {
-        self.cache
+        let mut c = self
+            .cache
             .read()
             .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+            .clone();
+        c.status.agent = self.flags.state(); // read live, so pause shows at once
+        c
+    }
+
+    /// Withdraws the agent's requests and ignores it until `resume_agent`.
+    pub async fn pause_agent(&self) -> Result<(), CommandError> {
+        self.agent_alive()?;
+        self.flags.paused.store(true, Ordering::SeqCst);
+        self.ask(Cmd::WithdrawAgent).await.map(drop)
+    }
+
+    pub async fn resume_agent(&self) -> Result<(), CommandError> {
+        self.agent_alive()?;
+        if !self.cache().status.engine_running {
+            return Err(CommandError::Unavailable);
+        }
+        self.flags.paused.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// A crashed agent thread is gone: saying "resumed" would be a lie (S8).
+    fn agent_alive(&self) -> Result<(), CommandError> {
+        if self.flags.crashed.load(Ordering::SeqCst) {
+            return Err(CommandError::Rejected(
+                "the agent stopped after an error; restart the service".into(),
+            ));
+        }
+        Ok(())
     }
 
     async fn ask(&self, make: impl FnOnce(Reply) -> Cmd) -> Done {
@@ -164,6 +272,8 @@ pub struct Status {
     /// Optional sensor sources (e.g. "hwinfo") that failed on the last tick and are missing
     /// from the snapshot. Not a safety state: required hardware is fine.
     pub unavailable_sources: Vec<String>,
+    /// Filled in when read (`Handle::cache`), not by the engine thread.
+    pub agent: AgentState,
 }
 
 /// The one snapshot per tick, shared. API reads use this, never the hardware (SPEC §5).
@@ -184,8 +294,40 @@ pub struct Daemon {
     cache: Arc<RwLock<Cache>>,
     tx: mpsc::Sender<Msg>,
     ticks: watch::Receiver<u64>,
+    flags: Arc<AgentFlags>,
     engine: Option<JoinHandle<()>>,
     history: Option<JoinHandle<()>>,
+    agent: Option<JoinHandle<()>>,
+}
+
+/// Ticks queued for the agent before new ones are dropped (the engine never waits).
+const AGENT_QUEUE: usize = 4;
+
+/// The agent thread (SPEC §7: separate from the engine, only submits). A panic withdraws
+/// its requests so the profile takes over, and is reported in `/status`.
+fn agent_loop(
+    mut brain: Box<dyn Brain>,
+    ticks: &mpsc::Receiver<AgentTick>,
+    tx: &mpsc::Sender<Msg>,
+    flags: &AgentFlags,
+) {
+    let began = Instant::now();
+    let run = catch_unwind(AssertUnwindSafe(|| {
+        while let Ok(tick) = ticks.recv() {
+            if flags.paused.load(Ordering::SeqCst) {
+                continue;
+            }
+            let asks = brain.step(&tick, began.elapsed());
+            if tx.send(Msg::Cmd(Cmd::Agent(asks))).is_err() {
+                return;
+            }
+        }
+    }));
+    if run.is_err() {
+        flags.crashed.store(true, Ordering::SeqCst);
+        let (reply, _) = oneshot::channel();
+        let _ = tx.send(Msg::Cmd(Cmd::WithdrawAgent(reply)));
+    }
 }
 
 impl Daemon {
@@ -194,11 +336,34 @@ impl Daemon {
     pub fn start(
         hal: Arc<dyn HardwareLayer>,
         active: &Profile,
-        mut saved: Vec<Profile>,
+        saved: Vec<Profile>,
         history: Arc<Mutex<HistoryDb>>,
         opts: Options,
     ) -> Self {
+        let for_agent = history.clone();
+        Self::start_with(hal, active, saved, history, opts, move |profile| {
+            Box::new(Agent::new(for_agent, profile, DEFAULT_SLIDER))
+        })
+    }
+
+    /// `start` with the agent's brain supplied (tests script or break it). `make_brain`
+    /// gets the shared active profile, which the engine thread keeps current.
+    pub(crate) fn start_with(
+        hal: Arc<dyn HardwareLayer>,
+        active: &Profile,
+        mut saved: Vec<Profile>,
+        history: Arc<Mutex<HistoryDb>>,
+        opts: Options,
+        make_brain: impl FnOnce(Arc<RwLock<Profile>>) -> Box<dyn Brain>,
+    ) -> Self {
         saved.push(active.clone());
+        let shared = AgentShared {
+            flags: Arc::default(),
+            profile: Arc::new(RwLock::new(active.clone())),
+        };
+        let flags = shared.flags.clone();
+        let brain = make_brain(shared.profile.clone());
+        let (agent_tx, agent_rx) = mpsc::sync_channel::<AgentTick>(AGENT_QUEUE);
         let cache = Arc::new(RwLock::new(Cache {
             status: Status {
                 engine_running: true,
@@ -211,6 +376,13 @@ impl Daemon {
         let (tick_tx, ticks) = watch::channel(0u64);
         let (history_tx, rx) = mpsc::sync_channel::<HistoryTick>(HISTORY_QUEUE);
         let history = std::thread::spawn(move || history_loop(&rx, &history, opts.prune_every));
+        let agent = {
+            let (tx, flags) = (tx.clone(), flags.clone());
+            std::thread::Builder::new()
+                .name("thermaliq-agent".into())
+                .spawn(move || agent_loop(brain, &agent_rx, &tx, &flags))
+                .expect("spawn agent thread")
+        };
         let engine = {
             let (cache, active, tick) = (cache.clone(), active.clone(), opts.tick);
             std::thread::spawn(move || {
@@ -252,7 +424,21 @@ impl Daemon {
                             degraded: engine.degraded(),
                             waiting_on: engine.latch_waiting_on().to_vec(),
                             unavailable_sources: sources.unavailable_sources(),
+                            agent: AgentState::default(),
                         };
+                        // Only fresh data: the agent never acts on an old snapshot. A full queue
+                        // drops this tick for it; its requests expire in 3 s.
+                        if engine.snapshot_fresh() && !shared.flags.paused.load(Ordering::SeqCst) {
+                            let curve = snapshot
+                                .fans
+                                .iter()
+                                .filter_map(|f| Some((f.id.clone(), engine.curve_output(&f.id)?)))
+                                .collect();
+                            let _ = agent_tx.try_send(AgentTick {
+                                snapshot: snapshot.clone(),
+                                curve,
+                            });
+                        }
                         {
                             let mut c = cache.write().unwrap_or_else(PoisonError::into_inner);
                             (c.snapshot, c.status) = (snapshot, status);
@@ -266,7 +452,7 @@ impl Daemon {
                                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
                             {
                                 Ok(Msg::Cmd(cmd)) => {
-                                    apply(&mut engine, began, &cache, cmd);
+                                    apply(&mut engine, began, &cache, &shared, cmd);
                                     if Instant::now() >= deadline {
                                         break;
                                     }
@@ -292,8 +478,10 @@ impl Daemon {
             cache,
             tx,
             ticks,
+            flags,
             engine: Some(engine),
             history: Some(history),
+            agent: Some(agent),
         }
     }
 
@@ -306,6 +494,7 @@ impl Daemon {
             cache: self.cache.clone(),
             tx: self.tx.clone(),
             ticks: self.ticks.clone(),
+            flags: self.flags.clone(),
         }
     }
 
@@ -319,6 +508,8 @@ impl Daemon {
         let _ = self.tx.send(Msg::Stop);
         let engine = self.engine.take().map(JoinHandle::join);
         let history = self.history.take().map(JoinHandle::join);
+        // Its input closed with the engine thread, so it ends; it catches its own panics.
+        let _ = self.agent.take().map(JoinHandle::join);
         match (engine, history) {
             (Some(Err(_)), _) => Err("engine thread panicked".into()),
             (_, Some(Err(_))) => Err("history thread panicked".into()),
@@ -358,7 +549,7 @@ fn history_loop(rx: &mpsc::Receiver<HistoryTick>, db: &Mutex<HistoryDb>, prune_e
     }
 }
 
-fn unix_now() -> i64 {
+pub(crate) fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
@@ -861,6 +1052,187 @@ mod tests {
             Ok(Some("latched"))
         );
         d.shutdown().unwrap();
+    }
+
+    // ---- agent thread (M20b wiring) ----
+
+    /// Asks for the same duties every tick, or panics after `panic_after` ticks.
+    struct Scripted {
+        asks: Vec<(String, u8)>,
+        panic_after: Option<u32>,
+        steps: u32,
+    }
+    impl Brain for Scripted {
+        fn step(&mut self, _: &AgentTick, _: Duration) -> Vec<(String, u8)> {
+            self.steps += 1;
+            assert!(self.panic_after.is_none_or(|n| self.steps <= n), "boom");
+            self.asks.clone()
+        }
+    }
+
+    fn asks(fan: &str, duty: u8, panic_after: Option<u32>) -> Scripted {
+        Scripted {
+            asks: vec![(fan.into(), duty)],
+            panic_after,
+            steps: 0,
+        }
+    }
+
+    fn with_brain(hal: Arc<MockHardwareLayer>, brain: Scripted) -> Daemon {
+        let active = Profile::from_toml(FLAT).unwrap();
+        Daemon::start_with(hal, &active, vec![], db(), fast(), |_| Box::new(brain))
+    }
+
+    fn mock() -> Arc<MockHardwareLayer> {
+        Arc::new(MockHardwareLayer::new(&["f1", "f2"], vec![at(40.0)]))
+    }
+
+    #[test]
+    fn an_agent_request_reaches_the_fan_and_the_engine_clamps_it_to_15_below_the_curve() {
+        let hal = mock();
+        let d = with_brain(hal.clone(), asks("f1", 80, None));
+        wait_until(|| last_write(&hal) == Some(("f1".into(), 80)));
+        d.shutdown().unwrap();
+        let hal = mock();
+        let d = with_brain(hal.clone(), asks("f1", 0, None));
+        wait_until(|| last_write(&hal) == Some(("f1".into(), 15))); // curve 30 − 15
+        d.shutdown().unwrap();
+        assert!(
+            hal.writes().iter().all(|(_, d)| *d >= 15),
+            "never below the clamp"
+        );
+    }
+
+    #[test]
+    fn an_ask_that_arrives_after_pause_is_dropped_by_the_engine_thread() {
+        // The agent thread and the tick feed also check the flag; this is the race they can't close.
+        let hal = mock();
+        let active = Profile::from_toml(FLAT).unwrap();
+        let mut engine = Engine::new(hal.clone(), &active);
+        let cache = RwLock::new(Cache::default());
+        let agent = AgentShared {
+            flags: Arc::default(),
+            profile: Arc::new(RwLock::new(active)),
+        };
+        let began = Instant::now();
+        engine.tick(Duration::ZERO);
+        agent.flags.paused.store(true, Ordering::SeqCst);
+        apply(
+            &mut engine,
+            began,
+            &cache,
+            &agent,
+            Cmd::Agent(vec![("f1".into(), 80)]),
+        );
+        engine.tick(began.elapsed());
+        assert_eq!(last_write(&hal), Some(("f1".into(), 30)));
+        agent.flags.paused.store(false, Ordering::SeqCst);
+        apply(
+            &mut engine,
+            began,
+            &cache,
+            &agent,
+            Cmd::Agent(vec![("f1".into(), 80)]),
+        );
+        engine.tick(began.elapsed());
+        assert_eq!(
+            last_write(&hal),
+            Some(("f1".into(), 80)),
+            "control: it does act unpaused"
+        );
+    }
+
+    #[test]
+    fn a_request_for_a_pump_never_reaches_it() {
+        let hal = Arc::new(MockHardwareLayer::new(&["f1", "f2"], vec![at(40.0)]).pump("f1"));
+        let d = with_brain(hal.clone(), asks("f1", 80, None));
+        wait_until(|| hal.writes().len() > 20);
+        d.shutdown().unwrap();
+        assert!(
+            hal.writes().iter().all(|(_, d)| *d != 80),
+            "{:?}",
+            hal.writes()
+        );
+    }
+
+    #[tokio::test]
+    async fn pause_withdraws_the_agent_and_resume_lets_it_act_again() {
+        let hal = mock();
+        let d = with_brain(hal.clone(), asks("f1", 80, None));
+        let h = d.handle();
+        assert_eq!(d.cache().status.agent, AgentState::Running);
+        wait_until(|| last_write(&hal) == Some(("f1".into(), 80)));
+        h.pause_agent().await.unwrap();
+        assert_eq!(d.cache().status.agent, AgentState::Paused);
+        wait_until(|| last_write(&hal) == Some(("f1".into(), 30)));
+        let n = hal.writes().len();
+        wait_until(|| hal.writes().len() >= n + 20);
+        assert!(
+            hal.writes()[n..].iter().all(|(_, d)| *d == 30),
+            "the agent keeps asking but a paused agent is ignored"
+        );
+        h.resume_agent().await.unwrap();
+        assert_eq!(d.cache().status.agent, AgentState::Running);
+        wait_until(|| last_write(&hal) == Some(("f1".into(), 80)));
+        d.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_crashed_agent_is_withdrawn_reported_and_cannot_be_resumed() {
+        let hal = mock();
+        let d = with_brain(hal.clone(), asks("f1", 80, Some(3)));
+        let h = d.handle();
+        wait_until(|| d.cache().status.agent == AgentState::Crashed);
+        // Withdrawn at once, not left to lapse (a request lives 3 s).
+        let t0 = Instant::now();
+        wait_until(|| last_write(&hal) == Some(("f1".into(), 30)));
+        assert!(t0.elapsed() < Duration::from_secs(1), "{:?}", t0.elapsed());
+        let n = hal.writes().len();
+        wait_until(|| hal.writes().len() >= n + 20);
+        assert!(
+            hal.writes()[n..].iter().all(|(_, d)| *d == 30),
+            "profile resumed"
+        );
+        assert!(d.cache().status.engine_running, "the engine carries on");
+        assert!(matches!(
+            h.resume_agent().await,
+            Err(CommandError::Rejected(_))
+        ));
+        assert!(matches!(
+            h.pause_agent().await,
+            Err(CommandError::Rejected(_))
+        ));
+        d.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_latch_beats_the_agent() {
+        let hal = Arc::new(MockHardwareLayer::new(&["f1", "f2"], vec![at(97.0)]));
+        let d = with_brain(hal.clone(), asks("f1", 0, None));
+        wait_until(|| d.cache().status.latched);
+        let n = hal.writes().len();
+        wait_until(|| hal.writes().len() >= n + 20);
+        assert!(
+            hal.writes().iter().all(|(_, d)| *d == 100),
+            "{:?}",
+            hal.writes()
+        );
+        d.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn pause_and_resume_after_the_engine_stopped_fail_instead_of_pretending() {
+        let d = with_brain(mock(), asks("f1", 80, None));
+        let h = d.handle();
+        d.shutdown().unwrap();
+        assert!(matches!(
+            h.pause_agent().await,
+            Err(CommandError::Unavailable)
+        ));
+        assert!(matches!(
+            h.resume_agent().await,
+            Err(CommandError::Unavailable)
+        ));
     }
 
     #[test]

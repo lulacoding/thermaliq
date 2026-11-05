@@ -111,6 +111,8 @@ Decided in the agent brainstorm (Sam, 2026-11-04). Research: `docs/dev/research/
 - *Workload classifier:* small gradient-boosted trees over the inputs give idle / browsing / gaming / compiling / rendering / other. It is trained on history labelled by the slow layer and by the user's corrections.
 - *Thermal model:* small, learned per component. It predicts each controlled temperature 10–30 s ahead from duty, load and power.
 - *Live optimiser:* it adjusts each fan up or down from its curve output to meet the slider target. Ramping up early for a predicted spike counts as a **short boost**, which expires in ≤ 60 s. Limits: it may raise any fan freely. It may lower a fan by at most 15 points below the curve output, and only while every temperature that fan cools is under its target and predicted to stay there. Requests expire in 3 s and are renewed every tick.
+  - *Targets from the slider* (0 = quiet, 100 = cool): a straight line between two targets per component. GPU 80 → 65 °C, CPU 85 → 70 °C. At 50: GPU 72.5, CPU 77.5. Safety (S2–S4) never sees them.
+  - *Which fan cools what:* until setup mapping (M20d) exists, a fan cools the component whose temperature sensor its profile curve reads. If the GPU, its load or its power cannot be named unambiguously, or no fan follows it, the agent leaves those fans to their curves.
 
 **Slow layer: every 60 s and whenever the foreground app changes. Decision model, not an LLM.**
 - Typed questions with confidence: the workload for an app not seen before (cached per exe afterwards); which profile to use; whether to accept a learned curve or a new profile.

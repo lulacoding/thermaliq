@@ -84,16 +84,21 @@ try {
         & $exe install-service
         if ($LASTEXITCODE -ne 0) { throw 'install-service failed (an existing ThermalIQ install may need uninstall-service first)' }
         # The bundled profiles use role IDs (gpu1, chassis1) that M13's first-run mapping will
-        # translate; until then nothing would drive the real fan. Use a flat 40% profile on it.
+        # translate; until then nothing would drive the real fan. Use a profile on it that follows
+        # the GPU temperature (40-100%), so the agent has a fan it may adjust while G1 runs.
         $cfg = Join-Path $dir 'config.toml'
         if (Test-Path $cfg) { Copy-Item $cfg $cfgBak -Force }
         New-Item -ItemType Directory -Force (Join-Path $dir 'profiles') | Out-Null
         Set-Content -Path $profile_ -Encoding ascii -Value @'
 name = "g1"
 [[curves]]
-type = "flat"
+type = "linear"
 id = "c"
-pwm = 40
+source = "nvml_gpu0_temp"
+min_temp = 30.0
+max_temp = 90.0
+min_pwm = 40
+max_pwm = 100
 [[controls]]
 fan = "nvml_gpu0_fan0"
 curve = "c"
@@ -113,6 +118,14 @@ step_down_pct = 100
         Wait-Controlled
         $t = (Get-Status).ticks
         Wait-Until { (Get-Status).ticks -gt $t } 5 'ticks to advance'
+    }
+    Step 'agent running; pause and resume work' {
+        if ((Get-Status).agent -ne 'running') { throw "agent is '$((Get-Status).agent)', not running" }
+        $auth = @{ Authorization = "Bearer $((Get-Content (Join-Path $dir 'token.txt') -Raw).Trim())" }
+        Invoke-RestMethod -Method Post "$api/agent/pause" -Headers $auth -TimeoutSec 5 | Out-Null
+        if ((Get-Status).agent -ne 'paused') { throw 'pause did not show in /status' }
+        Invoke-RestMethod -Method Post "$api/agent/resume" -Headers $auth -TimeoutSec 5 | Out-Null
+        if ((Get-Status).agent -ne 'running') { throw 'resume did not show in /status' }
     }
     Step 'inject 97 C: latched, GPU fan >= 98% for 30 s' {
         Set-Injection '97'
@@ -146,6 +159,7 @@ step_down_pct = 100
     Step 'after the kill the engine controls the fan' {
         # The fan stays manual across a kill, so prove control by commanding it: 97 C must give 100%.
         Wait-Until { (Get-Status).engine_running } 10 'the API'
+        if ((Get-Status).agent -ne 'running') { throw "agent is '$((Get-Status).agent)' after the restart" }
         Set-Injection '97'
         Wait-Until { (Get-Status).latched -and (Test-FansAtLeast98) } 20 'latch and the GPU fan >= 98%'
         Set-Injection ''

@@ -2,6 +2,7 @@
 
 #[cfg(windows)]
 pub mod acl;
+pub mod agent;
 pub mod api;
 pub mod app;
 pub mod history;
