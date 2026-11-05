@@ -2,10 +2,17 @@
 //! ask for; the daemon submits it to the engine (S1), which enforces the 15-point floor again.
 //! Every request expires in 3 s and is renewed each tick, so a stopped agent costs nothing.
 //!
-//! Lower only when every temperature the fan cools is known, under target, and the model,
-//! whose duty effect must be clearly negative, says it stays under target at the lowered
-//! duty. Anything unknown means no lowering. Raising is free.
-//! shortcut: the boost is a fixed +20 points; revisit it with real-game data.
+//! Three behaviours, from most to least urgent:
+//! - **Raise** (a temperature is over target *now*): ask for the curve + 2 points more each
+//!   tick, up to 100, with no time cap. Hold that while the part is within 2 °C of target;
+//!   once every temperature has been 2 °C under target for 10 s, ease back 1 point per tick
+//!   to the curve. An unknown reading holds.
+//! - **Boost** (only *predicted* over target): curve + 20, for at most 60 s, re-armed after
+//!   60 s without a predicted need. Over-target time does not use the window up.
+//! - **Lower** (everything known, under target, model says it stays there): up to 15 points.
+//!   Never while a raise is held or easing, nor right after a boost.
+//!
+//! shortcut: the boost is a fixed +20 and the raise step is fixed at 2; revisit with real-game data.
 
 use crate::inputs::{Component, Sample};
 use crate::model::ThermalModel;
@@ -18,6 +25,12 @@ pub const REQUEST_TTL: Duration = Duration::from_secs(3);
 /// A boost lasts at most this long, and re-arms only after this long without a need.
 pub const BOOST_MAX: Duration = Duration::from_secs(60);
 const BOOST_POINTS: u8 = 20;
+/// Points added per tick while a temperature is over target.
+const RAISE_STEP: u8 = 2;
+/// A raise is eased back only once every temperature has been this far under target...
+const EASE_BAND: f64 = 2.0;
+/// ...for this long; then it comes back 1 point per tick.
+const EASE_AFTER: Duration = Duration::from_secs(10);
 
 /// The temperature to hold, from the quiet ↔ cool slider (0–100): a straight line between
 /// the quiet target (GPU 80, CPU 85 °C) and the cool target (GPU 65, CPU 70 °C). SPEC §7.2.
@@ -42,22 +55,35 @@ pub struct Request {
     pub expires_at: Duration,
 }
 
-/// Per-fan state: when the current boost window started and when a boost was last needed.
+/// Per-fan state.
 #[derive(Debug, Default)]
 pub struct Optimiser {
+    /// Points above the curve that a temperature over target has earned and not yet given back.
+    extra: u8,
+    /// Since when every temperature has been `EASE_BAND` under target.
+    under_since: Option<Duration>,
+    /// When the current boost window started, and when a boost was last needed.
     boost_since: Option<Duration>,
     last_need: Duration,
 }
 
 impl Cooled<'_> {
-    /// Over target now, or predicted over it `AHEAD` ticks out.
-    fn needs_more(&self) -> bool {
+    /// Over target right now (a real reading, not a prediction).
+    fn over(&self) -> bool {
+        self.sample.is_some_and(|s| s.temp > self.target)
+    }
+
+    /// Known, and more than `band` under target.
+    fn under(&self, band: f64) -> bool {
+        self.sample.is_some_and(|s| s.temp < self.target - band)
+    }
+
+    /// Predicted over target `AHEAD` ticks out (the model refuses samples outside its range).
+    fn predicted_over(&self) -> bool {
         let Some(s) = self.sample else { return false };
-        s.temp > self.target
-            || self
-                .model
-                .and_then(|m| m.predict(&s, AHEAD))
-                .is_some_and(|p| p > self.target)
+        self.model
+            .and_then(|m| m.predict(&s, AHEAD))
+            .is_some_and(|p| p > self.target)
     }
 
     /// Known, under target, and still under target `AHEAD` ticks after the fan is set to the
@@ -89,19 +115,48 @@ impl Optimiser {
         cooled: &[Cooled],
     ) -> Option<Request> {
         if pump || cooled.is_empty() {
+            *self = Self::default();
             return None;
         }
         let expires_at = now + REQUEST_TTL;
         if now.saturating_sub(self.last_need) >= BOOST_MAX {
             self.boost_since = None;
         }
-        if cooled.iter().any(Cooled::needs_more) {
+        let over = cooled.iter().any(Cooled::over);
+        if over {
+            self.extra = self
+                .extra
+                .saturating_add(RAISE_STEP)
+                .min(100 - curve.min(100));
+            self.under_since = None;
+        } else if cooled.iter().all(|c| c.under(EASE_BAND)) {
+            let since = *self.under_since.get_or_insert(now);
+            if now.saturating_sub(since) >= EASE_AFTER {
+                self.extra = self.extra.saturating_sub(1);
+            }
+        } else {
+            self.under_since = None; // within 2 °C, or unknown: hold
+        }
+        let mut want = (self.extra > 0).then(|| curve.saturating_add(self.extra).min(100));
+        let boost = Some(curve.saturating_add(BOOST_POINTS).min(100));
+        if over {
+            // Being over target does not start or extend a boost, but one already running
+            // keeps its level (the request must not fall just as things get worse).
+            if self
+                .boost_since
+                .is_some_and(|s| now.saturating_sub(s) < BOOST_MAX)
+            {
+                want = want.max(boost);
+            }
+        } else if cooled.iter().any(Cooled::predicted_over) {
             self.last_need = now;
             let since = *self.boost_since.get_or_insert(now);
-            return (now.saturating_sub(since) < BOOST_MAX).then(|| Request {
-                duty: curve.saturating_add(BOOST_POINTS).min(100),
-                expires_at,
-            });
+            if now.saturating_sub(since) < BOOST_MAX {
+                want = want.max(boost);
+            }
+        }
+        if let Some(duty) = want {
+            return Some(Request { duty, expires_at });
         }
         // Just boosted: let the part settle before turning anything down.
         if self.boost_since.is_some() {
@@ -235,75 +290,225 @@ mod tests {
         );
     }
 
+    /// One `decide` per second from `T0 + from`, slider 0 (quiet), returning each duty asked.
+    fn run(o: &mut Optimiser, from: u64, n: u64, curve: u8, c: &[Cooled]) -> Vec<Option<u8>> {
+        (from..from + n)
+            .map(|t| o.decide(T0 + secs(t), curve, 0, false, c).map(|r| r.duty))
+            .collect()
+    }
+
     #[test]
-    fn every_cooled_temperature_must_allow_it() {
+    fn every_cooled_temperature_must_allow_lowering() {
         let m = model(2.0);
         let c = [cooled(70.0, 75.0, Some(&m)), cooled(76.0, 75.0, Some(&m))];
         let r = Optimiser::default().decide(T0, 50, 0, false, &c);
         assert_eq!(
             r.map(|r| r.duty),
-            Some(70),
-            "the hot one forces a boost, not a lowering"
+            Some(52),
+            "the hot one raises; nothing is lowered"
         );
     }
 
     #[test]
-    fn boosts_when_over_or_predicted_over_target() {
-        let m = model(3.0); // 74.5 + 3 − 2 = 75.5 predicted
-        let predicted = [cooled(74.5, 75.0, Some(&m))];
-        assert_eq!(
-            Optimiser::default()
-                .decide(T0, 50, 0, false, &predicted)
-                .map(|r| r.duty),
-            Some(70)
-        );
+    fn over_target_raises_2_points_a_tick_with_no_time_cap_up_to_100() {
         let over = [cooled(80.0, 75.0, None)];
-        assert_eq!(
-            Optimiser::default()
-                .decide(T0, 90, 0, false, &over)
-                .map(|r| r.duty),
-            Some(100),
-            "capped at 100"
+        let mut o = Optimiser::default();
+        let asks = run(&mut o, 0, 400, 50, &over);
+        assert_eq!(asks[..3], [Some(52), Some(54), Some(56)]);
+        assert_eq!(asks[24], Some(100));
+        assert!(
+            asks[24..].iter().all(|a| *a == Some(100)),
+            "held at 100 for the rest of 400 s, far past 60 s"
+        );
+        let mut o = Optimiser::default();
+        let asks = run(&mut o, 0, 5, 97, &over);
+        assert_eq!(asks, [Some(99), Some(100), Some(100), Some(100), Some(100)]);
+    }
+
+    #[test]
+    fn holds_until_2_under_target_for_10_s_then_eases_1_a_tick_to_the_curve() {
+        let over = [cooled(80.0, 75.0, None)];
+        let near = [cooled(74.0, 75.0, None)]; // under target, but not by 2
+        let cool = [cooled(72.0, 75.0, None)]; // 3 under
+        let mut o = Optimiser::default();
+        assert_eq!(run(&mut o, 0, 5, 50, &over).last(), Some(&Some(60)));
+        assert!(
+            run(&mut o, 5, 30, 50, &near).iter().all(|a| *a == Some(60)),
+            "holds for as long as it is within 2 °C"
+        );
+        let held = run(&mut o, 35, 10, 50, &cool);
+        assert!(held.iter().all(|a| *a == Some(60)), "10 s first: {held:?}");
+        let eased = run(&mut o, 45, 12, 50, &cool);
+        assert_eq!(eased[..4], [Some(59), Some(58), Some(57), Some(56)]);
+        assert_eq!(eased[8], Some(51));
+        assert!(
+            eased[9..].iter().all(Option::is_none),
+            "back on the curve: no request"
         );
     }
 
     #[test]
-    fn a_boost_ends_after_60_s_and_re_arms_after_60_s_without_need() {
+    fn a_dip_that_does_not_last_10_s_does_not_start_the_easing() {
         let over = [cooled(80.0, 75.0, None)];
+        let near = [cooled(74.0, 75.0, None)];
+        let cool = [cooled(72.0, 75.0, None)];
+        let mut o = Optimiser::default();
+        run(&mut o, 0, 5, 50, &over);
+        assert!(run(&mut o, 5, 9, 50, &cool).iter().all(|a| *a == Some(60)));
+        assert_eq!(
+            run(&mut o, 14, 1, 50, &near),
+            [Some(60)],
+            "the timer restarts"
+        );
+        assert!(run(&mut o, 15, 10, 50, &cool)
+            .iter()
+            .all(|a| *a == Some(60)));
+        assert_eq!(run(&mut o, 25, 1, 50, &cool), [Some(59)]);
+    }
+
+    #[test]
+    fn easing_stops_and_raising_resumes_if_it_gets_hot_again() {
+        let over = [cooled(80.0, 75.0, None)];
+        let cool = [cooled(72.0, 75.0, None)];
+        let mut o = Optimiser::default();
+        run(&mut o, 0, 5, 50, &over);
+        assert_eq!(run(&mut o, 5, 12, 50, &cool).last(), Some(&Some(58)));
+        assert_eq!(run(&mut o, 17, 1, 50, &over), [Some(60)], "8 + 2 points");
+    }
+
+    #[test]
+    fn an_unknown_reading_holds_the_raise_instead_of_easing_or_dropping_it() {
+        let over = [cooled(80.0, 75.0, None)];
+        let unknown = [Cooled {
+            sample: None,
+            ..cooled(0.0, 75.0, None)
+        }];
+        let mut o = Optimiser::default();
+        run(&mut o, 0, 5, 50, &over);
+        assert!(run(&mut o, 5, 120, 50, &unknown)
+            .iter()
+            .all(|a| *a == Some(60)));
+    }
+
+    #[test]
+    fn nothing_is_lowered_while_a_raise_is_held_or_easing() {
+        let m = model(2.0);
+        let over = [cooled(80.0, 75.0, Some(&m))];
+        let ok = [cooled(60.0, 75.0, Some(&m))]; // would be lowered 15 if nothing were raised
+        let mut o = Optimiser::default();
+        run(&mut o, 0, 3, 50, &over); // +6
+        let asks = run(&mut o, 3, 16, 50, &ok);
+        assert!(asks[..10].iter().all(|a| *a == Some(56)), "held: {asks:?}");
+        assert_eq!(
+            asks[10..15],
+            [Some(55), Some(54), Some(53), Some(52), Some(51)]
+        );
+        assert_eq!(asks[15], Some(35), "only once it is gone");
+    }
+
+    #[test]
+    fn a_predicted_only_boost_keeps_plus_20_and_the_60_s_cap() {
+        let m = model(3.0); // 74.5 + 3 − 2 = 75.5 predicted, but not over now
+        let pred = [cooled(74.5, 75.0, Some(&m))];
         let ok = [cooled(60.0, 75.0, None)];
         let mut o = Optimiser::default();
-        assert!(o.decide(T0, 50, 0, false, &over).is_some());
-        assert!(o.decide(T0 + secs(59), 50, 0, false, &over).is_some());
-        assert!(
-            o.decide(T0 + secs(60), 50, 0, false, &over).is_none(),
-            "spent"
+        assert_eq!(run(&mut o, 0, 1, 50, &pred), [Some(70)]);
+        assert!(run(&mut o, 1, 59, 50, &pred).iter().all(|a| *a == Some(70)));
+        assert_eq!(run(&mut o, 60, 1, 50, &pred), [None], "spent");
+        assert_eq!(
+            run(&mut o, 100, 1, 50, &pred),
+            [None],
+            "still spent while the need lasts"
         );
-        assert!(
-            o.decide(T0 + secs(100), 50, 0, false, &over).is_none(),
-            "still spent"
+        assert_eq!(run(&mut o, 101, 1, 50, &ok), [None]);
+        assert_eq!(run(&mut o, 161, 1, 50, &pred), [Some(70)], "re-armed");
+        let hot = [cooled(80.0, 75.0, Some(&m))];
+        let mut o = Optimiser::default();
+        assert_eq!(run(&mut o, 0, 1, 90, &pred), [Some(100)], "capped at 100");
+        assert!(run(&mut o, 1, 5, 90, &hot).iter().all(|a| *a == Some(100)));
+    }
+
+    #[test]
+    fn being_over_target_does_not_use_up_the_boost_window() {
+        // 100 s over target is a raise, not a boost: the 60 s window is untouched, so a
+        // predicted spike right after still gets its full +20.
+        let over = [cooled(80.0, 75.0, None)];
+        let mut o = Optimiser::default();
+        run(&mut o, 0, 100, 50, &over);
+        assert!(o.boost_since.is_none());
+        let m = model(3.0);
+        let pred = [cooled(74.5, 75.0, Some(&m))];
+        let mut fresh = Optimiser::default();
+        assert_eq!(run(&mut fresh, 0, 1, 50, &pred), [Some(70)]);
+        assert!(fresh.boost_since.is_some(), "while a predicted boost does");
+    }
+
+    #[test]
+    fn the_request_is_the_larger_of_the_raise_and_the_boost() {
+        let over = [cooled(80.0, 75.0, None)];
+        let m = model(3.0);
+        let pred = [cooled(74.5, 75.0, Some(&m))];
+        let mut o = Optimiser::default();
+        run(&mut o, 0, 2, 50, &over); // +4
+        assert_eq!(
+            run(&mut o, 2, 1, 50, &pred),
+            [Some(70)],
+            "boost 70 beats raise 54"
         );
-        assert!(o.decide(T0 + secs(101), 50, 0, false, &ok).is_none());
-        assert!(
-            o.decide(T0 + secs(161), 50, 0, false, &over).is_some(),
-            "re-armed"
+        assert!(run(&mut o, 3, 59, 50, &pred).iter().all(|a| *a == Some(70)));
+        assert_eq!(
+            run(&mut o, 62, 1, 50, &pred),
+            [Some(54)],
+            "boost spent: the raise remains"
         );
     }
 
     #[test]
     fn no_lowering_straight_after_a_boost() {
         let m = model(2.0);
-        let over = [cooled(80.0, 75.0, None)];
+        let m3 = model(3.0);
+        let pred = [cooled(74.5, 75.0, Some(&m3))];
         let ok = [cooled(70.0, 75.0, Some(&m))];
         let mut o = Optimiser::default();
-        o.decide(T0, 50, 0, false, &over);
+        assert!(o.decide(T0, 50, 0, false, &pred).is_some());
         assert!(o.decide(T0 + secs(1), 50, 0, false, &ok).is_none());
         assert!(o.decide(T0 + secs(61), 50, 0, false, &ok).is_some());
     }
 
     #[test]
-    fn never_touches_a_pump() {
+    fn never_touches_a_pump_and_a_pump_clears_any_raise() {
         let over = [cooled(80.0, 75.0, None)];
-        assert_eq!(Optimiser::default().decide(T0, 50, 0, true, &over), None);
+        let ok = [cooled(60.0, 75.0, None)];
+        let mut o = Optimiser::default();
+        assert!(o.decide(T0, 50, 0, false, &over).is_some());
+        assert_eq!(o.decide(T0 + secs(1), 50, 0, true, &over), None);
+        assert_eq!(
+            o.decide(T0 + secs(2), 50, 0, false, &ok),
+            None,
+            "no raise left to hold"
+        );
+    }
+
+    #[test]
+    fn the_startup_prediction_that_boosted_a_cold_gpu_is_refused() {
+        // 2026-11-05: GPU 40 °C, the fan still reading duty 0 as it spun up. The fitted model
+        // (never seen below duty 30) predicted 84.6 °C and the agent boosted the fan to 61%.
+        let m = ThermalModel::with_weights(AHEAD, [57.73, -0.3738, -0.6987, -0.0959, 0.0472])
+            .with_range([28.0, 30.0, 0.0, 51.0], [75.0, 64.0, 100.0, 123.0]);
+        let startup = Cooled {
+            sample: Some(Sample {
+                temp: 40.0,
+                duty: 0.0,
+                load: 7.0,
+                power: 52.0,
+            }),
+            target: 72.5,
+            model: Some(&m),
+        };
+        assert_eq!(
+            Optimiser::default().decide(T0, 41, 50, false, &[startup]),
+            None
+        );
     }
 
     #[test]

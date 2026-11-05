@@ -26,6 +26,8 @@ const WINDOW_S: i64 = 86_400;
 /// Bindings are rediscovered, and fans without a model retried, this often.
 const REFRESH: Duration = Duration::from_secs(60);
 const REFIT: Duration = Duration::from_secs(3600);
+/// Steps further apart than this (a pause, a stall) reset the per-fan optimisers.
+const MAX_STEP_GAP: Duration = Duration::from_secs(5);
 
 /// What the engine thread hands the agent each fresh tick.
 pub struct AgentTick {
@@ -197,6 +199,7 @@ pub struct Agent {
     slider: u8,
     bound: Vec<Bound>,
     optimisers: HashMap<String, Optimiser>,
+    last_step: Option<Duration>,
     profile_name: String,
     last_refresh: Option<Duration>,
     last_refit: Option<Duration>,
@@ -210,6 +213,7 @@ impl Agent {
             slider,
             bound: Vec::new(),
             optimisers: HashMap::new(),
+            last_step: None,
             profile_name: String::new(),
             last_refresh: None,
             last_refit: None,
@@ -265,6 +269,15 @@ impl Agent {
 
 impl Brain for Agent {
     fn step(&mut self, tick: &AgentTick, now: Duration) -> Vec<(String, u8)> {
+        // A pause (or a long stall) means what each optimiser held no longer describes the
+        // part: start every fan from its curve again.
+        if self
+            .last_step
+            .is_some_and(|l| now.saturating_sub(l) > MAX_STEP_GAP)
+        {
+            self.optimisers.clear();
+        }
+        self.last_step = Some(now);
         self.refresh(&tick.snapshot, now);
         let snap = &tick.snapshot;
         let mut out = Vec::new();
@@ -478,7 +491,7 @@ mod tests {
         let runs = history_runs(&long, &binding(), 0).unwrap();
         let m = fit_longest(&runs).expect("fits the 1399 s run");
         let s = Sample {
-            temp: 60.0,
+            temp: 45.0,
             duty: 50.0,
             load: 30.0,
             power: 80.0,
@@ -512,9 +525,22 @@ mod tests {
         );
         assert_eq!(
             a.step(&tick(80.0, 40), secs(1)),
-            [("f1".to_string(), 60)],
-            "over target: boost"
+            [("f1".to_string(), 42)],
+            "over target: raise 2 points a tick, and keep going"
         );
+        assert_eq!(a.step(&tick(80.0, 40), secs(2)), [("f1".to_string(), 44)]);
+    }
+
+    #[test]
+    fn a_raise_does_not_survive_a_pause() {
+        let mut a = agent_with(HistoryDb::in_memory().unwrap());
+        for t in 0..3 {
+            a.step(&tick(80.0, 40), secs(t));
+        }
+        assert_eq!(a.step(&tick(80.0, 40), secs(3)), [("f1".to_string(), 48)]);
+        // paused for a minute (the brain is not called): the GPU is cool now, and the old
+        // raise must not come back on resume
+        assert!(a.step(&tick(60.0, 40), secs(70)).is_empty());
     }
 
     #[test]
@@ -524,9 +550,14 @@ mod tests {
         record(&mut db, now - 2000, now - 500, &[]);
         let mut a = agent_with(db);
         a.slider = 0; // target 80 °C, lowers by the full 15
-        assert_eq!(a.step(&tick(60.0, 40), secs(0)), [("f1".to_string(), 25)]);
+                      // the fake history covers GPU 24-50 °C and duty 30-70: stay inside it
+        assert_eq!(a.step(&tick(45.0, 55), secs(0)), [("f1".to_string(), 40)]);
+        assert!(
+            a.step(&tick(45.0, 40), secs(1)).is_empty(),
+            "lowering to 25 would leave the duty range the model has seen"
+        );
         // f2 (flat) is never touched; a pump never is either
-        let mut t = tick(60.0, 40);
+        let mut t = tick(45.0, 55);
         t.snapshot.fans[0].kind = FanKind::Pump;
         let mut b = agent_with(HistoryDb::in_memory().unwrap());
         assert!(b.step(&t, secs(0)).is_empty());
@@ -539,7 +570,7 @@ mod tests {
         record(&mut db, now - WINDOW_S - 3000, now - WINDOW_S - 500, &[]);
         let mut a = agent_with(db);
         a.slider = 0;
-        assert!(a.step(&tick(60.0, 40), secs(0)).is_empty());
+        assert!(a.step(&tick(45.0, 55), secs(0)).is_empty());
     }
 
     #[test]
@@ -547,12 +578,12 @@ mod tests {
         let db = Arc::new(Mutex::new(HistoryDb::in_memory().unwrap()));
         let p = Arc::new(RwLock::new(profile()));
         let mut a = Agent::new(db.clone(), p, 0);
-        assert!(a.step(&tick(60.0, 40), secs(0)).is_empty());
+        assert!(a.step(&tick(45.0, 55), secs(0)).is_empty());
         let now = unix_now();
         record(&mut db.lock().unwrap(), now - 2000, now - 500, &[]);
-        assert!(a.step(&tick(60.0, 40), secs(30)).is_empty(), "not due yet");
+        assert!(a.step(&tick(45.0, 55), secs(30)).is_empty(), "not due yet");
         assert_eq!(
-            a.step(&tick(60.0, 40), secs(61)).len(),
+            a.step(&tick(45.0, 55), secs(61)).len(),
             1,
             "fitted at the minute"
         );

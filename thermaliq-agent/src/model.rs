@@ -19,7 +19,15 @@ const RIDGE: f64 = 0.01;
 pub struct ThermalModel {
     ahead: usize,
     w: [f64; N],
+    /// The range of [temp, duty, load, power] the fit saw. A linear model is only believable
+    /// inside it: at duty 0 (a fan spinning up) with a −0.7 °C-per-point coefficient it
+    /// predicted +44 °C and boosted a cold GPU.
+    lo: [f64; P],
+    hi: [f64; P],
 }
+
+/// Outside the fitted range by up to this share of it still counts as inside (quantisation).
+const RANGE_SLACK: f64 = 0.05;
 
 fn row(s: &Sample) -> [f64; N] {
     [1.0, s.temp, s.duty, s.load, s.power]
@@ -32,7 +40,18 @@ fn finite(s: &Sample) -> bool {
 impl ThermalModel {
     #[cfg(test)]
     pub(crate) fn with_weights(ahead: usize, w: [f64; N]) -> Self {
-        Self { ahead, w }
+        Self {
+            ahead,
+            w,
+            lo: [f64::NEG_INFINITY; P],
+            hi: [f64::INFINITY; P],
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_range(mut self, lo: [f64; P], hi: [f64; P]) -> Self {
+        (self.lo, self.hi) = (lo, hi);
+        self
     }
 
     /// `history` must be **consecutive 1-tick samples**: restarts and missing ticks make
@@ -102,13 +121,34 @@ impl ThermalModel {
             w[i + 1] = a[i][P] / a[i][i] / std[i];
         }
         w[0] = mean_y - (0..P).map(|i| w[i + 1] * mean[i]).sum::<f64>();
-        (w.iter().all(|v| v.is_finite()) && w[2] <= 0.0 && w[4] >= 0.0).then_some(Self { ahead, w })
+        let (mut lo, mut hi) = ([f64::INFINITY; P], [f64::NEG_INFINITY; P]);
+        for (now, _) in pairs() {
+            for (i, x) in col(now).into_iter().enumerate() {
+                (lo[i], hi[i]) = (lo[i].min(x), hi[i].max(x));
+            }
+        }
+        (w.iter().all(|v| v.is_finite()) && w[2] <= 0.0 && w[4] >= 0.0).then_some(Self {
+            ahead,
+            w,
+            lo,
+            hi,
+        })
     }
 
-    /// Temperature `ahead` ticks from now. `None` for a non-finite input or an `ahead`
-    /// other than the one this model was fitted for.
+    fn in_range(&self, s: &Sample) -> bool {
+        [s.temp, s.duty, s.load, s.power]
+            .iter()
+            .zip(self.lo.iter().zip(&self.hi))
+            .all(|(x, (lo, hi))| {
+                let slack = RANGE_SLACK * (hi - lo);
+                *x >= lo - slack && *x <= hi + slack
+            })
+    }
+
+    /// Temperature `ahead` ticks from now. `None` for a non-finite input, an `ahead` other
+    /// than the one this model was fitted for, or a sample outside the range it was fitted on.
     pub fn predict(&self, now: &Sample, ahead: usize) -> Option<f64> {
-        if ahead != self.ahead || !finite(now) {
+        if ahead != self.ahead || !finite(now) || !self.in_range(now) {
             return None;
         }
         let d: f64 = row(now).iter().zip(&self.w).map(|(x, w)| x * w).sum();
@@ -202,10 +242,21 @@ mod tests {
                 .filter(|(now, later)| {
                     !steady_only || (now.duty, now.load) == (later.duty, later.load)
                 })
-                .map(|(now, later)| (model.predict(now, 20).expect("predict") - later.temp).abs())
+                // outside the fitted range the model says "unknown": scored separately below
+                .filter_map(|(now, later)| Some((model.predict(now, 20)? - later.temp).abs()))
                 .collect();
             errs.iter().sum::<f64>() / errs.len() as f64
         };
+        let covered = test[..test.len() - 20]
+            .iter()
+            .filter(|s| model.predict(s, 20).is_some())
+            .count() as f64
+            / (test.len() - 20) as f64;
+        assert!(
+            covered > 0.9,
+            "the model refuses {:.0}% of ordinary samples",
+            (1.0 - covered) * 100.0
+        );
         println!(
             "20 s error: steady windows {:.2} °C, all windows {:.2} °C",
             mean(true),
@@ -279,6 +330,95 @@ mod tests {
         assert!(!m.lowering_is_safe(&h[0], 10));
     }
 
+    /// The coefficients and the ranges of Sam's 2026-11-05 run, where the agent's first tick
+    /// (GPU 40 °C, fan reading duty 0 while it spun up) predicted 84.6 °C and boosted the fan.
+    fn incident_model() -> ThermalModel {
+        ThermalModel::with_weights(20, [57.73, -0.3738, -0.6987, -0.0959, 0.0472])
+            .with_range([28.0, 30.0, 0.0, 51.0], [75.0, 64.0, 100.0, 123.0])
+    }
+
+    #[test]
+    fn a_startup_sample_far_outside_the_fitted_range_gets_no_prediction() {
+        let m = incident_model();
+        let startup = Sample {
+            temp: 40.0,
+            duty: 0.0,
+            load: 7.0,
+            power: 52.0,
+        };
+        assert_eq!(
+            m.predict(&startup, 20),
+            None,
+            "duty 0 was never seen: a linear fit would say 84.6"
+        );
+        let one_tick_later = Sample {
+            duty: 30.0,
+            ..startup
+        };
+        assert!(
+            m.predict(&one_tick_later, 20).is_some(),
+            "inside the range it still predicts"
+        );
+    }
+
+    #[test]
+    fn every_input_has_its_own_range() {
+        let m = incident_model();
+        let ok = Sample {
+            temp: 50.0,
+            duty: 45.0,
+            load: 50.0,
+            power: 80.0,
+        };
+        assert!(m.predict(&ok, 20).is_some());
+        for bad in [
+            Sample { temp: 10.0, ..ok },
+            Sample { temp: 90.0, ..ok },
+            Sample { duty: 100.0, ..ok },
+            Sample { load: -10.0, ..ok },
+            Sample { power: 10.0, ..ok },
+            Sample { power: 300.0, ..ok },
+        ] {
+            assert_eq!(m.predict(&bad, 20), None, "{bad:?}");
+        }
+        // a little outside (5% of the range) is tolerated: sensors are quantised
+        assert!(m.predict(&Sample { duty: 29.0, ..ok }, 20).is_some());
+    }
+
+    #[test]
+    fn a_fitted_model_remembers_the_range_it_was_fitted_on() {
+        let h = simulate(&COOLING, 3000, 1);
+        let m = ThermalModel::fit(&h, 20).expect("fit");
+        let inside = h[100];
+        assert!(m.predict(&inside, 20).is_some());
+        assert_eq!(
+            m.predict(
+                &Sample {
+                    duty: -50.0,
+                    ..inside
+                },
+                20
+            ),
+            None
+        );
+        assert_eq!(
+            m.predict(
+                &Sample {
+                    temp: 500.0,
+                    ..inside
+                },
+                20
+            ),
+            None
+        );
+        // lowering by 10 points from the bottom of the fitted duty range leaves it
+        let bottom = Sample {
+            duty: 20.5,
+            ..inside
+        };
+        assert!(!m.lowering_is_safe(&bottom, 20));
+    }
+
     #[test]
     fn only_a_clearly_cooling_fan_may_be_lowered() {
         let h = simulate(&COOLING, 3000, 1);
@@ -292,15 +432,9 @@ mod tests {
         if let Some(m) = ThermalModel::fit(&simulate(&flat, 3000, 1), 20) {
             assert!(!m.lowering_is_safe(&h[0], 20), "no real duty effect");
         }
-        let weak = ThermalModel {
-            ahead: 20,
-            w: [0.0, 0.0, -0.009, 0.0, 0.0],
-        };
+        let weak = ThermalModel::with_weights(20, [0.0, 0.0, -0.009, 0.0, 0.0]);
         assert!(!weak.lowering_is_safe(&h[0], 20), "-0.09 °C per 10 points");
-        let enough = ThermalModel {
-            ahead: 20,
-            w: [0.0, 0.0, -0.011, 0.0, 0.0],
-        };
+        let enough = ThermalModel::with_weights(20, [0.0, 0.0, -0.011, 0.0, 0.0]);
         assert!(enough.lowering_is_safe(&h[0], 20));
     }
 }

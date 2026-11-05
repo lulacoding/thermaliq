@@ -16,6 +16,12 @@ param(
     [string]$Fan = 'nvml_gpu0_fan0',
     [string]$GpuSensor = 'nvml_gpu0_temp',
     [int]$ProfileMin = 40,
+    # The agent's GPU target at slider 50 (SPEC 7.2: a line from 80 at quiet to 65 at cool).
+    [double]$Target = 72.5,
+    # The raise check applies to stretches over the target longer than this many seconds. The
+    # agent's own raise usually pulls the GPU back under in < 30 s, so a healthy rig reads
+    # NOT TESTED at the default; -RaiseAfter 10 checks the shorter stretches it does see.
+    [int]$RaiseAfter = 30,
     [string]$Csv = '',
     [int]$WaitMinutes = 10,
     # Quiet curve: duty only climbs from $ProfileMin to 45%, so a GPU stress test runs hot enough
@@ -31,6 +37,7 @@ $BoostLimit = 60    # SPEC 7.2: a boost lasts at most 60 s
 $BoostSlack = 2     # 1 Hz sampling: a 60 s boost can span 61-62 s of rows
 $PauseWithin = 2    # duty back on the curve within 2 s of /agent/pause
 $ResumeWithin = 3
+$RaiseBy = 2        # one tick's worth of the optimiser's raise
 $Header = 't,gpu_temp,duty,commanded,curve,agent_duty,boost,agent,latched,event'
 
 # ---------- judging (pure: rows in, verdicts out) ----------
@@ -49,16 +56,18 @@ function ConvertTo-Row($r) {
     }
 }
 
-# A boost is the agent asking for well above the curve (the optimiser adds 20, capped at 100).
-# The ask is computed one tick before the curve is sampled, so a curve that just moved can leave
-# a lowering ask 1-4 points above it; that is not a boost.
-function Test-Boost($r) {
-    $null -ne $r.ask -and $null -ne $r.curve -and ($r.ask -ge $r.curve + 5 -or ($r.ask -eq 100 -and $r.ask -gt $r.curve))
+# A (predicted-only) boost is exactly curve + 20, capped at 100, while the GPU is NOT over target.
+# Over target the agent raises 2 points a tick with no time cap: that is judged by the 'raise'
+# check, not as a boost. The ask is computed a tick before the curve is sampled, hence the +-2.
+function Test-Boost($r, [double]$target) {
+    if ($null -eq $r.ask -or $null -eq $r.curve -or $null -eq $r.gpu) { return $false }
+    if ($r.gpu -gt $target) { return $false }
+    ($r.ask -ge $r.curve + 5 -or ($r.ask -eq 100 -and $r.ask -gt $r.curve)) -and [Math]::Abs($r.ask - [Math]::Min(100, $r.curve + 20)) -le 2
 }
 
 function New-Verdict($name, $result, $detail) { [pscustomobject]@{ Name = $name; Result = $result; Detail = $detail } }
 
-function Get-Verdicts($csvRows, [int]$min) {
+function Get-Verdicts($csvRows, [int]$min, [double]$target) {
     $all = @($csvRows | ForEach-Object { ConvertTo-Row $_ })
     $out = @()
 
@@ -79,17 +88,22 @@ function Get-Verdicts($csvRows, [int]$min) {
     elseif ($lowered -eq 0) { $out += New-Verdict 'floor' 'NOT TESTED' "$n rows fine, but the agent never lowered the fan, so the limit was never exercised" }
     else { $out += New-Verdict 'floor' 'PASS' "$lowered lowered rows of $n, none below max(curve-15, $min)" }
 
-    # 2. no boost longer than 60 s (consecutive rows where the agent asks for more than the curve)
+    # 2. no predicted-only boost longer than 60 s (consecutive curve+20 rows with the GPU under target)
+    # A boost JUMPS to curve + 20 (the ask before it was none, or at least 5 points away). Easing
+    # back from a raise walks down 1 point a tick and passes through curve + 20 without being one.
     $run = $null; $prev = $null; $max = 0; $boosts = 0
     foreach ($r in $all) {
-        if (Test-Boost $r) {
+        $isBoost = Test-Boost $r $target
+        $joins = $null -ne $run -and $null -ne $prev -and ($r.t - $prev.t) -le 2.5
+        $jumped = $null -eq $prev -or $null -eq $prev.ask -or ($null -ne $r.ask -and [Math]::Abs($r.ask - $prev.ask) -ge 5)
+        if ($isBoost -and ($joins -or $jumped)) {
             $boosts++
-            if ($null -ne $run -and ($r.t - $prev.t) -le 2.5) { $run.end = $r.t } else { $run = @{ start = $r.t; end = $r.t } }
+            if ($joins) { $run.end = $r.t } else { $run = @{ start = $r.t; end = $r.t } }
             $max = [Math]::Max($max, $run.end - $run.start + 1)
         } else { $run = $null }
         $prev = $r
     }
-    if ($boosts -eq 0) { $out += New-Verdict 'boost' 'NOT TESTED' 'no boost happened (the GPU never went over its target)' }
+    if ($boosts -eq 0) { $out += New-Verdict 'boost' 'NOT TESTED' 'no predicted boost happened (curve + 20 while under target)' }
     elseif ($max -gt $BoostLimit + $BoostSlack) { $out += New-Verdict 'boost' 'FAIL' ("longest boost {0:0.#} s > {1} s" -f $max, $BoostLimit) }
     else { $out += New-Verdict 'boost' 'PASS' ("{0} boost rows, longest {1:0.#} s" -f $boosts, $max) }
 
@@ -124,6 +138,32 @@ function Get-Verdicts($csvRows, [int]$min) {
     if ($rt -eq 0) { $out += New-Verdict 'resume' 'NOT TESTED' 'no resume happened' }
     elseif ($rfail.Count -gt 0) { $out += New-Verdict 'resume' 'FAIL' ("agent not running within $ResumeWithin s of resume at t=" + ($rfail -join ', ')) }
     else { $out += New-Verdict 'resume' 'PASS' "$rt resume(s), agent running again" }
+
+    # 5. over target (a real reading) for more than 30 s with the agent running: the commanded duty
+    #    must have risen by 30 s in (>= 2 points, or already at ~100). Flickering around the target
+    #    never makes a 30 s run, so it does not count.
+    $periods = 0; $slow = @(); $i = 0
+    while ($i -lt $all.Count) {
+        $a = $all[$i]
+        if ($null -eq $a.gpu -or $a.gpu -le $target -or $null -eq $a.cmd) { $i++; continue }
+        $j = $i
+        while ($j + 1 -lt $all.Count -and $null -ne $all[$j + 1].gpu -and $all[$j + 1].gpu -gt $target -and ($all[$j + 1].t - $all[$j].t) -le 2.5) { $j++ }
+        if (($all[$j].t - $a.t) -gt $RaiseAfter) {
+            $ran = $true
+            for ($k = $i; $k -le $j; $k++) { if ($all[$k].agent -ne 'running') { $ran = $false; break } }
+            if ($ran) {
+                $k = $i
+                while ($k -lt $j -and ($all[$k].t - $a.t) -lt $RaiseAfter) { $k++ }
+                $periods++
+                $c = $all[$k].cmd
+                if ($null -eq $c -or -not ($c -ge $a.cmd + $RaiseBy -or $c -ge 98)) { $slow += ("{0} ({1} -> {2})" -f $a.t, $a.cmd, $c) }
+            }
+        }
+        $i = $j + 1
+    }
+    if ($periods -eq 0) { $out += New-Verdict 'raise' 'NOT TESTED' "the GPU was never over $target C for more than $RaiseAfter s with the agent running" }
+    elseif ($slow.Count -gt 0) { $out += New-Verdict 'raise' 'FAIL' ("over target for > $RaiseAfter s but the duty did not rise by $RaiseBy+ points in time, from t=" + ($slow -join ', ')) }
+    else { $out += New-Verdict 'raise' 'PASS' "$periods period(s) over $target C for > $RaiseAfter s, duty rose each time" }
     $out
 }
 
@@ -133,8 +173,8 @@ function Get-Overall($verdicts) {
     'PASS'
 }
 
-function Write-Verdicts($csvRows, [int]$min) {
-    $v = @(Get-Verdicts $csvRows $min)
+function Write-Verdicts($csvRows, [int]$min, [double]$target) {
+    $v = @(Get-Verdicts $csvRows $min $target)
     Write-Host ''
     foreach ($x in $v) {
         $c = switch ($x.Result) { 'PASS' { 'Green' } 'FAIL' { 'Red' } default { 'Yellow' } }
@@ -148,20 +188,30 @@ function Write-Verdicts($csvRows, [int]$min) {
 
 # ---------- self test (fake CSV data, no daemon) ----------
 
-function New-Fake([double]$t, $curve, $cmd, $ask, [string]$agent = 'running', [string]$ev = '') {
-    [pscustomobject]@{ t = $t; gpu_temp = 70; duty = $cmd; commanded = $cmd; curve = $curve; agent_duty = $ask; boost = ''; agent = $agent; latched = 'False'; event = $ev }
+function New-Fake([double]$t, $curve, $cmd, $ask, [string]$agent = 'running', [string]$ev = '', [double]$gpu = 70) {
+    [pscustomobject]@{ t = $t; gpu_temp = $gpu; duty = $cmd; commanded = $cmd; curve = $curve; agent_duty = $ask; boost = ''; agent = $agent; latched = 'False'; event = $ev }
 }
 
 # n seconds starting at t0; ask/cmd as given (cmd defaults to ask, or curve when there is no ask)
-function New-Span([double]$t0, [int]$n, $curve, $ask, $cmd = $null, [string]$agent = 'running') {
+function New-Span([double]$t0, [int]$n, $curve, $ask, $cmd = $null, [string]$agent = 'running', [double]$gpu = 70) {
     if ($null -eq $cmd) { $cmd = if ($null -ne $ask) { $ask } else { $curve } }
-    0..($n - 1) | ForEach-Object { New-Fake ($t0 + $_) $curve $cmd $ask $agent }
+    0..($n - 1) | ForEach-Object { New-Fake ($t0 + $_) $curve $cmd $ask $agent '' $gpu }
+}
+
+# The optimiser over target: the ask climbs 2 points a tick from the curve, up to 100.
+function New-Raise([double]$t0, [int]$n, $curve, [double]$gpu = 74) {
+    0..($n - 1) | ForEach-Object { $a = [Math]::Min(100, $curve + 2 * ($_ + 1)); New-Fake ($t0 + $_) $curve $a $a 'running' '' $gpu }
+}
+
+# one row per second, the commanded duty from a script block of the index
+function New-Rows([double]$t0, [int]$n, $curve, [scriptblock]$cmd, [double]$gpu = 74, [string]$agent = 'running') {
+    0..($n - 1) | ForEach-Object { New-Fake ($t0 + $_) $curve (& $cmd $_) $null $agent '' $gpu }
 }
 
 function Invoke-SelfTest {
     $fail = 0
     function Expect($name, $rows, $check, $want) {
-        $v = @(Get-Verdicts $rows 40 | Where-Object Name -eq $check)[0]
+        $v = @(Get-Verdicts $rows 40 72.5 | Where-Object Name -eq $check)[0]
         if ($v.Result -ne $want) { $script:selfFail++; Write-Host "SELFTEST FAIL  $name : $check wanted $want, got $($v.Result) ($($v.Detail))" -ForegroundColor Red }
         else { Write-Host "ok  $name : $check = $want" }
     }
@@ -182,7 +232,14 @@ function Invoke-SelfTest {
     Expect 'no boost' $idle 'boost' 'NOT TESTED'
     Expect 'a stale lowering ask 1 above a falling curve is not a boost' ($idle + (New-Span 40 5 $curve 61)) 'boost' 'NOT TESTED'
     Expect 'ask 4 above the curve is not a boost' ($idle + (New-Span 40 5 $curve 64)) 'boost' 'NOT TESTED'
-    Expect 'ask 5 above the curve is a boost' ($idle + (New-Span 40 5 $curve 65)) 'boost' 'PASS'
+    Expect 'ask 5 above the curve is a raise level, not a +20 boost' ($idle + (New-Span 40 5 $curve 65)) 'boost' 'NOT TESTED'
+    Expect 'curve + 20 while over target is a raise, not a boost' ($idle + (New-Span 40 70 $curve 80 $null 'running' 74)) 'boost' 'NOT TESTED'
+    Expect 'a 100 s raise is not a 60 s boost' ($idle + (New-Raise 40 100 $curve)) 'boost' 'NOT TESTED'
+    # easing back 1 point a tick passes through curve + 20 on its way down (Sam's 2026-11-05 run)
+    $ease = 0..24 | ForEach-Object { New-Fake (40 + $_) 43 (70 - $_) (70 - $_) 'running' '' 68 }
+    Expect 'easing down through curve + 20 is not a boost' ($idle + $ease) 'boost' 'NOT TESTED'
+    Expect 'a boost that starts from a small lowering ask is still a boost' ($idle + (New-Span 40 10 $curve 50 $null 'running' 70) + (New-Span 50 20 $curve 80)) 'boost' 'PASS'
+    Expect 'a boost right after the ease is still a boost' ($idle + $ease + (New-Span 70 20 43 63 $null 'running' 70)) 'boost' 'PASS'
     Expect 'a boost to 100 near the top counts' ($idle + (New-Span 40 5 98 100)) 'boost' 'PASS'
     Expect '30 s boost' ($idle + (New-Span 40 30 $curve 80)) 'boost' 'PASS'
     Expect '60 s boost' ($idle + (New-Span 40 60 $curve 80)) 'boost' 'PASS'
@@ -190,6 +247,26 @@ function Invoke-SelfTest {
     Expect '65 s boost' ($idle + (New-Span 40 65 $curve 80)) 'boost' 'FAIL'
     Expect 'two 40 s boosts 1 s apart' ($idle + (New-Span 40 40 $curve 80) + (New-Span 80 1 $curve $null) + (New-Span 81 40 $curve 80)) 'boost' 'PASS'
     Expect 'one boost with a 5 s hole in the log' ($idle + (New-Span 40 40 $curve 80) + (New-Span 85 40 $curve 80)) 'boost' 'PASS'
+
+    # raise: over target (72.5) for > 30 s with the agent running -> the duty must have risen by then
+    $script:RaiseAfter = 10
+    Expect 'raise: a 13 s stretch counts when -RaiseAfter is 10' ($idle + (New-Raise 40 14 $curve)) 'raise' 'PASS'
+    Expect 'raise: a 13 s stretch with a flat duty fails at -RaiseAfter 10' ($idle + (New-Span 40 14 $curve $null $null 'running' 74)) 'raise' 'FAIL'
+    $script:RaiseAfter = 30
+    Expect 'raise: the same 13 s stretch is not tested at the default 30' ($idle + (New-Raise 40 14 $curve)) 'raise' 'NOT TESTED'
+    Expect 'raise: over 40 s, the duty climbs' ($idle + (New-Raise 40 40 $curve)) 'raise' 'PASS'
+    Expect 'raise: over 40 s, the duty never moves' ($idle + (New-Span 40 40 $curve $null $null 'running' 74)) 'raise' 'FAIL'
+    Expect 'raise: over only 20 s' ($idle + (New-Raise 40 20 $curve)) 'raise' 'NOT TESTED'
+    Expect 'raise: over exactly 30 s is not more than 30 s' ($idle + (New-Raise 40 31 $curve) | Where-Object { $_.t -le 70 }) 'raise' 'NOT TESTED'
+    Expect 'raise: already at 100, cannot rise' ($idle + (New-Span 40 40 100 $null 100 'running' 74)) 'raise' 'PASS'
+    Expect 'raise: only 1 point in 30 s' ($idle + (New-Rows 40 40 $curve { param($i) 60 + [Math]::Min($i, 1) })) 'raise' 'FAIL'
+    Expect 'raise: 2 points in 30 s is enough' ($idle + (New-Rows 40 40 $curve { param($i) 60 + [Math]::Min($i, 2) })) 'raise' 'PASS'
+    Expect 'raise: it rose, then fell back' ($idle + (New-Rows 40 40 $curve { param($i) if ($i -lt 5) { 66 } else { 60 } })) 'raise' 'FAIL'
+    Expect 'raise: the agent was paused, so nothing was expected' ($idle + (New-Span 40 40 $curve $null $null 'paused' 74)) 'raise' 'NOT TESTED'
+    $flicker = 0..59 | ForEach-Object { New-Fake (40 + $_) $curve $curve $null 'running' '' $(if ($_ % 2) { 73 } else { 72 }) }
+    Expect 'raise: flickering around the target is not 30 s over' ($idle + $flicker) 'raise' 'NOT TESTED'
+    Expect 'raise: one period fine, a later one stuck' ($idle + (New-Raise 40 40 $curve) + (New-Span 90 5 $curve $null) + (New-Span 95 40 $curve $null $null 'running' 74)) 'raise' 'FAIL'
+    Expect 'raise: a log gap ends the period' ($idle + (New-Span 40 20 $curve $null $null 'running' 74) + (New-Span 70 20 $curve $null $null 'running' 74)) 'raise' 'NOT TESTED'
 
     # pause
     $adj = $idle + (New-Span 40 20 $curve 45)
@@ -218,18 +295,18 @@ function Invoke-SelfTest {
     Expect 'no resume' $good 'resume' 'NOT TESTED'
 
     # overall
-    $full = $adj + (New-Span 60 30 $curve 80) + @(New-Fake 90 $curve 45 45 'running') + @(New-Fake 91 $curve $curve $null 'paused' 'pause') + (New-Span 92 5 $curve $null $null 'paused') + @(New-Fake 97 $curve $curve $null 'running' 'resume') + (New-Span 98 5 $curve $null)
-    $o = Get-Overall (Get-Verdicts $full 40)
+    $full = $adj + (New-Span 60 30 $curve 80) + @(New-Fake 90 $curve 45 45 'running') + @(New-Fake 91 $curve $curve $null 'paused' 'pause') + (New-Span 92 5 $curve $null $null 'paused') + @(New-Fake 97 $curve $curve $null 'running' 'resume') + (New-Span 98 5 $curve $null) + (New-Raise 103 40 $curve)
+    $o = Get-Overall (Get-Verdicts $full 40 72.5)
     if ($o -ne 'PASS') { $script:selfFail++; Write-Host "SELFTEST FAIL  overall of a good run: wanted PASS, got $o" -ForegroundColor Red } else { Write-Host 'ok  overall of a good run = PASS' }
-    $o = Get-Overall (Get-Verdicts ($full + (New-Span 103 3 $curve 40 35)) 40)
+    $o = Get-Overall (Get-Verdicts ($full + (New-Span 150 3 $curve 40 35)) 40 72.5)
     if ($o -ne 'FAIL') { $script:selfFail++; Write-Host "SELFTEST FAIL  overall with one violation: wanted FAIL, got $o" -ForegroundColor Red } else { Write-Host 'ok  overall with one violation = FAIL' }
-    $o = Get-Overall (Get-Verdicts (New-Span 0 10 $curve $null) 40)
+    $o = Get-Overall (Get-Verdicts (New-Span 0 10 $curve $null) 40 72.5)
     if ($o -ne 'FAIL') { $script:selfFail++; Write-Host "SELFTEST FAIL  overall of too little data: wanted FAIL, got $o" -ForegroundColor Red } else { Write-Host 'ok  overall of too little data = FAIL' }
 
     # round trip through a real CSV file (empty cell = none)
     $tmp = Join-Path ([IO.Path]::GetTempPath()) "agent-run-selftest-$PID.csv"
     $full | Export-Csv $tmp -NoTypeInformation
-    $o = Get-Overall (Get-Verdicts (Import-Csv $tmp) 40)
+    $o = Get-Overall (Get-Verdicts (Import-Csv $tmp) 40 72.5)
     Remove-Item $tmp -ErrorAction SilentlyContinue
     if ($o -ne 'PASS') { $script:selfFail++; Write-Host "SELFTEST FAIL  CSV round trip: wanted PASS, got $o" -ForegroundColor Red } else { Write-Host 'ok  CSV round trip = PASS' }
 
@@ -240,7 +317,7 @@ function Invoke-SelfTest {
 
 if ($SelfTest) { exit (Invoke-SelfTest) }
 if ($CheckCsv) {
-    $o = Write-Verdicts (Import-Csv $CheckCsv) $ProfileMin
+    $o = Write-Verdicts (Import-Csv $CheckCsv) $ProfileMin $Target
     exit $(if ($o -eq 'PASS') { 0 } elseif ($o -eq 'FAIL') { 1 } else { 2 })
 }
 
@@ -327,7 +404,7 @@ try {
             $fa = @(Get-Api '/fans') | Where-Object { $_.id -eq $Fan } | Select-Object -First 1
             $misses = 0
             $ask = $fa.agent_duty; $curve = $fa.curve_duty
-            $boost = if (Test-Boost ([pscustomobject]@{ ask = $ask; curve = $curve })) { 1 } else { 0 }
+            $boost = if (Test-Boost ([pscustomobject]@{ ask = $ask; curve = $curve; gpu = $se.temp_celsius }) $Target) { 1 } else { 0 }
             $cells = @([Math]::Round($t, 3), $se.temp_celsius, $fa.duty_percent, $fa.commanded_duty, $curve, $ask, $boost, $st.agent, $st.latched, $event)
             Add-Content -Path $Csv -Value (($cells | ForEach-Object { Format-Cell $_ }) -join ',') -Encoding ascii
             $event = ''
@@ -360,7 +437,7 @@ finally {
     Write-Host ''
     Write-Host "Log: $Csv"
     $rows = @(Import-Csv $Csv)
-    $o = Write-Verdicts $rows $ProfileMin
+    $o = Write-Verdicts $rows $ProfileMin $Target
     Write-Host 'Stop the daemon with Ctrl-C in its terminal: the fans go back to automatic.'
     exit $(if ($o -eq 'PASS') { 0 } elseif ($o -eq 'FAIL') { 1 } else { 2 })
 }
