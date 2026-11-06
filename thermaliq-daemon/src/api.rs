@@ -1704,6 +1704,29 @@ mod tests {
     }
 
     #[test]
+    fn the_identify_client_works_against_the_real_server() {
+        use crate::identify_cli::{Api, HttpApi};
+        let r = identified(rig(vec![at(40.0)]));
+        while r.daemon.handle().cache().ticks == 0 {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let server = ApiServer::start(r.state.clone(), 0).unwrap();
+        let port = server.local_addr().port();
+        let api = HttpApi::new(port, TOKEN.into());
+        assert_eq!(api.identity().unwrap()["fans"][0]["id"], "f1");
+        assert_eq!(api.probe("f2").unwrap()["pairing"]["result"], "own");
+        // The server's own words come back, not a bare status.
+        assert!(api.probe("nope").unwrap_err().contains("nope"));
+        let want = json!({"case_fans": ["f1", "ghost"]});
+        assert!(api.put_roles(&want).unwrap_err().contains("ghost"));
+        assert!(HttpApi::new(port, "wrong".into())
+            .accept_inventory()
+            .is_err());
+        api.accept_inventory().unwrap();
+        server.shutdown();
+    }
+
+    #[test]
     fn websocket_accepts_no_origin_and_the_two_tauri_origins_only() {
         assert!(ws_handshake(None).is_ok(), "native clients send no Origin");
         assert!(ws_handshake(Some("tauri://localhost")).is_ok());

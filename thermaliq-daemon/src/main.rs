@@ -9,7 +9,8 @@ use std::time::Duration;
 use thermaliq_daemon::app::{self, Token};
 use thermaliq_daemon::store;
 
-const USAGE: &str = "usage: thermaliq-daemon [install-service [--force] | uninstall-service]";
+const USAGE: &str =
+    "usage: thermaliq-daemon [install-service [--force] | uninstall-service | identify [--probe <fan-id>]]";
 /// Same budget as the service stop.
 const STOP_BUDGET: Duration = Duration::from_secs(8);
 
@@ -17,6 +18,9 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         [] => interactive(),
+        // Talks to the running service over its API; touches no hardware itself.
+        ["identify"] => thermaliq_daemon::identify_cli::run_interactive(),
+        ["identify", "--probe", fan] => thermaliq_daemon::identify_cli::run_probe_interactive(fan),
         // Internal: started by the daemon in the user's session. Touches no hardware.
         [thermaliq_daemon::foreground::HELPER_ARG] => thermaliq_daemon::foreground::run_helper(),
         #[cfg(windows)]
