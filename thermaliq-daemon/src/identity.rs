@@ -12,7 +12,8 @@ use std::sync::{Mutex, PoisonError};
 
 use std::time::Duration;
 use thermaliq_common::identity::{
-    diff, missing_fans, missing_message, pair, propose, resolve, Inventory, InventoryDiff, Roles,
+    diff, missing_fans, missing_message, pair, propose, resolve, unmapped_lines, Inventory,
+    InventoryDiff, Role, Roles, CASE_FANS,
 };
 use thermaliq_common::{Control, Curve, HardwareSnapshot, Profile};
 use thermaliq_hal::HardwareLayer;
@@ -140,11 +141,13 @@ impl Identity {
                 Roles::default()
             })
         };
+        let mut unmapped = Vec::new();
         let resolved: Vec<Profile> = profiles
             .iter()
             .map(|p| {
                 let r = resolve(p, &roles);
                 id.problems.extend(r.skipped);
+                unmapped.push((p.name.clone(), r.unmapped));
                 let missing = missing_fans(&r.profile, &id.controllable);
                 if !missing.is_empty() {
                     id.problems.push(missing_message(&r.profile.name, &missing));
@@ -152,6 +155,7 @@ impl Identity {
                 r.profile
             })
             .collect();
+        id.problems.extend(unmapped_lines(&unmapped));
         *id.roles.lock().unwrap_or_else(PoisonError::into_inner) = roles;
         for line in &id.problems {
             eprintln!("thermaliq: {line}");
@@ -242,28 +246,36 @@ impl Identity {
     /// role a sensor in the latest snapshot. Profiles use it after the next service start.
     pub fn set_roles(
         &self,
-        wanted: &BTreeMap<String, String>,
+        wanted: &BTreeMap<String, Role>,
         snap: &HardwareSnapshot,
     ) -> Result<(), String> {
         let mut roles = Roles::default();
         let mut used = std::collections::HashSet::new();
-        for (role, id) in wanted {
-            if !used.insert(id) {
-                return Err(format!("'{id}' is wanted by two roles"));
-            }
-            let sensor = thermaliq_common::identity::SENSOR_ROLES.contains(&role.as_str());
-            let exists = if sensor {
-                snap.sensors.iter().any(|s| &s.id == id)
-            } else {
-                self.controllable.contains(id)
+        for (role, value) in wanted {
+            let ids: Vec<&String> = match (role == CASE_FANS, value) {
+                (true, Role::Many(ids)) => ids.iter().collect(),
+                (false, Role::One(id)) => vec![id],
+                (true, Role::One(_)) => return Err(format!("role '{role}' takes a list of ids")),
+                (false, Role::Many(_)) => return Err(format!("role '{role}' takes one id")),
             };
-            if !exists {
-                return Err(format!(
-                    "role '{role}' maps to '{id}', which is not a {} on this PC",
-                    if sensor { "sensor" } else { "controllable fan" }
-                ));
+            for id in ids {
+                if !used.insert(id) {
+                    return Err(format!("'{id}' is wanted twice"));
+                }
+                let sensor = thermaliq_common::identity::SENSOR_ROLES.contains(&role.as_str());
+                let exists = if sensor {
+                    snap.sensors.iter().any(|s| &s.id == id)
+                } else {
+                    self.controllable.contains(id)
+                };
+                if !exists {
+                    return Err(format!(
+                        "role '{role}' maps to '{id}', which is not a {} on this PC",
+                        if sensor { "sensor" } else { "controllable fan" }
+                    ));
+                }
+                roles.assign(role, id).map_err(|e| e.to_string())?;
             }
-            roles.assign(role, id).map_err(|e| e.to_string())?;
         }
         write_atomic(&self.dir.join("roles.toml"), roles.to_toml().as_bytes())
             .map_err(|e| format!("roles.toml: {e}"))?;
@@ -415,8 +427,7 @@ mod tests {
 
     const BAL: &str = "name = \"bal\"\n\
         [[curves]]\nid = \"c\"\ntype = \"linear\"\nsource = \"cpu_temp\"\nmin_temp = 30\nmax_temp = 90\nmin_pwm = 20\nmax_pwm = 100\n\
-        [[controls]]\nfan = \"case_front\"\ncurve = \"c\"\n\
-        [[controls]]\nfan = \"case_rear\"\ncurve = \"c\"\n\
+        [[controls]]\nfan = \"case_fans\"\ncurve = \"c\"\n\
         [[alerts]]\nsensor = \"cpu_temp\"\nthreshold = 85\nseverity = \"warn\"\naction = { type = \"log\" }\n";
 
     fn at() -> Tick {
@@ -455,7 +466,7 @@ mod tests {
         let d = dir();
         fs::write(
             d.path().join("roles.toml"),
-            "[roles]\ncase_front = \"f1\"\ncase_rear = \"f2\"\ncpu_temp = \"cpu\"\n",
+            "[roles]\ncase_fans = [\"f1\", \"f2\"]\ncpu_temp = \"cpu\"\n",
         )
         .unwrap();
         let (id, profiles) = Identity::load(d.path(), &*hal(&["f1", "f2"]), bal());
@@ -471,18 +482,36 @@ mod tests {
     #[test]
     fn an_unmapped_role_is_reported_by_name_and_its_control_skipped() {
         let d = dir();
-        fs::write(
-            d.path().join("roles.toml"),
-            "[roles]\ncase_front = \"f1\"\ncpu_temp = \"cpu\"\n",
-        )
-        .unwrap();
+        fs::write(d.path().join("roles.toml"), "[roles]\ncpu_temp = \"cpu\"\n").unwrap();
         let (id, profiles) = Identity::load(d.path(), &*hal(&["f1"]), bal());
-        assert_eq!(profiles[0].controls.len(), 1);
+        assert!(profiles[0].controls.is_empty());
         assert!(
-            id.problems.iter().any(|p| p.contains("'case_rear'")),
+            id.problems.iter().any(|p| p.contains("'case_fans'")),
             "{:?}",
             id.problems
         );
+    }
+
+    #[test]
+    fn an_unmapped_role_is_one_line_listing_every_profile_that_uses_it() {
+        let d = dir();
+        let mk = |name: &str| {
+            Profile::from_toml(&format!(
+                "name = \"{name}\"\n[[curves]]\nid = \"c\"\ntype = \"linear\"\nsource = \"cpu_temp\"\nmin_temp = 30\nmax_temp = 90\nmin_pwm = 20\nmax_pwm = 100\n\
+                 [[controls]]\nfan = \"case_fans\"\ncurve = \"c\"\n"
+            ))
+            .unwrap()
+        };
+        let (id, _) = Identity::load(d.path(), &*hal(&["f1"]), vec![mk("balanced"), mk("gaming")]);
+        for role in ["case_fans", "cpu_temp"] {
+            let lines: Vec<_> = id.problems.iter().filter(|p| p.contains(role)).collect();
+            assert_eq!(lines.len(), 1, "{role}: {:?}", id.problems);
+            assert!(
+                lines[0].contains("balanced") && lines[0].contains("gaming"),
+                "{}",
+                lines[0]
+            );
+        }
     }
 
     #[test]
@@ -490,7 +519,7 @@ mod tests {
         let d = dir();
         fs::write(
             d.path().join("roles.toml"),
-            "[roles]\ncase_front = \"f1\"\ncase_rear = \"gone\"\ncpu_temp = \"cpu\"\n",
+            "[roles]\ncase_fans = [\"f1\", \"gone\"]\ncpu_temp = \"cpu\"\n",
         )
         .unwrap();
         let (id, _) = Identity::load(d.path(), &*hal(&["f1"]), bal());
@@ -603,30 +632,40 @@ mod tests {
         let h = hal(&["f1", "f2"]);
         let (id, _) = Identity::load(d.path(), &*h, bal());
         let snap = h.snapshot().unwrap();
-        let want = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+        let want = |pairs: &[(&str, &[&str])]| -> BTreeMap<String, Role> {
             pairs
                 .iter()
-                .map(|(a, b)| ((*a).into(), (*b).into()))
+                .map(|(role, ids)| {
+                    let ids: Vec<String> = ids.iter().map(|i| (*i).into()).collect();
+                    let v = if *role == "case_fans" {
+                        Role::Many(ids)
+                    } else {
+                        Role::One(ids[0].clone())
+                    };
+                    ((*role).into(), v)
+                })
                 .collect()
         };
         for bad in [
-            want(&[("case_front", "nope")]),
-            want(&[("cpu_temp", "f1")]),
-            want(&[("middle", "f1")]),
-            want(&[("case_front", "f1"), ("case_rear", "f1")]),
+            want(&[("case_fans", &["f1", "nope"])]),
+            want(&[("cpu_temp", &["f1"])]),
+            want(&[("middle", &["f1"])]),
+            want(&[("case_front", &["f1"])]),
+            want(&[("case_fans", &["f1"]), ("cpu_fan", &["f1"])]),
+            want(&[("case_fans", &["f1", "f1"])]),
         ] {
             assert!(id.set_roles(&bad, &snap).is_err(), "{bad:?}");
         }
+        // The wrong shape for a role.
+        let one = BTreeMap::from([("case_fans".to_owned(), Role::One("f1".into()))]);
+        let many = BTreeMap::from([("cpu_fan".to_owned(), Role::Many(vec!["f1".into()]))]);
+        assert!(id.set_roles(&one, &snap).is_err() && id.set_roles(&many, &snap).is_err());
         assert!(
             !d.path().join("roles.toml").exists(),
             "a refused set writes nothing"
         );
         id.set_roles(
-            &want(&[
-                ("case_front", "f1"),
-                ("case_rear", "f2"),
-                ("cpu_temp", "cpu"),
-            ]),
+            &want(&[("case_fans", &["f1", "f2"]), ("cpu_temp", &["cpu"])]),
             &snap,
         )
         .unwrap();
@@ -645,7 +684,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .any(|r| r == "case_front"));
+            .any(|r| r == "case_fans"));
         assert!(v["proposals"].is_array() && v["roles"].is_object());
     }
 
@@ -758,7 +797,7 @@ mod tests {
     #[test]
     fn a_changed_board_loads_every_role_unmapped_and_says_what_to_run() {
         let d = dir();
-        let roles = "[roles]\ncase_front = \"f1\"\ncase_rear = \"f2\"\ncpu_temp = \"cpu\"\n";
+        let roles = "[roles]\ncase_fans = [\"f1\", \"f2\"]\ncpu_temp = \"cpu\"\n";
         fs::write(d.path().join("roles.toml"), roles).unwrap();
         let old = Boarded(hal(&["f1", "f2"]), "OLD BOARD");
         let (first, mapped) = Identity::load(d.path(), &old, bal());

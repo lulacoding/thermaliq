@@ -1,18 +1,18 @@
 //! Fan and sensor identity (SPEC §5.2): the saved inventory, role mapping, and the checks that
 //! name a missing fan. Pure logic; the daemon does the file IO.
 
-use crate::{invalid, Curve, CustomSensor, Error, FanKind, HardwareSnapshot, Profile, SensorKind};
+use crate::{
+    invalid, Control, Curve, CustomSensor, Error, FanKind, HardwareSnapshot, Profile, SensorKind,
+};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-pub const FAN_ROLES: [&str; 6] = [
-    "cpu_fan",
-    "pump",
-    "case_front",
-    "case_rear",
-    "case_top",
-    "gpu_fan",
-];
+/// The one role that names a group of fans (SPEC §5.2).
+pub const CASE_FANS: &str = "case_fans";
+/// Floor for every `case_fans` member. A case-fan header can have an AIO pump plugged into it.
+pub const CASE_FANS_MIN_PWM: u8 = 30;
+
+pub const FAN_ROLES: [&str; 4] = ["cpu_fan", "pump", "gpu_fan", CASE_FANS];
 pub const SENSOR_ROLES: [&str; 2] = ["cpu_temp", "gpu_temp"];
 
 /// A tach reading must rise at least this much for the probe to call a fan "moved".
@@ -22,62 +22,117 @@ fn is_role(id: &str) -> bool {
     FAN_ROLES.contains(&id) || SENSOR_ROLES.contains(&id)
 }
 
-/// `roles.toml`: role -> the real fan or sensor id on this PC.
+/// What a role maps to: one id, or for `case_fans` a list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Role {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl Role {
+    fn ids(&self) -> &[String] {
+        match self {
+            Self::One(id) => std::slice::from_ref(id),
+            Self::Many(ids) => ids,
+        }
+    }
+}
+
+/// `roles.toml`: role -> the real fan or sensor id(s) on this PC.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Roles {
     #[serde(default)]
-    roles: BTreeMap<String, String>,
+    roles: BTreeMap<String, Role>,
 }
 
 impl Roles {
     pub fn from_toml(s: &str) -> Result<Self, Error> {
         let r: Self = toml::from_str(s)?;
         let mut used = HashSet::new();
-        for (role, id) in &r.roles {
+        for (role, v) in &r.roles {
             if !is_role(role) {
                 return invalid(format!("`{role}` is not a role (known: {})", known_roles()));
             }
-            if id.is_empty() {
-                return invalid(format!("role `{role}` maps to an empty id"));
+            match (role == CASE_FANS, v) {
+                (true, Role::One(_)) => {
+                    return invalid(format!("role `{role}` takes a list of ids"))
+                }
+                (false, Role::Many(_)) => return invalid(format!("role `{role}` takes one id")),
+                _ => {}
             }
-            if !used.insert(id.as_str()) {
-                return invalid(format!("`{id}` is mapped to two roles"));
+            for id in v.ids() {
+                if id.is_empty() {
+                    return invalid(format!("role `{role}` maps to an empty id"));
+                }
+                if !used.insert(id.as_str()) {
+                    return invalid(format!("`{id}` is mapped to two roles"));
+                }
             }
         }
         Ok(r)
     }
 
     pub fn to_toml(&self) -> String {
-        // A map of strings always serialises.
+        // A map of strings and lists of strings always serialises.
         toml::to_string(self).unwrap_or_default()
     }
 
+    /// The id a single-id role maps to. `case_fans` is read with `members`.
     pub fn get(&self, role: &str) -> Option<&str> {
-        self.roles.get(role).map(String::as_str)
+        match self.roles.get(role) {
+            Some(Role::One(id)) => Some(id),
+            _ => None,
+        }
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.roles.iter().map(|(r, i)| (r.as_str(), i.as_str()))
+    /// The fans in `case_fans`, empty when it is unmapped.
+    pub fn members(&self) -> &[String] {
+        match self.roles.get(CASE_FANS) {
+            Some(Role::Many(ids)) => ids,
+            _ => &[],
+        }
     }
 
-    /// Maps `role` to `id`, taking `id` away from any other role.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &Role)> {
+        self.roles.iter().map(|(r, v)| (r.as_str(), v))
+    }
+
+    /// Maps `role` to `id`, taking `id` away from any other role. For `case_fans` it adds a member.
     pub fn assign(&mut self, role: &str, id: &str) -> Result<(), Error> {
         if !is_role(role) || id.is_empty() {
             return invalid(format!("cannot map `{role}` to `{id}`"));
         }
-        self.roles.retain(|_, v| v != id);
-        self.roles.insert(role.to_owned(), id.to_owned());
+        self.roles.retain(|_, v| match v {
+            Role::One(i) => i != id,
+            Role::Many(ids) => {
+                ids.retain(|i| i != id);
+                !ids.is_empty()
+            }
+        });
+        if role == CASE_FANS {
+            match self
+                .roles
+                .entry(role.to_owned())
+                .or_insert_with(|| Role::Many(Vec::new()))
+            {
+                Role::Many(ids) => ids.push(id.to_owned()),
+                Role::One(_) => {}
+            }
+        } else {
+            self.roles.insert(role.to_owned(), Role::One(id.to_owned()));
+        }
         Ok(())
     }
 
-    /// Roles no one has mapped yet, in a fixed order.
+    /// Roles no one has mapped yet, in a fixed order. An empty group is unmapped.
     pub fn unmapped(&self) -> Vec<&'static str> {
         FAN_ROLES
             .iter()
             .chain(&SENSOR_ROLES)
             .copied()
-            .filter(|r| !self.roles.contains_key(*r))
+            .filter(|r| self.roles.get(*r).is_none_or(|v| v.ids().is_empty()))
             .collect()
     }
 }
@@ -95,7 +150,9 @@ fn known_roles() -> String {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Resolved {
     pub profile: Profile,
-    /// One line per thing skipped, naming the role or fan. Never empty when something was.
+    /// Roles the profile uses that nothing is mapped to, sorted. Report them with `unmapped_lines`.
+    pub unmapped: Vec<String>,
+    /// Other things left out (a second control for the same fan). Empty when nothing was.
     pub skipped: Vec<String>,
 }
 
@@ -104,12 +161,38 @@ enum Sub {
     Unmapped(String),
 }
 
+/// One line per unmapped role, listing the profiles that use it: `(profile, its unmapped roles)`.
+pub fn unmapped_lines(per_profile: &[(String, Vec<String>)]) -> Vec<String> {
+    let mut by_role: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (profile, roles) in per_profile {
+        for r in roles {
+            by_role.entry(r).or_default().push(profile);
+        }
+    }
+    by_role
+        .into_iter()
+        .map(|(role, profiles)| {
+            let what = if SENSOR_ROLES.contains(&role) {
+                "the curves, controls and alerts that read it are skipped"
+            } else {
+                "its controls are skipped and the fans stay with the BIOS or driver"
+            };
+            format!(
+                "role '{role}' is not mapped, so {what} (profiles: {}). Run thermaliq-daemon identify",
+                profiles.join(", ")
+            )
+        })
+        .collect()
+}
+
 /// Replaces each role id in `p` with its mapped id. An unmapped role is skipped and reported
 /// (SPEC §5.2): a control on it is dropped, a curve on an unmapped sensor is dead and so is
-/// every control, curve, custom sensor and alert built on it.
+/// every control, curve, custom sensor and alert built on it. A control on `case_fans` becomes
+/// one control per member, each floored at `CASE_FANS_MIN_PWM`.
 pub fn resolve(p: &Profile, roles: &Roles) -> Resolved {
     let mut out = p.clone();
     let mut skipped = Vec::new();
+    let mut unmapped: BTreeSet<String> = BTreeSet::new();
     let name = &p.name;
     let sub = |id: &str| -> Option<Sub> {
         match roles.get(id) {
@@ -121,7 +204,6 @@ pub fn resolve(p: &Profile, roles: &Roles) -> Resolved {
 
     // Custom sensors whose source is an unmapped role, and those built on a dead one.
     let mut dead_sensors: HashSet<String> = HashSet::new();
-    let mut dead_why: Vec<String> = Vec::new();
     loop {
         let before = dead_sensors.len();
         for s in &mut out.sensors {
@@ -138,7 +220,7 @@ pub fn resolve(p: &Profile, roles: &Roles) -> Resolved {
                         Sub::Real(real) => *src = real,
                         Sub::Unmapped(role) => {
                             dead_sensors.insert(id.to_owned());
-                            dead_why.push(role);
+                            unmapped.insert(role);
                         }
                     }
                 }
@@ -167,10 +249,7 @@ pub fn resolve(p: &Profile, roles: &Roles) -> Resolved {
                             Sub::Real(real) => *source = real,
                             Sub::Unmapped(role) => {
                                 dead_curves.insert(id);
-                                skipped.push(format!(
-                                    "profile '{name}': sensor role '{role}' is not mapped, so \
-                                     curves and fans that read it are skipped"
-                                ));
+                                unmapped.insert(role);
                             }
                         }
                     }
@@ -188,64 +267,66 @@ pub fn resolve(p: &Profile, roles: &Roles) -> Resolved {
             break;
         }
     }
-    for role in dead_why {
-        skipped.push(format!(
-            "profile '{name}': sensor role '{role}' is not mapped, so custom sensors built on it \
-             are skipped"
-        ));
-    }
 
     let mut seen = HashSet::new();
     let mut controls = Vec::new();
-    for mut c in std::mem::take(&mut out.controls) {
-        if let Some(sub) = sub(&c.fan) {
-            match sub {
-                Sub::Real(real) => c.fan = real,
-                Sub::Unmapped(role) => {
-                    skipped.push(format!(
-                        "profile '{name}': fan role '{role}' is not mapped, so its control is skipped"
-                    ));
-                    continue;
-                }
+    for c in std::mem::take(&mut out.controls) {
+        let members: Vec<Control> = if c.fan == CASE_FANS {
+            roles
+                .members()
+                .iter()
+                .map(|m| Control {
+                    fan: m.clone(),
+                    min_pwm: c.min_pwm.max(CASE_FANS_MIN_PWM),
+                    ..c.clone()
+                })
+                .collect()
+        } else {
+            match sub(&c.fan) {
+                Some(Sub::Real(real)) => vec![Control {
+                    fan: real,
+                    ..c.clone()
+                }],
+                Some(Sub::Unmapped(_)) => Vec::new(),
+                None => vec![c.clone()],
             }
+        };
+        if members.is_empty() {
+            unmapped.insert(if c.fan == CASE_FANS {
+                CASE_FANS.into()
+            } else {
+                c.fan
+            });
+            continue;
         }
         if dead_curves.contains(&c.curve) {
-            skipped.push(format!(
-                "profile '{name}': the control for '{}' is skipped, its curve reads a sensor that is not mapped",
-                c.fan
-            ));
-            continue;
+            continue; // the dead sensor's role is already in `unmapped`
         }
-        if !seen.insert(c.fan.clone()) {
-            skipped.push(format!(
-                "profile '{name}': a second control for '{}' is skipped",
-                c.fan
-            ));
-            continue;
+        for m in members {
+            if seen.insert(m.fan.clone()) {
+                controls.push(m);
+            } else {
+                skipped.push(format!(
+                    "profile '{name}': a second control for '{}' is skipped",
+                    m.fan
+                ));
+            }
         }
-        controls.push(c);
     }
     out.controls = controls;
 
     let mut alerts = Vec::new();
     for mut a in std::mem::take(&mut out.alerts) {
         if sensor_dead(&a.sensor) {
-            skipped.push(format!(
-                "profile '{name}': the alert on '{}' is skipped, it reads a sensor that is not mapped",
-                a.sensor
-            ));
             continue;
         }
-        if let Some(sub) = sub(&a.sensor) {
-            match sub {
-                Sub::Real(real) => a.sensor = real,
-                Sub::Unmapped(role) => {
-                    skipped.push(format!(
-                        "profile '{name}': the alert on sensor role '{role}' is skipped, it is not mapped"
-                    ));
-                    continue;
-                }
+        match sub(&a.sensor) {
+            Some(Sub::Real(real)) => a.sensor = real,
+            Some(Sub::Unmapped(role)) => {
+                unmapped.insert(role);
+                continue;
             }
+            None => {}
         }
         alerts.push(a);
     }
@@ -255,6 +336,7 @@ pub fn resolve(p: &Profile, roles: &Roles) -> Resolved {
     skipped.retain(|s| once.insert(s.clone()));
     Resolved {
         profile: out,
+        unmapped: unmapped.into_iter().collect(),
         skipped,
     }
 }
@@ -392,8 +474,9 @@ pub struct Proposal {
 }
 
 /// Roles that can be set without asking: the NVIDIA fan, a pump by kind or name, `CPU` in a
-/// header's label, and the one CPU and GPU sensor. A role two fans both fit is left out, so the
-/// user is asked.
+/// header's label, and the one CPU and GPU sensor. A single-id role two fans both fit is left out,
+/// so the user is asked. Every other controllable fan of kind `fan` goes in `case_fans`, with or
+/// without a tach; one that looks like the CPU fan or a pump but was left out is not swept in.
 pub fn propose(snap: &HardwareSnapshot, controllable: &[String]) -> Vec<Proposal> {
     let mut by_role: BTreeMap<&'static str, Vec<Proposal>> = BTreeMap::new();
     for f in snap.fans.iter().filter(|f| controllable.contains(&f.id)) {
@@ -407,6 +490,8 @@ pub fn propose(snap: &HardwareSnapshot, controllable: &[String]) -> Vec<Proposal
             .any(|w| w == "cpu")
         {
             ("cpu_fan", "its label says CPU")
+        } else if f.kind == FanKind::Fan {
+            (CASE_FANS, "a fan header that is not the CPU fan or a pump")
         } else {
             continue;
         };
@@ -435,8 +520,12 @@ pub fn propose(snap: &HardwareSnapshot, controllable: &[String]) -> Vec<Proposal
         }
     }
     by_role
-        .into_values()
-        .filter_map(|mut v| (v.len() == 1).then(|| v.remove(0)))
+        .into_iter()
+        .flat_map(|(role, mut v)| match role {
+            CASE_FANS => v,
+            _ if v.len() == 1 => vec![v.remove(0)],
+            _ => Vec::new(),
+        })
         .collect()
 }
 
@@ -471,27 +560,6 @@ pub fn pair(probed: &str, before: &[(String, u32)], during: &[(String, u32)]) ->
     }
 }
 
-/// The user's answer to "which fan was that?".
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Heard {
-    Front,
-    Rear,
-    Top,
-    None,
-}
-
-impl Heard {
-    pub fn role(self) -> Option<&'static str> {
-        match self {
-            Self::Front => Some("case_front"),
-            Self::Rear => Some("case_rear"),
-            Self::Top => Some("case_top"),
-            Self::None => None,
-        }
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -511,7 +579,7 @@ mod tests {
             "name = \"p\"\n\
              [[curves]]\nid = \"cpu\"\ntype = \"linear\"\nsource = \"cpu_temp\"\nmin_temp = 40\nmax_temp = 80\nmin_pwm = 20\nmax_pwm = 100\n\
              [[curves]]\nid = \"gpu\"\ntype = \"linear\"\nsource = \"gpu_temp\"\nmin_temp = 40\nmax_temp = 80\nmin_pwm = 20\nmax_pwm = 100\n\
-             [[controls]]\nfan = \"case_front\"\ncurve = \"cpu\"\n\
+             [[controls]]\nfan = \"cpu_fan\"\ncurve = \"cpu\"\n\
              [[controls]]\nfan = \"gpu_fan\"\ncurve = \"gpu\"\n\
              [[alerts]]\nsensor = \"cpu_temp\"\nthreshold = 85\nseverity = \"warn\"\naction = {{ type = \"notify\" }}\n{extra}"
         ))
@@ -520,7 +588,7 @@ mod tests {
 
     fn all_mapped() -> Roles {
         roles(&[
-            ("case_front", "lhm_nct6687d_0_fan_1"),
+            ("cpu_fan", "lhm_nct6687d_0_fan_1"),
             ("gpu_fan", "nvml_GPU-a_fan0"),
             ("cpu_temp", "lhm_cpu"),
             ("gpu_temp", "nvml_GPU-a_temp"),
@@ -567,11 +635,11 @@ mod tests {
     #[test]
     fn an_unmapped_fan_role_drops_only_its_control_and_says_so() {
         let mut m = all_mapped();
-        m.roles.remove("case_front");
+        m.roles.remove("cpu_fan");
         let r = resolve(&profile(""), &m);
         assert_eq!(r.profile.controls.len(), 1);
-        assert_eq!(r.skipped.len(), 1);
-        assert!(r.skipped[0].contains("'case_front'") && r.skipped[0].contains("profile 'p'"));
+        assert_eq!(r.unmapped, ["cpu_fan"]);
+        assert!(r.skipped.is_empty());
     }
 
     #[test]
@@ -582,11 +650,7 @@ mod tests {
         let fans: Vec<_> = r.profile.controls.iter().map(|c| c.fan.as_str()).collect();
         assert_eq!(fans, ["nvml_GPU-a_fan0"]);
         assert!(r.profile.alerts.is_empty());
-        let all = r.skipped.join("\n");
-        assert!(
-            all.contains("'cpu_temp'") && all.contains("'lhm_nct6687d_0_fan_1'"),
-            "{all}"
-        );
+        assert_eq!(r.unmapped, ["cpu_temp"]);
     }
 
     #[test]
@@ -597,12 +661,12 @@ mod tests {
              [[curves]]\nid = \"a\"\ntype = \"linear\"\nsource = \"avg\"\nmin_temp = 40\nmax_temp = 80\nmin_pwm = 20\nmax_pwm = 100\n\
              [[curves]]\nid = \"m\"\ntype = \"mix\"\nfunction = \"max\"\ncurves = [\"a\"]\n\
              [[curves]]\nid = \"s\"\ntype = \"sync\"\ntarget = \"m\"\n\
-             [[controls]]\nfan = \"case_front\"\ncurve = \"s\"\n",
+             [[controls]]\nfan = \"cpu_fan\"\ncurve = \"s\"\n",
         )
         .unwrap();
-        let r = resolve(&p, &roles(&[("case_front", "f1")]));
+        let r = resolve(&p, &roles(&[("cpu_fan", "f1")]));
         assert!(r.profile.controls.is_empty());
-        assert!(!r.skipped.is_empty());
+        assert_eq!(r.unmapped, ["cpu_temp"]);
     }
 
     #[test]
@@ -643,12 +707,20 @@ mod tests {
 
     #[test]
     fn assigning_an_id_takes_it_from_its_old_role_and_rejects_unknown_roles() {
-        let mut m = roles(&[("case_front", "f1")]);
-        m.assign("case_rear", "f1").unwrap();
-        assert_eq!(m.get("case_front"), None);
-        assert_eq!(m.get("case_rear"), Some("f1"));
+        let mut m = roles(&[("cpu_fan", "f1")]);
+        m.assign("pump", "f1").unwrap();
+        assert_eq!(m.get("cpu_fan"), None);
+        assert_eq!(m.get("pump"), Some("f1"));
         assert!(m.assign("middle", "f2").is_err());
-        assert!(m.unmapped().contains(&"case_front") && !m.unmapped().contains(&"case_rear"));
+        assert!(m.unmapped().contains(&"cpu_fan") && !m.unmapped().contains(&"pump"));
+        // A group takes members one at a time, and a member leaving it can empty it.
+        m.assign("case_fans", "f2").unwrap();
+        m.assign("case_fans", "f3").unwrap();
+        assert_eq!(m.members(), ["f2", "f3"]);
+        m.assign("pump", "f2").unwrap();
+        assert_eq!(m.members(), ["f3"]);
+        m.assign("cpu_fan", "f3").unwrap();
+        assert!(m.members().is_empty() && m.unmapped().contains(&"case_fans"));
     }
 
     #[test]
@@ -752,7 +824,7 @@ mod tests {
     }
 
     #[test]
-    fn the_first_run_proposes_what_it_is_sure_of_and_leaves_system_fans_to_the_user() {
+    fn the_first_run_proposes_the_gpu_fan_cpu_fan_pump_sensors_and_the_case_fans() {
         let s = snap();
         let got: Vec<_> = propose(&s, &all_fans(&s))
             .into_iter()
@@ -761,6 +833,8 @@ mod tests {
         assert_eq!(
             got,
             [
+                ("case_fans", "lhm_nct6687d_0_fan_2".to_owned()),
+                ("case_fans", "lhm_nct6687d_0_fan_3".into()),
                 ("cpu_fan", "lhm_nct6687d_0_fan_0".to_owned()),
                 ("cpu_temp", "lhm_cpu".into()),
                 ("gpu_fan", "nvml_GPU-a_fan0".into()),
@@ -804,11 +878,150 @@ mod tests {
         assert_eq!(pair("a", &before, &before), Pairing::None);
     }
 
+    // ---- case_fans (design change, 2026-11-06) ----
+
+    fn group(ids: &[&str]) -> Roles {
+        let list: Vec<String> = ids.iter().map(|i| format!("\"{i}\"")).collect();
+        Roles::from_toml(&format!("[roles]\ncase_fans = [{}]\n", list.join(", "))).unwrap()
+    }
+
+    fn case_profile(min_pwm: u8) -> Profile {
+        Profile::from_toml(&format!(
+            "name = \"p\"\n\
+             [[curves]]\nid = \"c\"\ntype = \"flat\"\npwm = 25\n\
+             [[controls]]\nfan = \"case_fans\"\ncurve = \"c\"\nstep_down_pct = 7\nmin_pwm = {min_pwm}\n"
+        ))
+        .unwrap()
+    }
+
     #[test]
-    fn listen_answers_map_to_case_roles_and_none_maps_to_nothing() {
-        assert_eq!(Heard::Front.role(), Some("case_front"));
-        assert_eq!(Heard::Rear.role(), Some("case_rear"));
-        assert_eq!(Heard::Top.role(), Some("case_top"));
-        assert_eq!(Heard::None.role(), None);
+    fn roles_toml_takes_case_fans_as_a_list_and_the_other_roles_as_one_id() {
+        let r = Roles::from_toml("[roles]\ncase_fans = [\"a\", \"b\"]\ncpu_fan = \"c\"\n").unwrap();
+        assert_eq!(Roles::from_toml(&r.to_toml()).unwrap(), r);
+        assert_eq!(r.get("cpu_fan"), Some("c"));
+        for bad in [
+            "[roles]\ncase_fans = \"a\"\n",
+            "[roles]\ncpu_fan = [\"a\"]\n",
+            "[roles]\ncase_fans = [\"a\", \"a\"]\n",
+            "[roles]\ncase_fans = [\"a\", \"\"]\n",
+            "[roles]\ncase_fans = [\"a\"]\ncpu_fan = \"a\"\n",
+            "[roles]\ncase_front = \"a\"\n",
+            "[roles]\ncase_rear = \"a\"\n",
+            "[roles]\ncase_top = \"a\"\n",
+        ] {
+            assert!(Roles::from_toml(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_case_fans_control_becomes_one_control_per_member_floored_at_30() {
+        for (asked, floor) in [(0, 30), (20, 30), (30, 30), (45, 45)] {
+            let r = resolve(&case_profile(asked), &group(&["a", "b", "c"]));
+            assert!(r.skipped.is_empty(), "{:?}", r.skipped);
+            let got: Vec<_> = r
+                .profile
+                .controls
+                .iter()
+                .map(|c| (c.fan.as_str(), c.curve.as_str(), c.step_down_pct, c.min_pwm))
+                .collect();
+            assert_eq!(
+                got,
+                [
+                    ("a", "c", 7, floor),
+                    ("b", "c", 7, floor),
+                    ("c", "c", 7, floor)
+                ],
+                "min_pwm {asked}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_or_unmapped_case_fans_group_is_skipped_and_named() {
+        for roles in [group(&[]), Roles::default()] {
+            let r = resolve(&case_profile(0), &roles);
+            assert!(r.profile.controls.is_empty());
+            assert_eq!(r.unmapped, ["case_fans"]);
+        }
+    }
+
+    #[test]
+    fn unmapped_roles_are_one_line_each_naming_the_profiles_that_use_them() {
+        let per = vec![
+            (
+                "balanced".to_owned(),
+                vec!["case_fans".to_owned(), "cpu_temp".to_owned()],
+            ),
+            ("gaming".to_owned(), vec!["case_fans".to_owned()]),
+        ];
+        let lines = unmapped_lines(&per);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("'case_fans'") && lines[0].contains("balanced, gaming"));
+        assert!(lines[1].contains("'cpu_temp'") && !lines[1].contains("gaming"));
+        assert!(lines
+            .iter()
+            .all(|l| l.contains("thermaliq-daemon identify")));
+        assert!(unmapped_lines(&[]).is_empty());
+        assert_eq!(CASE_FANS_MIN_PWM, 30);
+    }
+
+    #[test]
+    fn the_first_run_proposes_every_other_controllable_fan_as_case_fans() {
+        let mut s = snap();
+        s.fans[4].rpm = 0; // a header with no tach is still a case fan
+        s.fans.push(fan("lhm_x_fan_8", "Aux Pump", FanKind::Pump));
+        s.fans
+            .push(fan("lhm_x_fan_9", "System Fan #3", FanKind::Fan));
+        let mut all = all_fans(&s);
+        all.retain(|f| f != "lhm_x_fan_9"); // read-only: never proposed
+        let got: Vec<_> = propose(&s, &all)
+            .into_iter()
+            .filter(|p| p.role == "case_fans")
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(got, ["lhm_nct6687d_0_fan_2", "lhm_nct6687d_0_fan_3"]);
+    }
+
+    #[test]
+    fn a_fan_that_might_be_the_cpu_fan_or_a_pump_is_never_swept_into_case_fans() {
+        let mut s = snap();
+        s.fans.push(fan("lhm_x_fan_9", "CPU_OPT", FanKind::Fan)); // two CPU fans: ambiguous
+        let all = all_fans(&s);
+        let ps = propose(&s, &all);
+        assert!(!ps.iter().any(|p| p.role == "cpu_fan"));
+        let case: Vec<_> = ps.iter().filter(|p| p.role == "case_fans").collect();
+        assert!(
+            case.iter()
+                .all(|p| p.id != "lhm_x_fan_9" && p.id != "lhm_nct6687d_0_fan_0"),
+            "{case:?}"
+        );
+        assert_eq!(case.len(), 2);
+    }
+
+    #[test]
+    fn every_bundled_profile_has_one_case_fans_control_and_none_of_the_old_roles() {
+        let mut roles = group(&["a", "b"]);
+        roles.assign("cpu_temp", "t1").unwrap();
+        roles.assign("gpu_temp", "t2").unwrap();
+        for (name, text) in crate::bundled_profiles() {
+            for old in ["case_front", "case_rear", "case_top"] {
+                assert!(!text.contains(old), "{name} still says {old}");
+            }
+            let p = Profile::from_toml(text).unwrap();
+            assert_eq!(
+                p.controls.iter().filter(|c| c.fan == "case_fans").count(),
+                1,
+                "{name}"
+            );
+            let r = resolve(&p, &roles);
+            let case: Vec<_> = r
+                .profile
+                .controls
+                .iter()
+                .filter(|c| c.fan == "a" || c.fan == "b")
+                .collect();
+            assert_eq!(case.len(), 2, "{name}");
+            assert!(case.iter().all(|c| c.min_pwm >= 30), "{name}");
+        }
     }
 }

@@ -120,26 +120,30 @@ While the bridge is stopped, its sensors are gone. S3 still applies: a GPU fan w
 
 **A different board.** If the saved inventory's board is not the board the bridge reports now (both known, names differ), the same IDs may be other fans. The daemon then loads with every role unmapped (so every role-based control is dropped and those fans go to the BIOS or driver), logs it, and adds a `degraded_reasons` line saying the board changed and to run `thermaliq-daemon identify`. It stays that way across restarts until `identify` finishes or `POST /inventory/accept` saves the new board. An unknown board now (no bridge) is not a change.
 
-**Roles.** Bundled profiles name roles, not hardware. Fan roles: `cpu_fan`, `pump`, `case_front`, `case_rear`, `case_top`, `gpu_fan`. Sensor roles: `cpu_temp`, `gpu_temp`. `roles.toml` in the data dir maps a role to a real ID. When a profile loads, each role becomes its mapped ID. An unmapped role is skipped and reported by name, never silently:
+**Roles.** Bundled profiles name roles, not hardware. Fan roles: `cpu_fan`, `pump`, `gpu_fan`, `case_fans`. Sensor roles: `cpu_temp`, `gpu_temp`. `roles.toml` in the data dir maps a role to a real ID; `case_fans` is a list of IDs, the others are one ID. When a profile loads, each role becomes its mapped ID. An unmapped role is skipped and reported, never silently:
 
 - a control on an unmapped fan role is dropped;
 - a curve on an unmapped sensor role is dead, and so is every control that uses it, plus any curve or custom sensor built on it;
 - an alert on an unmapped sensor role is dropped.
 
-A dropped fan goes to the BIOS or driver, not to a guess.
+A dropped fan goes to the BIOS or driver, not to a guess. The report is one line per role, listing every profile that uses it, in `GET /identity` `problems`, the log and the CLI.
+
+**`case_fans` (design change, Sam, 2026-11-06, from PC check step 2).** There are no front/rear/top roles. This PC's case fans read 0 RPM, so neither tach pairing nor listening can tell its headers apart, and FanControl doesn't know fan locations either. A control on `case_fans` becomes one control per member, with the same curve and settings and `min_pwm = max(the control's, CASE_FANS_MIN_PWM)`, where `CASE_FANS_MIN_PWM = 30`. The floor protects an AIO pump plugged into a System Fan header. An empty or unmapped group is skipped and reported. `PUT /roles` checks that every ID exists, and that `case_fans` is a list and the other roles are single IDs.
+
+**An active profile with no controls** (every role unmapped, say) is `degraded` with `profile '<name>' controls no fans: run thermaliq-daemon identify`, for as long as it is active.
 
 **A profile fan that no backend lists** (after mapping) is reported by name:
 
 - at load: logged, and `degraded` with `degraded_reasons` naming the fan and the profile. The daemon still starts, because S2–S4 and the other fans must keep working;
 - on activation: refused (`POST /profiles/active` and the agent's own switches), with an error naming the fan. The engine stays on the previous profile.
 
-**First-run identification** (`thermaliq-daemon identify`, over the API). It only ever raises a fan, never lowers one, and a pump only goes up:
+**First-run identification** (`thermaliq-daemon identify`, over the API). No probing and no location questions by default:
 
-1. **Auto:** NVML GPU fans become `gpu_fan`. A header's LHM label proposes a role (`CPU Fan` → `cpu_fan`, `Pump` → `pump`). `cpu_temp` and `gpu_temp` are the sensors of kind Cpu and Gpu when there is exactly one.
-2. **RPM pairing** (fans with a tach): the probe puts the fan at 100% for 5 s and compares every RPM. The fan whose RPM rose is the one it drives. A rise on another fan's tach is reported, never guessed.
-3. **Listen** (fans with no tach reading, or no rise): the probe puts the fan at 100% for 5 s and the user answers front, rear, top or none. `none` leaves the fan unmapped.
+1. **Proposals:** NVML GPU fans become `gpu_fan`. A header's LHM label proposes a role (`CPU Fan` → `cpu_fan`, `Pump` → `pump`). `cpu_temp` and `gpu_temp` are the sensors of kind Cpu and Gpu when there is exactly one. Every other controllable fan of kind `fan` goes into `case_fans`, with or without a tach. A fan whose label looks like the CPU fan or a pump but was not proposed for that role (two fit) is left out of `case_fans` and stays unmapped, so a possible pump is never swept in.
+2. `identify` prints the proposals, including the `case_fans` list, then asks "Save these? [Y/n]". `y` or a bare Enter saves `roles.toml` and accepts the inventory; `n`, `q` or end of input saves nothing.
+3. **Opt-in `identify --probe <fan-id>`:** runs the probe on that one fan and only reports the tach pairing (the fan whose RPM rose). A rise on another fan's tach is reported, never guessed. It saves nothing.
 
-A probe adds one flat-100% control for that fan to the active profile for 5 s, then restores the profile, so the engine stays the only writer (S1) and S2–S4 still win. The hold and the restore run in their own task, so a dropped request (Ctrl-C) still restores. The agent is paused for the probe and resumed afterwards only if it was running, so no profile switch can land inside the hold and be undone. Nothing is saved until the user confirms, and `roles.toml` is written atomically.
+A probe only ever raises a fan, never lowers one. It adds one flat-100% control for that fan to the active profile for 5 s, then restores the profile, so the engine stays the only writer (S1) and S2–S4 still win. The hold and the restore run in their own task, so a dropped request (Ctrl-C) still restores. The agent is paused for the probe and resumed afterwards only if it was running, so no profile switch can land inside the hold and be undone. `roles.toml` is written atomically.
 
 M13 is identity only. Which fan cools which component is M20d.
 

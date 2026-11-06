@@ -457,6 +457,17 @@ impl Daemon {
                         degraded_reasons.extend(engine.missing_fans().into_iter().map(|f| {
                             format!("the active profile controls fan '{f}', which no backend lists")
                         }));
+                        // A profile whose roles all went unmapped leaves every fan to the BIOS (SPEC §5.2).
+                        if engine.controls_nothing() {
+                            degraded_reasons.push(format!(
+                                "profile '{}' controls no fans: run thermaliq-daemon identify",
+                                shared
+                                    .profile
+                                    .read()
+                                    .unwrap_or_else(PoisonError::into_inner)
+                                    .name
+                            ));
+                        }
                         // A fresh snapshot with no fan at all means every fan backend failed to
                         // start or lost its fans. An empty engine must not look healthy (S8).
                         if engine.snapshot_fresh() && snapshot.fans.is_empty() {
@@ -1094,6 +1105,28 @@ mod tests {
                     .degraded_reasons
                     .contains(&"the board changed".into())
         );
+        d.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_active_profile_with_no_controls_is_degraded_until_one_with_controls_is_active() {
+        let hal = Arc::new(MockHardwareLayer::new(&["f1", "f2"], vec![at(40.0)]));
+        let empty = Profile::from_toml("name = \"bare\"\n").unwrap();
+        let d = Daemon::start(hal, &empty, vec![], db(), fast());
+        wait_until(|| d.cache().ticks > 2);
+        let c = d.cache();
+        let want = "profile 'bare' controls no fans: run thermaliq-daemon identify";
+        assert!(c.status.degraded, "{:?}", c.status);
+        assert!(
+            c.status.degraded_reasons.iter().any(|r| r == want),
+            "{:?}",
+            c.status
+        );
+        d.handle()
+            .set_profile(Profile::from_toml(FLAT).unwrap())
+            .await
+            .unwrap();
+        wait_until(|| d.cache().status.degraded_reasons.is_empty());
         d.shutdown().unwrap();
     }
 

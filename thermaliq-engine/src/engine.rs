@@ -149,6 +149,11 @@ impl Engine {
         }
     }
 
+    /// True when the active profile has no controls at all.
+    pub fn controls_nothing(&self) -> bool {
+        self.fans.is_empty()
+    }
+
     /// Fans the active profile controls that no backend lists (SPEC §5.2). They are inert, so
     /// the daemon reports them in `degraded_reasons`.
     pub fn missing_fans(&self) -> Vec<String> {
@@ -569,9 +574,9 @@ step_down_pct = 100
     #[test]
     fn a_profile_naming_a_fan_no_backend_lists_is_refused_by_name() {
         let (_, e) = rig(&["f1", "f2"], vec![at(30.0, 30.0)]);
-        let p = Profile::from_toml(&PROFILE.replace("\"f2\"", "\"case_rear\"")).unwrap();
+        let p = Profile::from_toml(&PROFILE.replace("\"f2\"", "\"ghost_fan\"")).unwrap();
         let err = e.check_profile(&p).unwrap_err();
-        assert!(err.contains("'case_rear'") && !err.contains("f1"), "{err}");
+        assert!(err.contains("'ghost_fan'") && !err.contains("f1"), "{err}");
         assert!(err.contains("profile 't'"), "{err}");
         assert!(e
             .check_profile(&Profile::from_toml(PROFILE).unwrap())

@@ -355,7 +355,7 @@ async fn identify_probe(State(s): State<ApiState>, Json(b): Json<ProbeBody>) -> 
 
 #[derive(Deserialize)]
 struct RolesBody {
-    roles: BTreeMap<String, String>,
+    roles: BTreeMap<String, thermaliq_common::identity::Role>,
 }
 
 /// Replaces `roles.toml`. Profiles pick it up when the service next starts.
@@ -813,7 +813,11 @@ mod tests {
         let r = identified(rig(vec![at(40.0)]));
         for (m, path, b) in [
             ("POST", "/identify/probe", Some(json!({"fan": "f2"}))),
-            ("PUT", "/roles", Some(json!({"roles": {"case_rear": "f2"}}))),
+            (
+                "PUT",
+                "/roles",
+                Some(json!({"roles": {"case_fans": ["f2"]}})),
+            ),
             ("POST", "/inventory/accept", None),
         ] {
             let (code, _) = call(&r, m, path, None, b).await;
@@ -832,7 +836,7 @@ mod tests {
         assert!(v["unmapped_roles"]
             .as_array()
             .unwrap()
-            .contains(&json!("case_rear")));
+            .contains(&json!("case_fans")));
         assert_eq!(v["inventory"]["missing"], json!([]));
     }
 
@@ -866,18 +870,36 @@ mod tests {
     async fn put_roles_validates_writes_the_file_and_says_when_it_applies() {
         let r = identified(rig(vec![at(40.0)]));
         ticked(&r).await;
-        let bad = json!({"roles": {"case_rear": "ghost"}});
-        let (code, v) = call(&r, "PUT", "/roles", Some(TOKEN), Some(bad)).await;
-        assert_eq!(code, StatusCode::BAD_REQUEST, "{v}");
+        // One bad member refuses the whole group, and the old per-location roles are gone.
+        for bad in [
+            json!({"roles": {"case_fans": ["f2", "ghost"]}}),
+            json!({"roles": {"case_front": "f2"}}),
+            json!({"roles": {"case_fans": "f2"}}),
+            json!({"roles": {"cpu_fan": ["f2"]}}),
+        ] {
+            let (code, v) = call(&r, "PUT", "/roles", Some(TOKEN), Some(bad.clone())).await;
+            assert_eq!(code, StatusCode::BAD_REQUEST, "{bad} {v}");
+        }
+        let (_, v) = call(
+            &r,
+            "PUT",
+            "/roles",
+            Some(TOKEN),
+            Some(json!({"roles": {"case_fans": ["f2", "ghost"]}})),
+        )
+        .await;
         assert!(v["error"].as_str().unwrap().contains("ghost"));
         assert!(!r.dir.path().join("roles.toml").exists());
-        let ok = json!({"roles": {"case_rear": "f2"}});
+        let ok = json!({"roles": {"case_fans": ["f1", "f2"]}});
         let (code, v) = call(&r, "PUT", "/roles", Some(TOKEN), Some(ok)).await;
         assert_eq!(code, StatusCode::OK, "{v}");
         assert!(v["applies"].as_str().unwrap().contains("restart"));
         let saved = std::fs::read_to_string(r.dir.path().join("roles.toml")).unwrap();
-        assert!(saved.contains("case_rear") && saved.contains("f2"));
-        assert_eq!(get(&r, "/identity").await.1["roles"]["case_rear"], "f2");
+        assert!(saved.contains("case_fans") && saved.contains("f2"));
+        assert_eq!(
+            get(&r, "/identity").await.1["roles"]["case_fans"],
+            json!(["f1", "f2"])
+        );
     }
 
     #[tokio::test]
