@@ -376,12 +376,23 @@ async fn hold_and_restore(
         .iter()
         .find(|f| f.id == fan)
         .map(|f| f.label.clone());
+    // What the engine last wrote to the fan and the chip accepted. A header that rejects writes
+    // (a channel with no header behind it, say) never gets there, whatever the engine asked.
+    let landed = during.fan_info.get(fan).and_then(|i| i.commanded) == Some(100);
+    let duty_after = during
+        .snapshot
+        .fans
+        .iter()
+        .find(|f| f.id == fan)
+        .map(|f| f.duty_percent);
     Ok(json!({
         "fan": fan,
         "label": label,
         "rpm_before": was,
         "rpm_after": now,
         "pairing": pair(fan, &was, &now),
+        "landed": landed,
+        "duty_after": duty_after,
     }))
 }
 
@@ -821,6 +832,24 @@ mod tests {
         let (ok, profiles) = Identity::load(d.path(), &new, bal());
         assert!(ok.board_reason().is_none());
         assert_eq!(profiles[0].controls.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_probe_says_whether_the_write_landed_and_where_the_chip_ended_up() {
+        let (h, d, profiles) = running(&["f1", "f2"]);
+        let id = identity_for(&["f1", "f2"]);
+        let ok = id.probe(&d.handle(), &profiles, "f2").await.unwrap();
+        assert_eq!(ok["landed"], true, "{ok}");
+        assert_eq!(ok["duty_after"], 100, "{ok}");
+
+        // A header whose writes the HAL refuses: commanded never reaches 100.
+        h.fail_writes("f1");
+        let bad = id.probe(&d.handle(), &profiles, "f1").await.unwrap();
+        assert_eq!(bad["landed"], false, "{bad}");
+        assert!(
+            bad["duty_after"].is_u64(),
+            "the chip's own reading is reported: {bad}"
+        );
     }
 
     #[tokio::test]
