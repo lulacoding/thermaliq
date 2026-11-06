@@ -8,7 +8,7 @@ pub mod datadir;
 pub mod identity;
 mod profile;
 
-pub use config::{DaemonConfig, LogLevel};
+pub use config::{DaemonConfig, LogLevel, ScheduleEntry};
 pub use profile::{
     Alert, AlertAction, AppRule, Control, Curve, CustomSensor, GraphPoint, MixFunction, Profile,
     Severity,

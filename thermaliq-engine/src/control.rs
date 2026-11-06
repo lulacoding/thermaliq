@@ -101,6 +101,15 @@ impl FanControl {
             .map(|r| r.duty.min(100))
     }
 
+    /// Highest duty asked for by any source below Agent (AppRule, Schedule, Profile).
+    pub(crate) fn lower_priority_baseline(&self) -> Option<u8> {
+        self.requests
+            .iter()
+            .filter(|r| r.source > Source::Agent)
+            .map(|r| r.duty.min(100))
+            .max()
+    }
+
     /// Raises an Agent request up to `floor` (SPEC §7.2: never far below the curve).
     pub(crate) fn floor_agent(&mut self, floor: u8) {
         for r in self

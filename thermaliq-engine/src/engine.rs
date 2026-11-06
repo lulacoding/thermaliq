@@ -124,6 +124,8 @@ pub struct Engine {
     fans: Vec<Fan>,
     controllable: HashSet<String>,
     touched: BTreeSet<String>,
+    /// Fans dropped by a profile switch while the emergency latch owns them.
+    deferred_restore: BTreeSet<String>,
     latch: Latch,
     snapshot_fails: u8,
     /// Last duty each fan accepted, to seed ramping across a profile switch.
@@ -145,6 +147,7 @@ impl Engine {
             controllable: hal.capabilities().controllable_fans.into_iter().collect(),
             hal,
             touched: BTreeSet::new(),
+            deferred_restore: BTreeSet::new(),
             latch: Latch::default(),
             snapshot_fails: 0,
             written: HashMap::new(),
@@ -218,6 +221,7 @@ impl Engine {
                 let mut fan = Fan::new(c);
                 if let Some(i) = old.iter().position(|o| o.id == c.fan) {
                     let mut o = old.swap_remove(i);
+                    self.deferred_restore.remove(&c.fan);
                     fan.ctl.put_requests(o.ctl.take_requests());
                     (fan.good, fan.bad, fan.lost) = (o.good, o.bad, o.lost);
                 }
@@ -231,7 +235,9 @@ impl Engine {
         for gone in old {
             self.written.remove(&gone.id);
             self.write_fails.remove(&gone.id);
-            if self.touched.remove(&gone.id) {
+            if self.latch.on && self.touched.contains(&gone.id) {
+                self.deferred_restore.insert(gone.id);
+            } else if self.touched.remove(&gone.id) {
                 let _ = self.hal.restore_auto(&gone.id);
             }
         }
@@ -364,6 +370,10 @@ impl Engine {
             self.all_full();
             return;
         }
+        for fan in std::mem::take(&mut self.deferred_restore) {
+            self.touched.remove(&fan);
+            let _ = self.hal.restore_auto(&fan);
+        }
         let real: Temps = snap
             .sensors
             .iter()
@@ -389,8 +399,11 @@ impl Engine {
                     Some(d) => {
                         // Profile never needs an expiry, so submit cannot fail.
                         let _ = f.ctl.submit(Source::Profile, d, None);
-                        // SPEC §7.2: the engine itself keeps an agent within 15 points of the curve.
-                        f.ctl.floor_agent(d.saturating_sub(AGENT_MAX_LOWER_PCT));
+                        // M15: app and schedule requests are part of the Agent baseline too.
+                        // SPEC §7.2: the engine itself keeps an agent within 15 points of it.
+                        let baseline = f.ctl.lower_priority_baseline().unwrap_or(d);
+                        f.ctl
+                            .floor_agent(baseline.saturating_sub(AGENT_MAX_LOWER_PCT));
                     }
                     None => {
                         // No curve output means no floor to enforce: the agent must not act either.
@@ -996,6 +1009,13 @@ mod profile_switch_tests {
         Duration::from_secs(n)
     }
 
+    fn at(cpu: f32, gpu: f32) -> Tick {
+        Tick::Temps(vec![
+            ("cpu".into(), SensorKind::Cpu, cpu),
+            ("gpu".into(), SensorKind::Gpu, gpu),
+        ])
+    }
+
     #[test]
     fn switching_profile_while_latched_stays_at_100_and_hands_nothing_back() {
         let (hal, mut e) = rig(97.0);
@@ -1005,6 +1025,31 @@ mod profile_switch_tests {
         assert!(e.latched());
         assert!(hal.writes().iter().all(|(_, d)| *d == 100));
         assert!(hal.restores().is_empty());
+    }
+
+    #[test]
+    fn switching_profile_while_latched_does_not_restore_a_dropped_fan() {
+        let hal = Arc::new(MockHardwareLayer::new(
+            &["f1", "f2"],
+            vec![at(97.0, 40.0), at(40.0, 40.0), at(40.0, 40.0)],
+        ));
+        let mut e = Engine::new(hal.clone(), &profile(30, &["f1", "f2"]));
+        e.tick(secs(0));
+        assert!(e.latched());
+
+        e.set_profile(&profile(30, &["f1"]));
+
+        assert!(
+            hal.restores().is_empty(),
+            "a dropped fan must stay under engine control while the emergency latch is active"
+        );
+        e.tick(secs(1));
+        assert!(e.latched());
+        assert!(hal.restores().is_empty());
+        assert!(hal.writes().iter().all(|(_, duty)| *duty == 100));
+        e.tick(secs(31));
+        assert!(!e.latched());
+        assert_eq!(hal.restores(), ["f2"]);
     }
 
     #[test]
@@ -1310,6 +1355,20 @@ mod agent_tests {
         agent(&mut e, 34, 99);
         e.tick(secs(2));
         assert_eq!(last(&hal), 35);
+    }
+
+    #[test]
+    fn agent_floor_uses_the_highest_lower_priority_request() {
+        let (hal, mut e) = rig();
+        e.tick(secs(0));
+        e.submit("f1", Source::Schedule, 70, None).unwrap();
+        e.submit("f1", Source::AppRule, 80, None).unwrap();
+        agent(&mut e, 0, 60);
+
+        e.tick(secs(1));
+
+        assert_eq!(last(&hal), 65, "AppRule's 80% baseline minus 15");
+        assert_eq!(e.agent_request("f1"), Some(65));
     }
 
     #[test]

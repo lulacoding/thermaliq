@@ -12,7 +12,7 @@ use std::process::Child;
 use std::ptr::{null, null_mut};
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, SetHandleInformation, SetLastError, ERROR_NOT_FOUND,
-    ERROR_SERVICE_DOES_NOT_EXIST, HANDLE, HANDLE_FLAG_INHERIT, RECT,
+    ERROR_SERVICE_DOES_NOT_EXIST, HANDLE, HANDLE_FLAG_INHERIT, RECT, SYSTEMTIME,
 };
 use windows_sys::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
@@ -37,6 +37,7 @@ use windows_sys::Win32::System::Services::{
     CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatus, SC_MANAGER_CONNECT,
     SERVICE_QUERY_STATUS, SERVICE_STATUS, SERVICE_STOPPED,
 };
+use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 use windows_sys::Win32::System::Threading::{
     CreateProcessAsUserW, DeleteProcThreadAttributeList, InitializeProcThreadAttributeList,
     OpenProcess, QueryFullProcessImageNameW, TerminateProcess, UpdateProcThreadAttribute,
@@ -57,6 +58,22 @@ fn wide(s: &OsStr) -> Vec<u16> {
 
 fn last_error() -> io::Error {
     io::Error::last_os_error()
+}
+
+pub fn local_time() -> (&'static str, u16) {
+    let mut time = SYSTEMTIME::default();
+    // SAFETY: GetLocalTime initializes the provided SYSTEMTIME structure.
+    unsafe { GetLocalTime(&mut time) };
+    let weekday = match time.wDayOfWeek {
+        0 => "sun",
+        1 => "mon",
+        2 => "tue",
+        3 => "wed",
+        4 => "thu",
+        5 => "fri",
+        _ => "sat",
+    };
+    (weekday, time.wHour * 60 + time.wMinute)
 }
 
 // ---- keychain (Windows Credential Manager) ----
