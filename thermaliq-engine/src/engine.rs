@@ -572,6 +572,32 @@ step_down_pct = 100
     }
 
     #[test]
+    fn a_case_fans_control_with_0_rpm_set_still_never_drops_a_member_below_30() {
+        // A member may be an AIO pump on a System Fan header (SPEC §5.2), so the floor wins.
+        use thermaliq_common::identity::{resolve, Roles};
+        let text = "name = \"t\"\n[[curves]]\ntype = \"flat\"\nid = \"c\"\npwm = 10\n\
+                    [[controls]]\nfan = \"case_fans\"\ncurve = \"c\"\nstep_up_pct = 100\n\
+                    step_down_pct = 100\nstart_percent = 40\nstop_percent = 30\n";
+        let mut roles = Roles::default();
+        roles.assign("case_fans", "f1").unwrap();
+        roles.assign("case_fans", "f2").unwrap();
+        let p = resolve(&Profile::from_toml(text).unwrap(), &roles).profile;
+        let hal = Arc::new(MockHardwareLayer::new(&["f1", "f2"], vec![at(30.0, 30.0)]));
+        let mut e = Engine::new(hal.clone(), &p);
+        for t in 0..6 {
+            e.tick(secs(t));
+        }
+        let w = hal.writes();
+        for fan in ["f1", "f2"] {
+            assert!(
+                w.iter().any(|(f, _)| f == fan),
+                "{fan} never written: {w:?}"
+            );
+        }
+        assert!(w.iter().all(|(_, d)| *d >= 30), "{w:?}");
+    }
+
+    #[test]
     fn a_profile_naming_a_fan_no_backend_lists_is_refused_by_name() {
         let (_, e) = rig(&["f1", "f2"], vec![at(30.0, 30.0)]);
         let p = Profile::from_toml(&PROFILE.replace("\"f2\"", "\"ghost_fan\"")).unwrap();

@@ -271,6 +271,12 @@ pub fn resolve(p: &Profile, roles: &Roles) -> Resolved {
     let mut seen = HashSet::new();
     let mut controls = Vec::new();
     for c in std::mem::take(&mut out.controls) {
+        if c.fan == CASE_FANS && (c.start_percent.is_some() || c.stop_percent.is_some()) {
+            // 0-RPM beats `min_pwm` in the engine, and a member may be a pump.
+            skipped.push(format!(
+                "profile '{name}': 0-RPM is not allowed on case_fans (a member may be a pump); ignored"
+            ));
+        }
         let members: Vec<Control> = if c.fan == CASE_FANS {
             roles
                 .members()
@@ -278,6 +284,8 @@ pub fn resolve(p: &Profile, roles: &Roles) -> Resolved {
                 .map(|m| Control {
                     fan: m.clone(),
                     min_pwm: c.min_pwm.max(CASE_FANS_MIN_PWM),
+                    start_percent: None,
+                    stop_percent: None,
                     ..c.clone()
                 })
                 .collect()
@@ -934,6 +942,30 @@ mod tests {
                 "min_pwm {asked}"
             );
         }
+    }
+
+    #[test]
+    fn zero_rpm_on_case_fans_is_stripped_from_every_member_and_reported_once() {
+        let p = Profile::from_toml(
+            "name = \"p\"\n[[curves]]\nid = \"c\"\ntype = \"flat\"\npwm = 25\n\
+             [[controls]]\nfan = \"case_fans\"\ncurve = \"c\"\nstart_percent = 40\nstop_percent = 30\n\
+             [[controls]]\nfan = \"cpu_fan\"\ncurve = \"c\"\nstart_percent = 40\nstop_percent = 30\n",
+        )
+        .unwrap();
+        let mut roles = group(&["a", "b"]);
+        roles.assign("cpu_fan", "x").unwrap();
+        let r = resolve(&p, &roles);
+        for c in &r.profile.controls {
+            let case = c.fan != "x";
+            assert_eq!(c.stop_percent.is_none(), case, "{}", c.fan);
+            assert_eq!(c.start_percent.is_none(), case, "{}", c.fan);
+        }
+        assert_eq!(
+            r.skipped,
+            ["profile 'p': 0-RPM is not allowed on case_fans (a member may be a pump); ignored"]
+        );
+        // Without 0-RPM settings there is nothing to report.
+        assert!(resolve(&case_profile(0), &roles).skipped.is_empty());
     }
 
     #[test]
