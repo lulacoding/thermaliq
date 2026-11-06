@@ -1,6 +1,6 @@
 # M14 checks on the Windows PC
 
-**Not run yet.** Do these after reviewing the M14 PR. Paste each step's output into chat and stop at the first failure.
+**Done 2026-11-06 (steps 1-8 passed, Sam; M14 is ticked).** Kept as a record. Paste each step's output into chat and stop at the first failure.
 
 Branch: `m14-cli`. Use an **admin** PowerShell (step 4 also uses a normal one), and close Fan Control, MSI Center and games first. The service must already be installed and mapped as at the end of M13 (`roles.toml` present, `balanced` active).
 
