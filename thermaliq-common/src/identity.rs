@@ -178,7 +178,7 @@ pub fn unmapped_lines(per_profile: &[(String, Vec<String>)]) -> Vec<String> {
                 "its controls are skipped and the fans stay with the BIOS or driver"
             };
             format!(
-                "role '{role}' is not mapped, so {what} (profiles: {}). Run thermaliq-daemon identify",
+                "role '{role}' is not mapped, so {what} (profiles: {}). Run tq identify",
                 profiles.join(", ")
             )
         })
@@ -990,9 +990,7 @@ mod tests {
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(lines[0].contains("'case_fans'") && lines[0].contains("balanced, gaming"));
         assert!(lines[1].contains("'cpu_temp'") && !lines[1].contains("gaming"));
-        assert!(lines
-            .iter()
-            .all(|l| l.contains("thermaliq-daemon identify")));
+        assert!(lines.iter().all(|l| l.contains("tq identify")));
         assert!(unmapped_lines(&[]).is_empty());
         assert_eq!(CASE_FANS_MIN_PWM, 30);
     }

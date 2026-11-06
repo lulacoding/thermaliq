@@ -1,38 +1,14 @@
 //! Data directory, atomic writes, config and API token (SPEC §6).
 
-use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use thermaliq_common::datadir::parse_token;
+pub use thermaliq_common::datadir::{data_dir, DATA_DIR_ENV};
 use thermaliq_common::DaemonConfig;
 
-pub const DATA_DIR_ENV: &str = "THERMALIQ_DATA_DIR";
 const CONFIG_FILE: &str = "config.toml";
 const TOKEN_FILE: &str = "token.txt";
-
-/// Env override wins (dev, CI); else `%ProgramData%\ThermalIQ`.
-pub fn data_dir_from(
-    override_dir: Option<OsString>,
-    program_data: Option<OsString>,
-) -> io::Result<PathBuf> {
-    if let Some(d) = override_dir.filter(|d| !d.is_empty()) {
-        return Ok(d.into());
-    }
-    match program_data.filter(|d| !d.is_empty()) {
-        Some(p) => Ok(PathBuf::from(p).join("ThermalIQ")),
-        None => Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("%ProgramData% is not set; set {DATA_DIR_ENV}"),
-        )),
-    }
-}
-
-pub fn data_dir() -> io::Result<PathBuf> {
-    data_dir_from(
-        std::env::var_os(DATA_DIR_ENV),
-        std::env::var_os("ProgramData"),
-    )
-}
 
 /// Temp file in the same directory, then rename over `path`.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -77,10 +53,7 @@ pub fn save_config(dir: &Path, cfg: &DaemonConfig) -> io::Result<()> {
 /// Reads `token.txt`. `None` if it is missing or malformed.
 pub fn load_token(dir: &Path) -> io::Result<Option<String>> {
     match fs::read_to_string(dir.join(TOKEN_FILE)) {
-        Ok(s) => {
-            let s = s.trim();
-            Ok((s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())).then(|| s.to_owned()))
-        }
+        Ok(s) => Ok(parse_token(&s)),
         Err(e) if e.kind() == io::ErrorKind::NotFound || e.kind() == io::ErrorKind::InvalidData => {
             Ok(None)
         }
@@ -106,25 +79,6 @@ pub fn load_or_create_token(dir: &Path) -> io::Result<String> {
 mod tests {
     use super::*;
     use std::fs;
-
-    #[test]
-    fn env_override_wins() {
-        let p = data_dir_from(Some("devdir".into()), Some("pd".into())).unwrap();
-        assert_eq!(p, PathBuf::from("devdir"));
-    }
-
-    #[test]
-    fn program_data_path() {
-        let p = data_dir_from(None, Some("pd".into())).unwrap();
-        assert_eq!(p, PathBuf::from("pd").join("ThermalIQ"));
-    }
-
-    #[test]
-    fn no_dir_is_an_error_and_empty_override_is_ignored() {
-        assert!(data_dir_from(None, None).is_err());
-        let p = data_dir_from(Some("".into()), Some("pd".into())).unwrap();
-        assert_eq!(p, PathBuf::from("pd").join("ThermalIQ"));
-    }
 
     #[test]
     fn atomic_write_replaces_and_leaves_no_temp() {

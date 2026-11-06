@@ -1,6 +1,6 @@
 # M13 checks on the Windows PC
 
-**Not run yet.** Do these after reviewing #59 and #60. Paste each step's output into chat and stop at the first failure.
+**Done 2026-11-06 (M13 is ticked).** Kept as a record. Since M14, `identify` is `tq identify`: the commands below use `$pf\tq.exe`, which step 1 does not copy. Build it with `cargo build -p thermaliq-cli` and copy `target\debug\tq.exe` into `$pf` first (`docs/dev/m14-pc-checks.md` does this).
 
 Branch: `m13-identify` (it holds #59 and #60). Use an **admin** PowerShell, and close Fan Control, MSI Center and games first. Don't commit `out\` dumps.
 
@@ -74,16 +74,16 @@ Get-Content "$dir\inventory.json"
 Get-Content "$dir\service.log"
 ```
 
-**Pass:** `board` names your B550M board, `inventory.json` exists and lists every fan, `inventory` shows nothing new/missing/changed, `roles` is empty, and `unmapped_roles` lists all six roles (`cpu_fan`, `pump`, `gpu_fan`, `case_fans`, `cpu_temp`, `gpu_temp`). `problems` has **one line per role** (not one per profile) naming the profiles that use it. `proposals` lists `gpu_fan`, `cpu_fan` (CPU Fan), `pump` (Pump Fan), a CPU and a GPU sensor, and `case_fans` with System Fan #1 to #6 (even though they read 0 RPM). `degraded` is **true** with `degraded_reasons` = `profile 'balanced' controls no fans: run thermaliq-daemon identify`, because nothing is mapped yet. `active_profile` is `balanced`. The service log says "first run: saved the fan inventory".
+**Pass:** `board` names your B550M board, `inventory.json` exists and lists every fan, `inventory` shows nothing new/missing/changed, `roles` is empty, and `unmapped_roles` lists all six roles (`cpu_fan`, `pump`, `gpu_fan`, `case_fans`, `cpu_temp`, `gpu_temp`). `problems` has **one line per role** (not one per profile) naming the profiles that use it. `proposals` lists `gpu_fan`, `cpu_fan` (CPU Fan), `pump` (Pump Fan), a CPU and a GPU sensor, and `case_fans` with System Fan #1 to #6 (even though they read 0 RPM). `degraded` is **true** with `degraded_reasons` = `profile 'balanced' controls no fans: run tq identify`, because nothing is mapped yet. `active_profile` is `balanced`. The service log says "first run: saved the fan inventory".
 
 ## 2. Identify
 
 First answer `n` to see that nothing is written, then run it again and press Enter:
 
 ```powershell
-& "$pf\thermaliq-daemon.exe" identify
+& "$pf\tq.exe" identify
 Test-Path "$dir\roles.toml"
-& "$pf\thermaliq-daemon.exe" identify
+& "$pf\tq.exe" identify
 Get-Content "$dir\roles.toml"
 ```
 
@@ -106,7 +106,7 @@ Then, in the first window:
 
 ```powershell
 Get-Content "$dir\roles.toml" > "$env:TEMP\roles.before"
-& "$pf\thermaliq-daemon.exe" identify --probe lhm_nct6687d_0_fan_2
+& "$pf\tq.exe" identify --probe lhm_nct6687d_0_fan_2
 (Compare-Object (Get-Content "$env:TEMP\roles.before") (Get-Content "$dir\roles.toml")).Count
 ```
 
@@ -117,7 +117,7 @@ Then pause the agent yourself and probe again:
 ```powershell
 $h = @{ Authorization = "Bearer $((Get-Content "$dir\token.txt" -Raw).Trim())" }
 Invoke-RestMethod "$api/agent/pause" -Method Post -Headers $h | Out-Null
-& "$pf\thermaliq-daemon.exe" identify --probe lhm_nct6687d_0_fan_2
+& "$pf\tq.exe" identify --probe lhm_nct6687d_0_fan_2
 (Invoke-RestMethod "$api/status").agent
 Invoke-RestMethod "$api/agent/resume" -Method Post -Headers $h | Out-Null
 (Invoke-RestMethod "$api/status").agent
@@ -128,7 +128,7 @@ Invoke-RestMethod "$api/agent/resume" -Method Post -Headers $h | Out-Null
 ## 4. Ctrl-C in the middle of a probe
 
 ```powershell
-& "$pf\thermaliq-daemon.exe" identify --probe lhm_nct6687d_0_fan_2
+& "$pf\tq.exe" identify --probe lhm_nct6687d_0_fan_2
 ```
 
 Hear the fan go up and press **Ctrl-C** about 2 s in. Then:
@@ -138,7 +138,7 @@ Start-Sleep 8
 (Invoke-RestMethod "$api/status") | Select-Object active_profile, degraded, degraded_reasons, agent | Format-List
 @((Invoke-RestMethod "$api/fans")) | Select-Object id, rpm, duty_percent, curve_duty, commanded_duty | Format-Table
 Get-Content "$dir\service.log" -Tail 20
-& "$pf\thermaliq-daemon.exe" identify --probe lhm_nct6687d_0_fan_2
+& "$pf\tq.exe" identify --probe lhm_nct6687d_0_fan_2
 ```
 
 **Pass:** the fan drops back within a few seconds of the 5 s ending, `active_profile` is `balanced`, `agent` is `running`, nothing in `degraded_reasons` says "could not put profile back", and the last command runs normally (it must not say another probe is running; if it does, wait 2 s and try again once, then report it).
@@ -175,7 +175,7 @@ Start-Sleep 20
 @((Invoke-RestMethod "$api/fans")) | Select-Object id, rpm, duty_percent, curve_duty, commanded_duty | Format-Table
 ```
 
-**Pass:** `degraded` is true and `degraded_reasons` has two lines: the board changed (both boards named, and to run `thermaliq-daemon identify`), and `profile 'balanced' controls no fans: run thermaliq-daemon identify`. `roles` is empty and every role is in `unmapped_roles`, even though `roles.toml` still has your mapping. No fan has a `curve_duty` any more (the BIOS has them).
+**Pass:** `degraded` is true and `degraded_reasons` has two lines: the board changed (both boards named, and to run `tq identify`), and `profile 'balanced' controls no fans: run tq identify`. `roles` is empty and every role is in `unmapped_roles`, even though `roles.toml` still has your mapping. No fan has a `curve_duty` any more (the BIOS has them).
 
 Restart once more, to see it stays that way, then accept:
 

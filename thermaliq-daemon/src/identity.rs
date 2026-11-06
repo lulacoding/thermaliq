@@ -127,7 +127,7 @@ impl Identity {
         let roles = if let Some((was, now)) = moved {
             let show = |b: Option<String>| b.unwrap_or_else(|| "none".into());
             let why = format!(
-                "the board changed (saved: {}, now: {}); no role is mapped. Run `thermaliq-daemon identify`",
+                "the board changed (saved: {}, now: {}); no role is mapped. Run `tq identify`",
                 show(was),
                 show(now)
             );
@@ -821,7 +821,7 @@ mod tests {
         assert!(id.roles().iter().next().is_none());
         let why = id.board_reason().unwrap();
         assert!(
-            why.contains("NEW BOARD") && why.contains("thermaliq-daemon identify"),
+            why.contains("NEW BOARD") && why.contains("tq identify"),
             "{why}"
         );
 

@@ -48,6 +48,8 @@ mock-hardware = []
 gate-tests = []
 
 [dev-dependencies]
+# The real-server test of the CLI client. The CLI never depends on the daemon.
+thermaliq-cli = { path = "../thermaliq-cli" }
 futures-util = "0.3"
 tempfile = "3"
 tokio-tungstenite = "0.26"

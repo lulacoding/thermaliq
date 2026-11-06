@@ -86,7 +86,7 @@ try {
         & $exe install-service
         if ($LASTEXITCODE -ne 0) { throw 'install-service failed (an existing ThermalIQ install may need uninstall-service first)' }
         # The bundled `balanced` profile names roles (SPEC 5.2). Map the GPU fan and temperature to
-        # this PC's first NVIDIA GPU, as `thermaliq-daemon identify` would, and run that profile.
+        # this PC's first NVIDIA GPU, as `tq identify` would, and run that profile.
         # Its case-fan roles stay unmapped, so those controls are skipped and logged, which is
         # the behaviour on a PC with only a GPU fan.
         $uuid = "$(nvidia-smi --query-gpu=uuid --format=csv,noheader | Select-Object -First 1)".Trim()

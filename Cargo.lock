@@ -1024,6 +1024,12 @@ dependencies = [
 [[package]]
 name = "thermaliq-cli"
 version = "2.0.0-dev.0"
+dependencies = [
+ "serde_json",
+ "tempfile",
+ "thermaliq-common",
+ "ureq",
+]
 
 [[package]]
 name = "thermaliq-common"
@@ -1046,6 +1052,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thermaliq-agent",
+ "thermaliq-cli",
  "thermaliq-common",
  "thermaliq-engine",
  "thermaliq-hal",
