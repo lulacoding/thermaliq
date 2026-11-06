@@ -120,6 +120,24 @@ pub fn run_probe_interactive(fan: &str) -> Result<(), String> {
     run_probe(&http_api()?, fan, &mut std::io::stdout())
 }
 
+fn label_of(v: &Value, id: &str) -> String {
+    v["fans"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|f| f["id"] == id)
+        .and_then(|f| f["label"].as_str())
+        .unwrap_or(id)
+        .to_owned()
+}
+
+/// What the chip read at the end of a probe, for a message.
+fn chip(r: &Value) -> String {
+    r["duty_after"]
+        .as_u64()
+        .map_or_else(|| "an unknown duty".into(), |d| format!("{d}%"))
+}
+
 struct Term<'a> {
     input: &'a mut dyn BufRead,
     out: &'a mut dyn Write,
@@ -200,6 +218,7 @@ pub fn run(api: &dyn Api, input: &mut dyn BufRead, out: &mut dyn Write) -> Resul
         })
     };
 
+    let mut candidates: Vec<String> = Vec::new();
     for p in v["proposals"].as_array().into_iter().flatten() {
         let (Some(role), Some(id)) = (p["role"].as_str(), p["id"].as_str()) else {
             continue;
@@ -213,6 +232,7 @@ pub fn run(api: &dyn Api, input: &mut dyn BufRead, out: &mut dyn Write) -> Resul
                 .or_insert_with(|| Role::Many(Vec::new()))
             {
                 m.push(id.to_owned());
+                candidates.push(id.to_owned());
             }
         } else if roles.contains_key(role) {
             continue;
@@ -223,6 +243,40 @@ pub fn run(api: &dyn Api, input: &mut dyn BufRead, out: &mut dyn Write) -> Resul
             "  {role} <- {id}  ({})",
             p["why"].as_str().unwrap_or("")
         ));
+    }
+
+    // A header can exist as a channel with no header behind it: the chip then ignores writes.
+    // Each new candidate runs at 100% once (raise-only, agent paused by the daemon); one whose
+    // write does not land is not worth controlling.
+    if !candidates.is_empty() {
+        t.say(&format!(
+            "\nChecking {} case fan{}: each runs at 100% for 5 s, one at a time.",
+            candidates.len(),
+            if candidates.len() == 1 { "" } else { "s" }
+        ));
+    }
+    for id in candidates {
+        let label = label_of(&v, &id);
+        let left_out = match api.probe(&id) {
+            Ok(r) if r["landed"] == true => {
+                t.say(&format!("  {label}: the write landed"));
+                None
+            }
+            Ok(r) => Some(format!(
+                "{label} rejects writes (chip stays at {}): left out",
+                chip(&r)
+            )),
+            Err(e) => Some(format!("{label} could not be checked ({e}): left out")),
+        };
+        if let Some(why) = left_out {
+            t.say(&format!("  {why}"));
+            if let Some(Role::Many(m)) = roles.get_mut(CASE_FANS) {
+                m.retain(|i| *i != id);
+            }
+        }
+    }
+    if roles.get(CASE_FANS) == Some(&Role::Many(Vec::new())) {
+        roles.remove(CASE_FANS);
     }
 
     let unmapped: Vec<_> = strings(&v["unmapped_roles"])
@@ -289,7 +343,16 @@ pub fn run_probe(api: &dyn Api, fan: &str, out: &mut dyn Write) -> Result<(), St
         .unwrap_or(fan);
     let _ = writeln!(out, "Running '{label}' ({fan}) at 100% for 5 s...");
     let r = api.probe(fan)?;
-    let _ = writeln!(out, "  {}\nNothing was saved.", pairing_line(&r, fan));
+    let landed = if r["landed"] == true {
+        format!("the write landed (the chip reads {})", chip(&r))
+    } else {
+        format!("it rejects writes (chip stays at {})", chip(&r))
+    };
+    let _ = writeln!(
+        out,
+        "  {}\n  {landed}\nNothing was saved.",
+        pairing_line(&r, fan)
+    );
     Ok(())
 }
 
@@ -304,6 +367,7 @@ mod tests {
         identity: Value,
         probe_result: Value,
         probe_error: Option<String>,
+        per_fan: std::collections::HashMap<String, Result<Value, String>>,
         probed: RefCell<Vec<String>>,
         saved: RefCell<Option<Value>>,
         accepted: RefCell<u32>,
@@ -315,6 +379,9 @@ mod tests {
         }
         fn probe(&self, fan: &str) -> Result<Value, String> {
             self.probed.borrow_mut().push(fan.into());
+            if let Some(r) = self.per_fan.get(fan) {
+                return r.clone();
+            }
             match &self.probe_error {
                 Some(e) => Err(e.clone()),
                 None => Ok(self.probe_result.clone()),
@@ -352,6 +419,7 @@ mod tests {
                     proposal("cpu_fan", "h0", "its label says CPU"),
                     proposal("case_fans", "h1", "a fan header"),
                     proposal("case_fans", "h2", "a fan header"),
+                    proposal("pump", "p0", "a pump by its kind or label"),
                 ],
                 "fans": [
                     fan("nvml_GPU-a_fan0", "GPU 0 fan 0", "fan", 900),
@@ -363,7 +431,7 @@ mod tests {
             }),
             probe_result: json!({
                 "rpm_before": [["h1", 500]], "rpm_after": [["h1", 1300]],
-                "pairing": {"result": "own"},
+                "pairing": {"result": "own"}, "landed": true, "duty_after": 100,
             }),
             ..Fake::default()
         }
@@ -376,8 +444,7 @@ mod tests {
     }
 
     fn mapped(api: &mut Fake) {
-        api.identity["roles"] =
-            json!({"gpu_fan": "nvml_GPU-a_fan0", "cpu_fan": "h0", "case_fans": ["h1", "h2"]});
+        api.identity["roles"] = json!({"gpu_fan": "nvml_GPU-a_fan0", "cpu_fan": "h0", "pump": "p0", "case_fans": ["h1", "h2"]});
     }
 
     #[test]
@@ -387,7 +454,7 @@ mod tests {
         let saved = api.saved.borrow().clone().unwrap();
         assert_eq!(
             saved,
-            json!({"gpu_fan": "nvml_GPU-a_fan0", "cpu_fan": "h0", "case_fans": ["h1", "h2"]})
+            json!({"gpu_fan": "nvml_GPU-a_fan0", "cpu_fan": "h0", "pump": "p0", "case_fans": ["h1", "h2"]})
         );
         assert_eq!(*api.accepted.borrow(), 1);
         for want in [
@@ -401,14 +468,72 @@ mod tests {
         }
     }
 
+    fn rejects(api: &mut Fake, fan: &str, chip: u8) {
+        api.per_fan.insert(
+            fan.into(),
+            Ok(
+                json!({"rpm_before": [], "rpm_after": [], "pairing": {"result": "none"},
+                      "landed": false, "duty_after": chip}),
+            ),
+        );
+    }
+
     #[test]
-    fn it_never_probes_or_asks_where_a_fan_is() {
+    fn each_new_case_fans_candidate_is_probed_once_and_never_a_pump_or_another_role() {
         let api = pc();
-        let out = go(&api, "\ny\ny\ny\nfront\n");
-        assert!(api.probed.borrow().is_empty());
-        for no in ["100%", "louder", "front/rear", "Fan 'System Fan"] {
+        let out = go(&api, "\n");
+        assert_eq!(*api.probed.borrow(), ["h1", "h2"]);
+        assert!(
+            out.contains("100% for 5 s"),
+            "tells you it runs the fans: {out}"
+        );
+        for no in ["louder", "front/rear"] {
             assert!(!out.contains(no), "{no}: {out}");
         }
+    }
+
+    #[test]
+    fn a_candidate_that_rejects_writes_is_left_out_and_listed_with_the_chip_duty() {
+        let mut api = pc();
+        rejects(&mut api, "h2", 50);
+        let out = go(&api, "\n");
+        assert!(
+            out.contains("System Fan #2 rejects writes (chip stays at 50%): left out"),
+            "{out}"
+        );
+        let saved = api.saved.borrow().clone().unwrap();
+        assert_eq!(saved["case_fans"], json!(["h1"]));
+        let summary = out.split("Roles to save:").nth(1).unwrap();
+        assert!(!summary.contains("h2"), "{out}");
+    }
+
+    #[test]
+    fn when_no_candidate_lands_there_is_no_case_fans_role() {
+        let mut api = pc();
+        rejects(&mut api, "h1", 50);
+        rejects(&mut api, "h2", 50);
+        go(&api, "\n");
+        let saved = api.saved.borrow().clone().unwrap();
+        assert!(saved.get("case_fans").is_none(), "{saved}");
+        assert_eq!(saved["cpu_fan"], "h0");
+    }
+
+    #[test]
+    fn a_candidate_that_cannot_be_checked_is_left_out_with_the_reason() {
+        let mut api = pc();
+        api.per_fan.insert(
+            "h1".into(),
+            Err("the safety latch holds every fan at 100%".into()),
+        );
+        let out = go(&api, "\n");
+        assert!(
+            out.contains("System Fan #1 could not be checked (the safety latch holds every fan at 100%): left out"),
+            "{out}"
+        );
+        assert_eq!(
+            api.saved.borrow().clone().unwrap()["case_fans"],
+            json!(["h2"])
+        );
     }
 
     #[test]
@@ -439,6 +564,11 @@ mod tests {
         let saved = api.saved.borrow().clone().unwrap();
         assert_eq!(saved["cpu_fan"], "h1");
         assert_eq!(saved["case_fans"], json!(["h2", "h3"]));
+        assert_eq!(
+            *api.probed.borrow(),
+            ["h3"],
+            "only the new candidate is probed"
+        );
     }
 
     #[test]
@@ -483,6 +613,17 @@ mod tests {
         assert!(out.contains("its own tach rose (500 -> 1300 RPM)"), "{out}");
         assert!(out.contains("System Fan #1"), "{out}");
         assert!(api.saved.borrow().is_none() && *api.accepted.borrow() == 0);
+    }
+
+    #[test]
+    fn probe_also_says_whether_the_write_landed() {
+        let mut api = pc();
+        assert!(probe_out(&api, "h1")
+            .unwrap()
+            .contains("the write landed (the chip reads 100%)"));
+        rejects(&mut api, "h1", 50);
+        let out = probe_out(&api, "h1").unwrap();
+        assert!(out.contains("rejects writes (chip stays at 50%)"), "{out}");
     }
 
     #[test]

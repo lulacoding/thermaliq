@@ -87,9 +87,9 @@ Test-Path "$dir\roles.toml"
 Get-Content "$dir\roles.toml"
 ```
 
-**Expect:** each run prints the board and the problems, then the proposals (`case_fans <- ...` once per System Fan), then "Roles to save:" with `case_fans = lhm_nct6687d_0_fan_2, ...` and "Save these? [Y/n]". It does **not** run any fan and asks nothing about front/rear/top. On the first run type `n`: "Nothing was saved." On the second press **Enter**: "Saved. Restart the ThermalIQ service...".
+**Expect:** each run prints the board and the problems, then the proposals (`case_fans <- ...` once per System Fan), then "Roles to save:" with `case_fans = lhm_nct6687d_0_fan_2, ...` and "Save these? [Y/n]". It then checks each new `case_fans` candidate: "Checking 6 case fans: each runs at 100% for 5 s, one at a time." (about 30 s; you will hear each fan go up in turn), with one line per fan. It asks nothing about front/rear/top, and never runs the pump. On the first run type `n`: "Nothing was saved." On the second press **Enter**: "Saved. Restart the ThermalIQ service...".
 
-**Pass:** `Test-Path` says `False` after the `n`. After the Enter, `roles.toml` has `gpu_fan`, `cpu_fan`, `pump`, `cpu_temp`, `gpu_temp` as single ids and `case_fans` as a list of the System Fan headers. The pump header (`lhm_nct6687d_0_fan_1`, "Pump Fan") is **not** in `case_fans`.
+**Pass:** `Test-Path` says `False` after the `n`. After the Enter, `roles.toml` has `gpu_fan`, `cpu_fan`, `pump`, `cpu_temp`, `gpu_temp` as single ids and `case_fans` as a list of the System Fan headers that took the write. On this board expect `System Fan #6 rejects writes (chip stays at 50%): left out` and 5 members (#1 to #5; #4 and #5 have no header but accept writes, so they are kept). The pump header (`lhm_nct6687d_0_fan_1`, "Pump Fan") is **not** in `case_fans`.
 
 ## 3. `identify --probe`, and the agent during it
 
@@ -157,7 +157,7 @@ $case | Select-Object id, label, rpm, duty_percent, curve_duty, commanded_duty |
 Get-Content "$dir\service.log" -Tail 30
 ```
 
-**Pass:** `roles` matches `roles.toml`, `inventory` shows nothing new/missing/changed, `degraded` is false, and `problems` names no role. The two numbers on the "case_fans members" line are equal, and they equal the number of System Fans (6 here). Check `commanded_duty`, not `curve_duty`: `curve_duty` is the curve's answer before the floor, so 20 to 21 there is expected, while `commanded_duty` is what was written and must be 30 or more for every member. If a member's `commanded_duty` is stuck, or `degraded_reasons` names it (`fan '...': 5 or more writes in a row failed (...)`), copy the line: the bridge refused the write (last time `fan_7` held 47 to 49).
+**Pass:** `roles` matches `roles.toml`, `inventory` shows nothing new/missing/changed, `degraded` is false, and `problems` names no role. The two numbers on the "case_fans members" line are equal, and they equal the number of System Fans identify kept (5 on this board: see step 2). Check `commanded_duty`, not `curve_duty`: `curve_duty` is the curve's answer before the floor, so 20 to 21 there is expected, while `commanded_duty` is what was written and must be 30 or more for every member. If a member's `commanded_duty` is stuck, or `degraded_reasons` names it (`fan '...': 5 or more writes in a row failed (...)`), copy the line: the bridge refused the write (last time `fan_7` held 47 to 49).
 
 ## 6. A changed board
 
@@ -226,7 +226,7 @@ Get-Service ThermalIQ -ErrorAction SilentlyContinue
 
 Needs the service from steps 1 to 5 installed and running with `roles.toml` mapped. If you already ran step 8, run steps 1 and 2 again first (they install, map and start it), then `Restart-Service ThermalIQ; Start-Sleep 20`. Don't run this while step 7 or 8 is in progress.
 
-It polls `/status` and `/fans` every 10 s for 15 minutes and logs `fan_7` (System Fan #6, `lhm_nct6687d_0_fan_7`): what the fan reports (`duty_percent`) against what the engine last wrote (`commanded_duty`), plus `degraded` and its reasons. It reads only.
+It polls `/status` and `/fans` every 10 s for 15 minutes and logs `fan_7` (System Fan #6, `lhm_nct6687d_0_fan_7`; set `$fan` to another id to watch a different header): what the fan reports (`duty_percent`) against what the engine last wrote (`commanded_duty`), plus `degraded` and its reasons. It reads only.
 
 ```powershell
 $api = 'http://127.0.0.1:7272'
@@ -234,18 +234,20 @@ $dir = "$env:ProgramData\ThermalIQ"
 $fan = 'lhm_nct6687d_0_fan_7'
 $csv = "$env:TEMP\m13-soak.csv"
 $begin = Get-Content "$dir\service.log" -ErrorAction SilentlyContinue | Measure-Object | Select-Object -ExpandProperty Count
-"time,state,degraded,duty_percent,commanded_duty,curve_duty,reasons" | Set-Content $csv
+"time,state,degraded,duty_percent,commanded_duty,curve_duty,reasons" | Set-Content $csv -Encoding ascii
 1..90 | ForEach-Object {
     $t = Get-Date -Format 'HH:mm:ss'
     try {
         $s = Invoke-RestMethod "$api/status" -TimeoutSec 5
         $f = @((Invoke-RestMethod "$api/fans" -TimeoutSec 5)) | Where-Object { $_.id -eq $fan }
-        "$t,up,$($s.degraded),$($f.duty_percent),$($f.commanded_duty),$($f.curve_duty),""$($s.degraded_reasons -join ' | ')"""
+        $row = "$t,up,$($s.degraded),$($f.duty_percent),$($f.commanded_duty),$($f.curve_duty),""$($s.degraded_reasons -join ' | ')"""
     } catch {
-        "$t,UNREACHABLE,,,,,""$($_.Exception.Message)"""
+        $row = "$t,UNREACHABLE,,,,,""$($_.Exception.Message)"""
     }
+    Add-Content $csv $row -Encoding ascii
+    $row
     Start-Sleep -Seconds 10
-} | Tee-Object -Append $csv
+}
 "service: $((Get-Service ThermalIQ).Status)"
 Get-Content $csv | ConvertFrom-Csv | Group-Object state, degraded | Select-Object Count, Name | Format-Table
 Get-Content "$dir\service.log" | Select-Object -Skip $begin | Select-String 'lifecycle|STOP FAILED|UNEXPECTED|panick'
@@ -253,6 +255,6 @@ Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Service Con
     Where-Object { $_.Message -match 'ThermalIQ' } | Select-Object TimeCreated, Id, Message | Format-Table -Wrap
 ```
 
-**Pass:** 90 rows, none `UNREACHABLE`, `service: Running` at the end, and no `lifecycle:` stop line, `STOP FAILED` or `UNEXPECTED` after the start. No Service Control Manager events for ThermalIQ (a 7031 or 7034 means the process died). `degraded` stays `False` except for rows where `reasons` names `fan_7`; those rows show `commanded_duty` unchanged while the curve moves, which is the failed write now reported instead of silent. Paste `$csv` (`Get-Content $env:TEMP\m13-soak.csv`) whatever happens.
+**Pass:** 90 rows, none `UNREACHABLE`, `service: Running` at the end, and no `lifecycle:` stop line, `STOP FAILED` or `UNEXPECTED` after the start. No Service Control Manager events for ThermalIQ (a 7031 or 7034 means the process died). `degraded` stays `False` for all 90 rows: `fan_7` is no longer in `case_fans`, so nothing writes to it, `commanded_duty` is blank and `reasons` is empty. (If it still names `fan_7`, identify did not leave it out: paste the step 2 output.) Paste `$csv` (`Get-Content $env:TEMP\m13-soak.csv`) whatever happens.
 
 **If it goes `UNREACHABLE`:** paste the rows around it, the `lifecycle:` lines (a stop with a reason is a clean stop; no line at all means the process was killed or crashed), the Service Control Manager events, and `Get-Content "$dir\service.log" -Tail 40`.
