@@ -1717,7 +1717,7 @@ mod tests {
         assert_eq!(api.probe("f2").unwrap()["pairing"]["result"], "own");
         // The server's own words come back, not a bare status.
         assert!(api.probe("nope").unwrap_err().contains("nope"));
-        let want = BTreeMap::from([("case_rear".to_owned(), "ghost".to_owned())]);
+        let want = json!({"case_fans": ["f1", "ghost"]});
         assert!(api.put_roles(&want).unwrap_err().contains("ghost"));
         assert!(HttpApi::new(port, "wrong".into())
             .accept_inventory()

@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
 use std::time::Duration;
-use thermaliq_common::identity::Heard;
+use thermaliq_common::identity::{Role, CASE_FANS};
 
 /// A probe holds a fan for 5 s before it answers.
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -14,7 +14,7 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 pub trait Api {
     fn identity(&self) -> Result<Value, String>;
     fn probe(&self, fan: &str) -> Result<Value, String>;
-    fn put_roles(&self, roles: &BTreeMap<String, String>) -> Result<(), String>;
+    fn put_roles(&self, roles: &Value) -> Result<(), String>;
     fn accept_inventory(&self) -> Result<(), String>;
 }
 
@@ -86,7 +86,7 @@ impl Api for HttpApi {
     fn probe(&self, fan: &str) -> Result<Value, String> {
         self.call("POST", "/identify/probe", Some(json!({ "fan": fan })))
     }
-    fn put_roles(&self, roles: &BTreeMap<String, String>) -> Result<(), String> {
+    fn put_roles(&self, roles: &Value) -> Result<(), String> {
         self.call("PUT", "/roles", Some(json!({ "roles": roles })))
             .map(drop)
     }
@@ -95,8 +95,7 @@ impl Api for HttpApi {
     }
 }
 
-/// `thermaliq-daemon identify`.
-pub fn run_interactive() -> Result<(), String> {
+fn http_api() -> Result<HttpApi, String> {
     let dir = store::data_dir().map_err(|e| e.to_string())?;
     let port = store::load_config(&dir)
         .map_err(|e| format!("config.toml: {e}"))?
@@ -104,11 +103,21 @@ pub fn run_interactive() -> Result<(), String> {
     let token = store::load_token(&dir)
         .map_err(|e| format!("token.txt: {e}"))?
         .ok_or("token.txt is missing: run install-service first")?;
+    Ok(HttpApi::new(port, token))
+}
+
+/// `thermaliq-daemon identify`.
+pub fn run_interactive() -> Result<(), String> {
     run(
-        &HttpApi::new(port, token),
+        &http_api()?,
         &mut std::io::stdin().lock(),
         &mut std::io::stdout(),
     )
+}
+
+/// `thermaliq-daemon identify --probe <fan-id>`.
+pub fn run_probe_interactive(fan: &str) -> Result<(), String> {
+    run_probe(&http_api()?, fan, &mut std::io::stdout())
 }
 
 struct Term<'a> {
@@ -169,18 +178,9 @@ fn pairing_line(v: &Value, fan: &str) -> String {
     }
 }
 
-fn heard(answer: &str) -> Option<Heard> {
-    match answer {
-        "front" | "f" => Some(Heard::Front),
-        "rear" | "r" | "back" => Some(Heard::Rear),
-        "top" | "t" => Some(Heard::Top),
-        "none" | "n" | "" => Some(Heard::None),
-        _ => None,
-    }
-}
-
-/// Walks the user through the fans. Saves on `y` or a bare Enter at "Save these? [Y/n]"; `n`, `q`
-/// or the end of input saves nothing.
+/// Shows what the daemon would map, then asks "Save these? [Y/n]". `y` or a bare Enter saves
+/// `roles.toml` and accepts the inventory; `n`, `q` or the end of input saves nothing. It never
+/// probes a fan and never asks where one is (SPEC §5.2).
 pub fn run(api: &dyn Api, input: &mut dyn BufRead, out: &mut dyn Write) -> Result<(), String> {
     let mut t = Term { input, out };
     let v = api.identity()?;
@@ -190,71 +190,39 @@ pub fn run(api: &dyn Api, input: &mut dyn BufRead, out: &mut dyn Write) -> Resul
     for p in strings(&v["problems"]) {
         t.say(&format!("Problem: {p}"));
     }
-    let mut roles: BTreeMap<String, String> = v["roles"]
-        .as_object()
-        .map(|o| {
-            o.iter()
-                .filter_map(|(r, i)| Some((r.clone(), i.as_str()?.to_owned())))
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut roles: BTreeMap<String, Role> =
+        serde_json::from_value(v["roles"].clone()).unwrap_or_default();
     let before = roles.clone();
+    let used = |roles: &BTreeMap<String, Role>, id: &str| {
+        roles.values().any(|r| match r {
+            Role::One(i) => i == id,
+            Role::Many(m) => m.iter().any(|i| i == id),
+        })
+    };
 
     for p in v["proposals"].as_array().into_iter().flatten() {
         let (Some(role), Some(id)) = (p["role"].as_str(), p["id"].as_str()) else {
             continue;
         };
-        if !roles.contains_key(role) && !roles.values().any(|i| i == id) {
-            t.say(&format!(
-                "  {role} <- {id}  ({})",
-                p["why"].as_str().unwrap_or("")
-            ));
-            roles.insert(role.to_owned(), id.to_owned());
-        }
-    }
-
-    // A pump is never probed here: a probe only raises a fan, but a pump's role comes from its
-    // kind or label, and what it cools is M20d's.
-    for f in v["fans"].as_array().into_iter().flatten() {
-        let (Some(id), Some(label)) = (f["id"].as_str(), f["label"].as_str()) else {
-            continue;
-        };
-        if f["controllable"] != true || f["kind"] == "pump" || roles.values().any(|i| i == id) {
+        if used(&roles, id) {
             continue;
         }
-        t.say(&format!("\nFan '{label}' ({id}) has no role."));
-        let Some(go) = t.ask("Run it at 100% for 5 s to find out what it is? [Y/n, q to stop]")
-        else {
-            t.say("Stopped. Nothing was saved.");
-            return Ok(());
-        };
-        if go.starts_with('n') {
+        if role == CASE_FANS {
+            if let Role::Many(m) = roles
+                .entry(role.to_owned())
+                .or_insert_with(|| Role::Many(Vec::new()))
+            {
+                m.push(id.to_owned());
+            }
+        } else if roles.contains_key(role) {
             continue;
+        } else {
+            roles.insert(role.to_owned(), Role::One(id.to_owned()));
         }
-        match api.probe(id) {
-            Ok(r) => t.say(&format!("  {}", pairing_line(&r, id))),
-            Err(e) => {
-                t.say(&format!("  could not probe it: {e}"));
-                continue;
-            }
-        }
-        let mut answer = None;
-        for _ in 0..3 {
-            let Some(a) = t.ask("Which fan got louder? [front/rear/top/none, q to stop]") else {
-                t.say("Stopped. Nothing was saved.");
-                return Ok(());
-            };
-            if let Some(h) = heard(&a) {
-                answer = Some(h);
-                break;
-            }
-            t.say("  please answer front, rear, top or none");
-        }
-        if let Some(role) = answer.and_then(Heard::role) {
-            if let Some(old) = roles.insert(role.to_owned(), id.to_owned()) {
-                t.say(&format!("  {role} was {old}; it is {id} now"));
-            }
-        }
+        t.say(&format!(
+            "  {role} <- {id}  ({})",
+            p["why"].as_str().unwrap_or("")
+        ));
     }
 
     let unmapped: Vec<_> = strings(&v["unmapped_roles"])
@@ -271,7 +239,11 @@ pub fn run(api: &dyn Api, input: &mut dyn BufRead, out: &mut dyn Write) -> Resul
     if roles != before {
         t.say("\nRoles to save:");
         for (r, i) in &roles {
-            t.say(&format!("  {r} = {i}"));
+            let ids = match i {
+                Role::One(id) => id.clone(),
+                Role::Many(m) => m.join(", "),
+            };
+            t.say(&format!("  {r} = {ids}"));
         }
         if t.ask("Save these? [Y/n]")
             .is_none_or(|a| a.starts_with('n'))
@@ -279,7 +251,7 @@ pub fn run(api: &dyn Api, input: &mut dyn BufRead, out: &mut dyn Write) -> Resul
             t.say("Nothing was saved.");
             return Ok(());
         }
-        api.put_roles(&roles)?;
+        api.put_roles(&json!(roles))?;
         api.accept_inventory()?;
         t.say("Saved. Restart the ThermalIQ service so profiles use these roles.");
         return Ok(());
@@ -304,6 +276,23 @@ pub fn run(api: &dyn Api, input: &mut dyn BufRead, out: &mut dyn Write) -> Resul
     Ok(())
 }
 
+/// `thermaliq-daemon identify --probe <fan>`: runs that one fan at 100% for 5 s and says which
+/// tach rose. Opt-in, and it saves nothing.
+pub fn run_probe(api: &dyn Api, fan: &str, out: &mut dyn Write) -> Result<(), String> {
+    let v = api.identity()?;
+    let label = v["fans"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|f| f["id"] == fan)
+        .and_then(|f| f["label"].as_str())
+        .unwrap_or(fan);
+    let _ = writeln!(out, "Running '{label}' ({fan}) at 100% for 5 s...");
+    let r = api.probe(fan)?;
+    let _ = writeln!(out, "  {}\nNothing was saved.", pairing_line(&r, fan));
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -316,7 +305,7 @@ mod tests {
         probe_result: Value,
         probe_error: Option<String>,
         probed: RefCell<Vec<String>>,
-        saved: RefCell<Option<BTreeMap<String, String>>>,
+        saved: RefCell<Option<Value>>,
         accepted: RefCell<u32>,
     }
 
@@ -331,7 +320,7 @@ mod tests {
                 None => Ok(self.probe_result.clone()),
             }
         }
-        fn put_roles(&self, roles: &BTreeMap<String, String>) -> Result<(), String> {
+        fn put_roles(&self, roles: &Value) -> Result<(), String> {
             *self.saved.borrow_mut() = Some(roles.clone());
             Ok(())
         }
@@ -341,28 +330,35 @@ mod tests {
         }
     }
 
-    fn fan(id: &str, label: &str, kind: &str) -> Value {
-        json!({"id": id, "label": label, "kind": kind, "rpm": 800, "controllable": true})
+    fn fan(id: &str, label: &str, kind: &str, rpm: u32) -> Value {
+        json!({"id": id, "label": label, "kind": kind, "rpm": rpm, "controllable": true})
     }
 
+    fn proposal(role: &str, id: &str, why: &str) -> Value {
+        json!({"role": role, "id": id, "why": why})
+    }
+
+    /// This PC: System Fan #1 and #2 (no tach), a CPU fan, a pump and the GPU fan.
     fn pc() -> Fake {
         Fake {
             identity: json!({
                 "board": "TEST BOARD",
                 "problems": [],
                 "roles": {},
-                "unmapped_roles": ["cpu_fan", "pump", "case_front", "case_rear", "case_top", "gpu_fan", "cpu_temp", "gpu_temp"],
+                "unmapped_roles": ["cpu_fan", "pump", "gpu_fan", "case_fans", "cpu_temp", "gpu_temp"],
                 "inventory": {"new": [], "missing": [], "changed": [], "board_changed": null},
                 "proposals": [
-                    {"role": "gpu_fan", "id": "nvml_GPU-a_fan0", "why": "an NVIDIA GPU fan"},
-                    {"role": "cpu_fan", "id": "h0", "why": "its label says CPU"},
+                    proposal("gpu_fan", "nvml_GPU-a_fan0", "an NVIDIA GPU fan"),
+                    proposal("cpu_fan", "h0", "its label says CPU"),
+                    proposal("case_fans", "h1", "a fan header"),
+                    proposal("case_fans", "h2", "a fan header"),
                 ],
                 "fans": [
-                    fan("nvml_GPU-a_fan0", "GPU 0 fan 0", "fan"),
-                    fan("h0", "CPU Fan", "fan"),
-                    fan("h1", "System Fan #1", "fan"),
-                    fan("h2", "System Fan #2", "fan"),
-                    fan("p0", "Pump Fan", "pump"),
+                    fan("nvml_GPU-a_fan0", "GPU 0 fan 0", "fan", 900),
+                    fan("h0", "CPU Fan", "fan", 800),
+                    fan("h1", "System Fan #1", "fan", 0),
+                    fan("h2", "System Fan #2", "fan", 0),
+                    fan("p0", "Pump Fan", "pump", 2000),
                 ],
             }),
             probe_result: json!({
@@ -379,80 +375,85 @@ mod tests {
         String::from_utf8(out).unwrap()
     }
 
+    fn mapped(api: &mut Fake) {
+        api.identity["roles"] =
+            json!({"gpu_fan": "nvml_GPU-a_fan0", "cpu_fan": "h0", "case_fans": ["h1", "h2"]});
+    }
+
     #[test]
-    fn it_proposes_what_it_is_sure_of_asks_about_the_rest_and_saves_after_a_yes() {
+    fn it_shows_the_proposals_with_the_case_fans_list_and_enter_saves_them() {
         let api = pc();
-        let out = go(&api, "y\nfront\ny\nrear\ny\n");
-        assert_eq!(*api.probed.borrow(), ["h1", "h2"]);
+        let out = go(&api, "\n");
         let saved = api.saved.borrow().clone().unwrap();
-        assert_eq!(saved["gpu_fan"], "nvml_GPU-a_fan0");
-        assert_eq!(saved["cpu_fan"], "h0");
-        assert_eq!(saved["case_front"], "h1");
-        assert_eq!(saved["case_rear"], "h2");
+        assert_eq!(
+            saved,
+            json!({"gpu_fan": "nvml_GPU-a_fan0", "cpu_fan": "h0", "case_fans": ["h1", "h2"]})
+        );
         assert_eq!(*api.accepted.borrow(), 1);
-        assert!(out.contains("its own tach rose (500 -> 1300 RPM)"), "{out}");
-        assert!(out.contains("Restart the ThermalIQ service"), "{out}");
-    }
-
-    #[test]
-    fn a_pump_and_a_fan_that_already_has_a_role_are_never_probed() {
-        let api = pc();
-        go(&api, "n\nn\n");
-        assert!(!api.probed.borrow().iter().any(|f| f == "p0" || f == "h0"));
-    }
-
-    #[test]
-    fn answering_none_leaves_the_fan_unmapped() {
-        let api = pc();
-        go(&api, "y\nnone\nn\ny\n");
-        let saved = api.saved.borrow().clone().unwrap();
-        assert!(!saved.values().any(|i| i == "h1"));
-    }
-
-    #[test]
-    fn the_end_of_input_or_q_saves_nothing() {
-        for answers in ["", "q\n", "y\nq\n", "y\nfront\ny\nq\n", "y\nfront\nn\n"] {
-            let api = pc();
-            go(&api, answers);
-            assert!(api.saved.borrow().is_none(), "{answers:?}");
-            assert_eq!(*api.accepted.borrow(), 0, "{answers:?}");
+        for want in [
+            "case_fans",
+            "h1",
+            "h2",
+            "Save these? [Y/n]",
+            "Restart the ThermalIQ service",
+        ] {
+            assert!(out.contains(want), "{want}: {out}");
         }
     }
 
     #[test]
-    fn declining_the_save_saves_nothing() {
+    fn it_never_probes_or_asks_where_a_fan_is() {
         let api = pc();
-        go(&api, "n\nn\nn\n");
-        assert!(api.saved.borrow().is_none());
-        assert_eq!(*api.accepted.borrow(), 0);
+        let out = go(&api, "\ny\ny\ny\nfront\n");
+        assert!(api.probed.borrow().is_empty());
+        for no in ["100%", "louder", "front/rear", "Fan 'System Fan"] {
+            assert!(!out.contains(no), "{no}: {out}");
+        }
     }
 
     #[test]
-    fn a_failed_probe_is_reported_and_the_fan_skipped() {
+    fn y_and_a_bare_enter_save_and_n_q_or_the_end_of_input_save_nothing() {
+        for yes in ["\n", "y\n", "Y\n"] {
+            let api = pc();
+            go(&api, yes);
+            assert!(api.saved.borrow().is_some(), "{yes:?}");
+        }
+        for no in ["n\n", "q\n", ""] {
+            let api = pc();
+            go(&api, no);
+            assert!(api.saved.borrow().is_none(), "{no:?}");
+            assert_eq!(*api.accepted.borrow(), 0, "{no:?}");
+        }
+    }
+
+    #[test]
+    fn a_fan_already_in_another_role_is_not_added_and_an_existing_group_grows() {
         let mut api = pc();
-        api.probe_error = Some("the safety latch holds every fan at 100%".into());
-        let out = go(&api, "y\ny\ny\n");
-        assert!(
-            out.contains("could not probe it: the safety latch"),
-            "{out}"
-        );
+        api.identity["roles"] = json!({"cpu_fan": "h1", "case_fans": ["h2"]});
+        api.identity["proposals"] = json!([
+            proposal("case_fans", "h1", "a fan header"),
+            proposal("case_fans", "h2", "a fan header"),
+            proposal("case_fans", "h3", "a fan header"),
+        ]);
+        go(&api, "\n");
         let saved = api.saved.borrow().clone().unwrap();
-        assert!(!saved.contains_key("case_front"));
+        assert_eq!(saved["cpu_fan"], "h1");
+        assert_eq!(saved["case_fans"], json!(["h2", "h3"]));
     }
 
     #[test]
-    fn a_tach_that_rose_on_another_fan_is_said_not_guessed() {
+    fn what_load_found_is_printed_once_per_line() {
         let mut api = pc();
-        api.probe_result =
-            json!({"rpm_before": [], "rpm_after": [], "pairing": {"result": "other", "fan": "h2"}});
-        let out = go(&api, "y\nn\nn\nn\n");
-        assert!(out.contains("tach of 'h2' rose instead"), "{out}");
+        api.identity["problems"] =
+            json!(["role 'cpu_temp' is not mapped (profiles: balanced, gaming)"]);
+        let out = go(&api, "n\n");
+        assert_eq!(out.matches("Problem: role 'cpu_temp'").count(), 1, "{out}");
     }
 
     #[test]
     fn nothing_to_do_changes_nothing() {
         let mut api = pc();
-        api.identity["roles"] = json!({"gpu_fan": "nvml_GPU-a_fan0", "cpu_fan": "h0", "case_front": "h1", "case_rear": "h2"});
+        mapped(&mut api);
         let out = go(&api, "");
         assert!(out.contains("Nothing changed"), "{out}");
         assert!(api.probed.borrow().is_empty() && api.saved.borrow().is_none());
@@ -461,27 +462,41 @@ mod tests {
     #[test]
     fn a_differing_inventory_can_be_accepted_on_its_own() {
         let mut api = pc();
-        api.identity["roles"] = json!({"gpu_fan": "nvml_GPU-a_fan0", "cpu_fan": "h0", "case_front": "h1", "case_rear": "h2"});
+        mapped(&mut api);
         api.identity["inventory"]["missing"] = json!(["gone"]);
         go(&api, "y\n");
         assert_eq!(*api.accepted.borrow(), 1);
         assert!(api.saved.borrow().is_none());
     }
 
+    fn probe_out(api: &Fake, fan: &str) -> Result<String, String> {
+        let mut out = Vec::new();
+        run_probe(api, fan, &mut out)?;
+        Ok(String::from_utf8(out).unwrap())
+    }
+
     #[test]
-    fn an_unusable_answer_is_asked_again_then_taken_as_none() {
+    fn probe_reports_the_pairing_for_one_fan_and_saves_nothing() {
         let api = pc();
-        let out = go(&api, "y\nmiddle\nlounge\nattic\nn\ny\n");
-        assert_eq!(
-            out.matches("please answer front, rear, top or none")
-                .count(),
-            3
-        );
-        assert!(!api
-            .saved
-            .borrow()
-            .clone()
+        let out = probe_out(&api, "h1").unwrap();
+        assert_eq!(*api.probed.borrow(), ["h1"]);
+        assert!(out.contains("its own tach rose (500 -> 1300 RPM)"), "{out}");
+        assert!(out.contains("System Fan #1"), "{out}");
+        assert!(api.saved.borrow().is_none() && *api.accepted.borrow() == 0);
+    }
+
+    #[test]
+    fn probe_says_when_another_tach_rose_or_none_did_and_passes_an_error_on() {
+        let mut api = pc();
+        api.probe_result =
+            json!({"rpm_before": [], "rpm_after": [], "pairing": {"result": "other", "fan": "h2"}});
+        assert!(probe_out(&api, "h1")
             .unwrap()
-            .contains_key("case_front"));
+            .contains("tach of 'h2' rose instead"));
+        api.probe_result =
+            json!({"rpm_before": [], "rpm_after": [], "pairing": {"result": "none"}});
+        assert!(probe_out(&api, "h1").unwrap().contains("no tach moved"));
+        api.probe_error = Some("the safety latch holds every fan at 100%".into());
+        assert!(probe_out(&api, "h1").unwrap_err().contains("safety latch"));
     }
 }

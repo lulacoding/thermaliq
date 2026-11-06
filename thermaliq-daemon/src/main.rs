@@ -10,7 +10,7 @@ use thermaliq_daemon::app::{self, Token};
 use thermaliq_daemon::store;
 
 const USAGE: &str =
-    "usage: thermaliq-daemon [install-service [--force] | uninstall-service | identify]";
+    "usage: thermaliq-daemon [install-service [--force] | uninstall-service | identify [--probe <fan-id>]]";
 /// Same budget as the service stop.
 const STOP_BUDGET: Duration = Duration::from_secs(8);
 
@@ -20,6 +20,7 @@ fn main() -> ExitCode {
         [] => interactive(),
         // Talks to the running service over its API; touches no hardware itself.
         ["identify"] => thermaliq_daemon::identify_cli::run_interactive(),
+        ["identify", "--probe", fan] => thermaliq_daemon::identify_cli::run_probe_interactive(fan),
         // Internal: started by the daemon in the user's session. Touches no hardware.
         [thermaliq_daemon::foreground::HELPER_ARG] => thermaliq_daemon::foreground::run_helper(),
         #[cfg(windows)]

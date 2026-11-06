@@ -4,15 +4,15 @@
 
 Branch: `m13-identify` (it holds #59 and #60). Use an **admin** PowerShell, and close Fan Control, MSI Center and games first. Don't commit `out\` dumps.
 
-What this does to hardware: `identify` runs one fan at 100% for 5 s at a time, and only ever raises a fan. It never probes a pump. Everything else only reads. Each step that touches a fan says how it gets handed back.
+What this does to hardware: By default `identify` probes nothing: it reads, then writes `roles.toml`. Only `identify --probe <fan-id>` runs a fan (100% for 5 s, only ever a raise), and it saves nothing. Each step that touches a fan says how it gets handed back.
 
 | Step | What it proves |
 |---|---|
-| 1 | Install, first-run inventory baseline, no roles yet |
-| 2 | `identify` end to end: proposals, a probe, the tach pairing, the save |
-| 3 | The agent is paused during a probe and running again after |
+| 1 | Install, first-run inventory baseline, nothing mapped yet |
+| 2 | `identify` proposes `case_fans` (System Fan #1-#6) and Enter saves |
+| 3 | `identify --probe`: the agent is paused during it and running again after |
 | 4 | Ctrl-C in the middle of a probe still puts the profile back |
-| 5 | After a restart the mapping loads and `/identity` shows no problems |
+| 5 | After a restart the mapping loads and every `case_fans` member follows the curve, at 30% or more |
 | 6 | A changed board unmaps every role and says what to run |
 | 7 | `g1.ps1` on the mapped bundled `balanced` profile |
 | 8 | Clean up |
@@ -64,82 +64,90 @@ Get-Content "$dir\inventory.json"
 Get-Content "$dir\service.log"
 ```
 
-**Pass:** `board` names your B550M board, `inventory.json` exists and lists every fan, `inventory` shows nothing new/missing/changed, `roles` is empty, `unmapped_roles` lists all eight roles, and `problems` names each unmapped role (the case fans, `cpu_fan`, and so on) by name. `proposals` includes the GPU fan as `gpu_fan` and a CPU or GPU sensor. `active_profile` is `balanced`. The service log says "first run: saved the fan inventory".
+**Pass:** `board` names your B550M board, `inventory.json` exists and lists every fan, `inventory` shows nothing new/missing/changed, `roles` is empty, and `unmapped_roles` lists all six roles (`cpu_fan`, `pump`, `gpu_fan`, `case_fans`, `cpu_temp`, `gpu_temp`). `problems` has **one line per role** (not one per profile) naming the profiles that use it. `proposals` lists `gpu_fan`, `cpu_fan` (CPU Fan), `pump` (Pump Fan), a CPU and a GPU sensor, and `case_fans` with System Fan #1 to #6 (even though they read 0 RPM). `degraded` is **true** with `degraded_reasons` = `profile 'balanced' controls no fans: run thermaliq-daemon identify`, because nothing is mapped yet. `active_profile` is `balanced`. The service log says "first run: saved the fan inventory".
 
 ## 2. Identify
 
-Pick the window so you can hear the case fans. Keep the agent running here (step 3 needs it).
+First answer `n` to see that nothing is written, then run it again and press Enter:
 
 ```powershell
 & "$pf\thermaliq-daemon.exe" identify
-```
-
-It lists the proposals, then goes through each fan with no role. For each: answer `y` (or Enter) to the probe, listen for 5 s, and answer `front`, `rear`, `top` or `none`. It never offers a pump. Answer `q` once to see that it stops with "Nothing was saved." (then run it again). On the final "Save these? [Y/n]", Enter or `y` saves; `n` saves nothing.
-
-Then:
-
-```powershell
+Test-Path "$dir\roles.toml"
+& "$pf\thermaliq-daemon.exe" identify
 Get-Content "$dir\roles.toml"
-Get-Content "$dir\inventory.json" | Select-Object -First 3
 ```
 
-**Pass:** each probed fan's pairing line matches what you heard (the NCT6687D fans should say "its own tach rose"). Nothing was written before the final prompt. `roles.toml` has exactly what the summary showed. After the prompt, the fan you probed is back where it was (on the BIOS, since the profile does not control it yet).
+**Expect:** each run prints the board and the problems, then the proposals (`case_fans <- ...` once per System Fan), then "Roles to save:" with `case_fans = lhm_nct6687d_0_fan_2, ...` and "Save these? [Y/n]". It does **not** run any fan and asks nothing about front/rear/top. On the first run type `n`: "Nothing was saved." On the second press **Enter**: "Saved. Restart the ThermalIQ service...".
 
-## 3. The agent is paused during a probe
+**Pass:** `Test-Path` says `False` after the `n`. After the Enter, `roles.toml` has `gpu_fan`, `cpu_fan`, `pump`, `cpu_temp`, `gpu_temp` as single ids and `case_fans` as a list of the System Fan headers. The pump header (`lhm_nct6687d_0_fan_1`, "Pump Fan") is **not** in `case_fans`.
 
-In a second admin PowerShell, start this first, then in the first window run `& "$pf\thermaliq-daemon.exe" identify` and answer `y` to one probe, but with an unmapped fan left (reset it first with `Remove-Item "$dir\roles.toml"; Restart-Service ThermalIQ; Start-Sleep 20` if step 2 mapped them all):
+## 3. `identify --probe`, and the agent during it
+
+This runs one System Fan at 100% for 5 s. It reports the tach pairing and saves nothing. System Fan #1 is `lhm_nct6687d_0_fan_2`.
+
+In a **second** admin PowerShell, start this first:
 
 ```powershell
 $api = 'http://127.0.0.1:7272'
 1..40 | ForEach-Object { "{0:HH:mm:ss.f}  agent={1}" -f (Get-Date), (Invoke-RestMethod "$api/status").agent; Start-Sleep -Milliseconds 500 }
 ```
 
-**Pass:** `agent=running`, then `agent=paused` for about 5 s while the fan is at 100%, then `agent=running` again.
+Then, in the first window:
+
+```powershell
+Get-Content "$dir\roles.toml" > "$env:TEMP\roles.before"
+& "$pf\thermaliq-daemon.exe" identify --probe lhm_nct6687d_0_fan_2
+(Compare-Object (Get-Content "$env:TEMP\roles.before") (Get-Content "$dir\roles.toml")).Count
+```
+
+**Pass:** the command prints "Running 'System Fan #1' (lhm_nct6687d_0_fan_2) at 100% for 5 s...", then a pairing line (on this PC probably "no tach moved", since the header reads 0 RPM), then "Nothing was saved." The last line is `0`. In the second window: `agent=running`, then `agent=paused` for about 5 s, then `agent=running` again. Listen: that fan goes up for the 5 s and comes back.
 
 Then pause the agent yourself and probe again:
 
 ```powershell
-Pause-Agent
-& "$pf\thermaliq-daemon.exe" identify
+$h = @{ Authorization = "Bearer $((Get-Content "$dir\token.txt" -Raw).Trim())" }
+Invoke-RestMethod "$api/agent/pause" -Method Post -Headers $h | Out-Null
+& "$pf\thermaliq-daemon.exe" identify --probe lhm_nct6687d_0_fan_2
+(Invoke-RestMethod "$api/status").agent
+Invoke-RestMethod "$api/agent/resume" -Method Post -Headers $h | Out-Null
 (Invoke-RestMethod "$api/status").agent
 ```
 
-**Pass:** the last line says `paused`: a probe resumes the agent only if it paused it.
+**Pass:** the first status line says `paused` (a probe resumes the agent only if it paused it), the second `running`.
 
 ## 4. Ctrl-C in the middle of a probe
 
-Needs an unmapped, controllable case fan (use the reset from step 3 if needed).
-
 ```powershell
-Invoke-RestMethod "$api/agent/resume" -Method Post -Headers @{ Authorization = "Bearer $((Get-Content "$dir\token.txt" -Raw).Trim())" } | Out-Null
-& "$pf\thermaliq-daemon.exe" identify
+& "$pf\thermaliq-daemon.exe" identify --probe lhm_nct6687d_0_fan_2
 ```
 
-Answer `y` to a probe, hear the fan go up, and press **Ctrl-C** about 2 s in. Then:
+Hear the fan go up and press **Ctrl-C** about 2 s in. Then:
 
 ```powershell
 Start-Sleep 8
 (Invoke-RestMethod "$api/status") | Select-Object active_profile, degraded, degraded_reasons, agent | Format-List
-Invoke-RestMethod "$api/fans" | Select-Object id, rpm, duty_percent | Format-Table
+Invoke-RestMethod "$api/fans" | Select-Object id, rpm, duty_percent, curve_duty | Format-Table
 Get-Content "$dir\service.log" -Tail 20
+& "$pf\thermaliq-daemon.exe" identify --probe lhm_nct6687d_0_fan_2
 ```
 
-**Pass:** the fan drops back within a few seconds of the 5 s ending (without Ctrl-C-ing the service), `active_profile` is `balanced`, `agent` is `running`, nothing in `degraded_reasons` says "could not put profile back", and `/identity` still answers. Run `identify` once more and probe the same fan: it must not say another probe is running.
+**Pass:** the fan drops back within a few seconds of the 5 s ending, `active_profile` is `balanced`, `agent` is `running`, nothing in `degraded_reasons` says "could not put profile back", and the last command runs normally (it must not say another probe is running; if it does, wait 2 s and try again once, then report it).
 
-## 5. Restart: the mapping loads
-
-Run `identify` again and map at least the fans you can, then save. Then:
+## 5. Restart: the mapping loads, and the case fans have a floor
 
 ```powershell
 Restart-Service ThermalIQ
 Start-Sleep 20
 Show-Identity
 (Invoke-RestMethod "$api/status") | Select-Object degraded, degraded_reasons, active_profile | Format-List
-Invoke-RestMethod "$api/fans" | Select-Object id, label, rpm, duty_percent, curve_duty | Format-Table
+$ids = @((Invoke-RestMethod "$api/identity").roles.case_fans)
+$case = @(Invoke-RestMethod "$api/fans" | Where-Object { $ids -contains $_.id })
+$case | Select-Object id, label, rpm, duty_percent, curve_duty | Format-Table
+"case_fans members: $($ids.Count); with curve_duty >= 30: $(@($case | Where-Object { $null -ne $_.curve_duty -and $_.curve_duty -ge 30 }).Count)"
 Get-Content "$dir\service.log" -Tail 30
 ```
 
-**Pass:** `roles` matches `roles.toml`, `inventory` shows nothing new/missing/changed, `degraded` is false, and `problems` names only the roles you answered `none` for or left unmapped. The fans you mapped follow the `balanced` curve (`curve_duty` filled in, `duty_percent` close to it).
+**Pass:** `roles` matches `roles.toml`, `inventory` shows nothing new/missing/changed, `degraded` is false, and `problems` names no role. The two numbers on the "case_fans members" line are equal, and they equal the number of System Fans (6 here). Every member has a `curve_duty` of 30 or more, even at a cool idle, where the bundled `balanced` curve alone would ask for less.
 
 ## 6. A changed board
 
@@ -157,7 +165,7 @@ Start-Sleep 20
 Invoke-RestMethod "$api/fans" | Select-Object id, rpm, duty_percent, curve_duty | Format-Table
 ```
 
-**Pass:** `degraded` is true and `degraded_reasons` says the board changed, names both boards, and says to run `thermaliq-daemon identify`. `roles` is empty and every role is in `unmapped_roles`, even though `roles.toml` still has your mapping. The case fans you had mapped have no `curve_duty` any more (the BIOS has them).
+**Pass:** `degraded` is true and `degraded_reasons` has two lines: the board changed (both boards named, and to run `thermaliq-daemon identify`), and `profile 'balanced' controls no fans: run thermaliq-daemon identify`. `roles` is empty and every role is in `unmapped_roles`, even though `roles.toml` still has your mapping. No fan has a `curve_duty` any more (the BIOS has them).
 
 Restart once more, to see it stays that way, then accept:
 
@@ -171,7 +179,7 @@ Restart-Service ThermalIQ; Start-Sleep 20
 (Invoke-RestMethod "$api/identity") | Select-Object board, roles | Format-List
 ```
 
-**Pass:** the first line still says the board changed; after accepting and restarting, `degraded` is false, `board` is your real board, and `roles` is the mapping from step 5 again.
+**Pass:** the first line still says the board changed; after accepting and restarting, `degraded` is false, `board` is your real board, and `roles` is the mapping from step 2 again.
 
 ## 7. G1 on the mapped `balanced` profile
 
