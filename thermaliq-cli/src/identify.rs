@@ -1,123 +1,33 @@
-//! `thermaliq-daemon identify`: the first-run walk through the fans (SPEC §5.2). It talks to the
-//! running daemon over the API, never to hardware: a probe is a request the engine carries out.
+//! `tq identify`: the first-run walk through the fans (SPEC §5.2). It talks to the running
+//! daemon over the API, never to hardware: a probe is a request the engine carries out.
 
-use crate::store;
+use crate::client::Client;
+use crate::CliError;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
-use std::time::Duration;
 use thermaliq_common::identity::{Role, CASE_FANS};
 
-/// A probe holds a fan for 5 s before it answers.
-const CALL_TIMEOUT: Duration = Duration::from_secs(30);
-
 pub trait Api {
-    fn identity(&self) -> Result<Value, String>;
-    fn probe(&self, fan: &str) -> Result<Value, String>;
-    fn put_roles(&self, roles: &Value) -> Result<(), String>;
-    fn accept_inventory(&self) -> Result<(), String>;
+    fn identity(&self) -> Result<Value, CliError>;
+    fn probe(&self, fan: &str) -> Result<Value, CliError>;
+    fn put_roles(&self, roles: &Value) -> Result<(), CliError>;
+    fn accept_inventory(&self) -> Result<(), CliError>;
 }
 
-pub struct HttpApi {
-    base: String,
-    token: String,
-    agent: ureq::Agent,
-}
-
-impl HttpApi {
-    pub fn new(port: u16, token: String) -> Self {
-        Self {
-            base: format!("http://127.0.0.1:{port}"),
-            token,
-            agent: ureq::Agent::config_builder()
-                .timeout_global(Some(CALL_TIMEOUT))
-                .max_redirects(0)
-                .http_status_as_error(false)
-                .build()
-                .into(),
-        }
+impl Api for Client {
+    fn identity(&self) -> Result<Value, CliError> {
+        self.get("/identity")
     }
-
-    fn call(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value, String> {
-        let url = format!("{}{path}", self.base);
-        let auth = format!("Bearer {}", self.token);
-        let sent = match (method, body) {
-            ("GET", _) => self.agent.get(&url).call(),
-            ("POST", None) => self
-                .agent
-                .post(&url)
-                .header("Authorization", &auth)
-                .send_empty(),
-            ("POST", Some(b)) => self
-                .agent
-                .post(&url)
-                .header("Authorization", &auth)
-                .header("Content-Type", "application/json")
-                .send(b.to_string()),
-            (_, b) => self
-                .agent
-                .put(&url)
-                .header("Authorization", &auth)
-                .header("Content-Type", "application/json")
-                .send(b.unwrap_or(Value::Null).to_string()),
-        };
-        let mut res = sent.map_err(|e| {
-            format!(
-                "cannot reach the daemon at {}: {e}. Is the ThermalIQ service running?",
-                self.base
-            )
-        })?;
-        let status = res.status().as_u16();
-        let text = res.body_mut().read_to_string().unwrap_or_default();
-        let value: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-        if status >= 400 {
-            return Err(value["error"]
-                .as_str()
-                .map_or_else(|| format!("HTTP {status}"), str::to_owned));
-        }
-        Ok(value)
+    fn probe(&self, fan: &str) -> Result<Value, CliError> {
+        self.post("/identify/probe", Some(json!({ "fan": fan })))
     }
-}
-
-impl Api for HttpApi {
-    fn identity(&self) -> Result<Value, String> {
-        self.call("GET", "/identity", None)
+    fn put_roles(&self, roles: &Value) -> Result<(), CliError> {
+        self.put("/roles", json!({ "roles": roles })).map(drop)
     }
-    fn probe(&self, fan: &str) -> Result<Value, String> {
-        self.call("POST", "/identify/probe", Some(json!({ "fan": fan })))
+    fn accept_inventory(&self) -> Result<(), CliError> {
+        self.post("/inventory/accept", None).map(drop)
     }
-    fn put_roles(&self, roles: &Value) -> Result<(), String> {
-        self.call("PUT", "/roles", Some(json!({ "roles": roles })))
-            .map(drop)
-    }
-    fn accept_inventory(&self) -> Result<(), String> {
-        self.call("POST", "/inventory/accept", None).map(drop)
-    }
-}
-
-fn http_api() -> Result<HttpApi, String> {
-    let dir = store::data_dir().map_err(|e| e.to_string())?;
-    let port = store::load_config(&dir)
-        .map_err(|e| format!("config.toml: {e}"))?
-        .api_port;
-    let token = store::load_token(&dir)
-        .map_err(|e| format!("token.txt: {e}"))?
-        .ok_or("token.txt is missing: run install-service first")?;
-    Ok(HttpApi::new(port, token))
-}
-
-/// `thermaliq-daemon identify`.
-pub fn run_interactive() -> Result<(), String> {
-    run(
-        &http_api()?,
-        &mut std::io::stdin().lock(),
-        &mut std::io::stdout(),
-    )
-}
-
-/// `thermaliq-daemon identify --probe <fan-id>`.
-pub fn run_probe_interactive(fan: &str) -> Result<(), String> {
-    run_probe(&http_api()?, fan, &mut std::io::stdout())
 }
 
 fn label_of(v: &Value, id: &str) -> String {
@@ -199,7 +109,7 @@ fn pairing_line(v: &Value, fan: &str) -> String {
 /// Shows what the daemon would map, then asks "Save these? [Y/n]". `y` or a bare Enter saves
 /// `roles.toml` and accepts the inventory; `n`, `q` or the end of input saves nothing. It never
 /// probes a fan and never asks where one is (SPEC §5.2).
-pub fn run(api: &dyn Api, input: &mut dyn BufRead, out: &mut dyn Write) -> Result<(), String> {
+pub fn run(api: &dyn Api, input: &mut dyn BufRead, out: &mut dyn Write) -> Result<(), CliError> {
     let mut t = Term { input, out };
     let v = api.identity()?;
     if let Some(b) = v["board"].as_str() {
@@ -330,9 +240,9 @@ pub fn run(api: &dyn Api, input: &mut dyn BufRead, out: &mut dyn Write) -> Resul
     Ok(())
 }
 
-/// `thermaliq-daemon identify --probe <fan>`: runs that one fan at 100% for 5 s and says which
-/// tach rose. Opt-in, and it saves nothing.
-pub fn run_probe(api: &dyn Api, fan: &str, out: &mut dyn Write) -> Result<(), String> {
+/// `tq identify --probe <fan>`: runs that one fan at 100% for 5 s and says which tach rose.
+/// Opt-in, and it saves nothing.
+pub fn run_probe(api: &dyn Api, fan: &str, out: &mut dyn Write) -> Result<(), CliError> {
     let v = api.identity()?;
     let label = v["fans"]
         .as_array()
@@ -367,31 +277,31 @@ mod tests {
         identity: Value,
         probe_result: Value,
         probe_error: Option<String>,
-        per_fan: std::collections::HashMap<String, Result<Value, String>>,
+        per_fan: std::collections::HashMap<String, Result<Value, CliError>>,
         probed: RefCell<Vec<String>>,
         saved: RefCell<Option<Value>>,
         accepted: RefCell<u32>,
     }
 
     impl Api for Fake {
-        fn identity(&self) -> Result<Value, String> {
+        fn identity(&self) -> Result<Value, CliError> {
             Ok(self.identity.clone())
         }
-        fn probe(&self, fan: &str) -> Result<Value, String> {
+        fn probe(&self, fan: &str) -> Result<Value, CliError> {
             self.probed.borrow_mut().push(fan.into());
             if let Some(r) = self.per_fan.get(fan) {
                 return r.clone();
             }
             match &self.probe_error {
-                Some(e) => Err(e.clone()),
+                Some(e) => Err(e.as_str().into()),
                 None => Ok(self.probe_result.clone()),
             }
         }
-        fn put_roles(&self, roles: &Value) -> Result<(), String> {
+        fn put_roles(&self, roles: &Value) -> Result<(), CliError> {
             *self.saved.borrow_mut() = Some(roles.clone());
             Ok(())
         }
-        fn accept_inventory(&self) -> Result<(), String> {
+        fn accept_inventory(&self) -> Result<(), CliError> {
             *self.accepted.borrow_mut() += 1;
             Ok(())
         }
@@ -599,7 +509,7 @@ mod tests {
         assert!(api.saved.borrow().is_none());
     }
 
-    fn probe_out(api: &Fake, fan: &str) -> Result<String, String> {
+    fn probe_out(api: &Fake, fan: &str) -> Result<String, CliError> {
         let mut out = Vec::new();
         run_probe(api, fan, &mut out)?;
         Ok(String::from_utf8(out).unwrap())
@@ -638,6 +548,9 @@ mod tests {
             json!({"rpm_before": [], "rpm_after": [], "pairing": {"result": "none"}});
         assert!(probe_out(&api, "h1").unwrap().contains("no tach moved"));
         api.probe_error = Some("the safety latch holds every fan at 100%".into());
-        assert!(probe_out(&api, "h1").unwrap_err().contains("safety latch"));
+        assert!(probe_out(&api, "h1")
+            .unwrap_err()
+            .msg
+            .contains("safety latch"));
     }
 }

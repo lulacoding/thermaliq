@@ -122,7 +122,7 @@ While the bridge is stopped, its sensors are gone. S3 still applies: a GPU fan w
 
 **Inventory.** `inventory.json` in the data dir: the board fingerprint and every fan (id, label, kind). Checked at every start against the first snapshot: `new`, `missing`, `changed` (label, kind, or the board) are logged and listed in `GET /identity`. The first run saves the baseline. After that it changes only when the user accepts it (`POST /inventory/accept`, or finishing `identify`), so a fan that stays missing is reported until someone decides.
 
-**A different board.** If the saved inventory's board is not the board the bridge reports now (both known, names differ), the same IDs may be other fans. The daemon then loads with every role unmapped (so every role-based control is dropped and those fans go to the BIOS or driver), logs it, and adds a `degraded_reasons` line saying the board changed and to run `thermaliq-daemon identify`. It stays that way across restarts until `identify` finishes or `POST /inventory/accept` saves the new board. An unknown board now (no bridge) is not a change.
+**A different board.** If the saved inventory's board is not the board the bridge reports now (both known, names differ), the same IDs may be other fans. The daemon then loads with every role unmapped (so every role-based control is dropped and those fans go to the BIOS or driver), logs it, and adds a `degraded_reasons` line saying the board changed and to run `tq identify`. It stays that way across restarts until `identify` finishes or `POST /inventory/accept` saves the new board. An unknown board now (no bridge) is not a change.
 
 **Roles.** Bundled profiles name roles, not hardware. Fan roles: `cpu_fan`, `pump`, `gpu_fan`, `case_fans`. Sensor roles: `cpu_temp`, `gpu_temp`. `roles.toml` in the data dir maps a role to a real ID; `case_fans` is a list of IDs, the others are one ID. When a profile loads, each role becomes its mapped ID. An unmapped role is skipped and reported, never silently:
 
@@ -134,19 +134,19 @@ A dropped fan goes to the BIOS or driver, not to a guess. The report is one line
 
 **`case_fans` (design change, Sam, 2026-11-06, from PC check step 2).** There are no front/rear/top roles. This PC's case fans read 0 RPM, so neither tach pairing nor listening can tell its headers apart, and FanControl doesn't know fan locations either. A control on `case_fans` becomes one control per member, with the same curve and settings and `min_pwm = max(the control's, CASE_FANS_MIN_PWM)`, where `CASE_FANS_MIN_PWM = 30`. The floor protects an AIO pump plugged into a System Fan header. An empty or unmapped group is skipped and reported. 0-RPM (`start_percent`/`stop_percent`) is stripped from every member and reported (`profile '<name>': 0-RPM is not allowed on case_fans (a member may be a pump); ignored`), because the engine lets 0-RPM beat `min_pwm`, so it would otherwise stop a pump on a System Fan header. `PUT /roles` checks that every ID exists, and that `case_fans` is a list and the other roles are single IDs.
 
-**An active profile with no controls** (every role unmapped, say) is `degraded` with `profile '<name>' controls no fans: run thermaliq-daemon identify`, for as long as it is active.
+**An active profile with no controls** (every role unmapped, say) is `degraded` with `profile '<name>' controls no fans: run tq identify`, for as long as it is active.
 
 **A profile fan that no backend lists** (after mapping) is reported by name:
 
 - at load: logged, and `degraded` with `degraded_reasons` naming the fan and the profile. The daemon still starts, because S2–S4 and the other fans must keep working;
 - on activation: refused (`POST /profiles/active` and the agent's own switches), with an error naming the fan. The engine stays on the previous profile.
 
-**First-run identification** (`thermaliq-daemon identify`, over the API). No location questions:
+**First-run identification** (`tq identify`, over the API; it lived in the daemon binary until M14). No location questions:
 
 1. **Proposals:** NVML GPU fans become `gpu_fan`. A header's LHM label proposes a role (`CPU Fan` → `cpu_fan`, `Pump` → `pump`). `cpu_temp` and `gpu_temp` are the sensors of kind Cpu and Gpu when there is exactly one. Every other controllable fan of kind `fan` is a `case_fans` candidate, with or without a tach. A fan whose label looks like the CPU fan or a pump but was not proposed for that role (two fit) is left out of `case_fans` and stays unmapped, so a possible pump is never swept in.
 2. **Write check:** each new `case_fans` candidate gets the probe (100% for 5 s, raise-only, agent paused). The probe result says `landed`: true when the engine's commanded duty for that fan (the last write the chip accepted) reached 100 during the hold, plus `duty_after`, the chip's own reading. A candidate that does not land is left out of `case_fans` and listed as `<label> rejects writes (chip stays at X%): left out`; one the probe cannot check (latch, busy, error) is left out too, with the reason. Some boards list more channels than they have headers (LHM shows six System Fan channels on the NCT6687D of the test PC, which has three headers; #6 reads 50% whatever is written). Pumps are never probed. Fans already in `roles.toml` are not probed again.
 3. `identify` prints the proposals, including the `case_fans` list and what was left out, then asks "Save these? [Y/n]". `y` or a bare Enter saves `roles.toml` and accepts the inventory; `n`, `q` or end of input saves nothing.
-4. **`identify --probe <fan-id>`:** runs the probe on that one fan and reports the tach pairing (the fan whose RPM rose) and whether the write landed. A rise on another fan's tach is reported, never guessed. It saves nothing.
+4. **`tq identify --probe <fan-id>`:** runs the probe on that one fan and reports the tach pairing (the fan whose RPM rose) and whether the write landed. A rise on another fan's tach is reported, never guessed. It saves nothing.
 
 A probe only ever raises a fan, never lowers one. It adds one flat-100% control for that fan to the active profile for 5 s, then restores the profile, so the engine stays the only writer (S1) and S2–S4 still win. The hold and the restore run in their own task, so a dropped request (Ctrl-C) still restores. The agent is paused for the probe and resumed afterwards only if it was running, so no profile switch can land inside the hold and be undone. `roles.toml` is written atomically.
 
@@ -160,6 +160,32 @@ M13 is identity only. Which fan cools which component is M20d.
 - Every mutating endpoint needs `Authorization: Bearer <token>`. Read-only endpoints may be open. CORS lists the real production origins (including `http://tauri.localhost` on Windows).
 - UI gets the token through a Tauri command, not by reading files from the webview.
 - History: one transaction per tick. Records: every fan; every CPU/GPU sensor; and every sensor referenced by **any saved profile** (curve sources, custom-sensor sources, alert sensors), not just the active one. Raw readings are kept **24 h**, then downsampled to 1/min until 90 days. Expected size ~300–400 MB.
+
+### 6.1 The `tq` CLI (M14 brainstorm, Sam, 2026-11-06)
+
+`tq` (crate `thermaliq-cli`) is an HTTP client for the API above and nothing else: it never opens hardware and never sets a fan duty itself (an override is a request the engine carries out). It does not depend on the daemon crate. Service control (`install-service`, `uninstall-service`) stays on `thermaliq-daemon`; v0's calibration, schedule and alert commands wait for the modules that own them.
+
+| Command | Calls | Token |
+|---|---|---|
+| `tq status` | `GET /status` | no |
+| `tq sensors`, `tq fans`, `tq metrics` | `GET /sensors`, `/fans`, `/metrics` | no |
+| `tq profile list` / `tq profile set <name>` | `GET /profiles` / `POST /profiles/active` | set only |
+| `tq override <fan> <duty> [--secs N]` | `POST /fans/{id}/override` (duty 0-100; the API needs an expiry, so `--secs` defaults to 60 and the daemon caps it at 300) | yes |
+| `tq override <fan> --cancel` | `DELETE /fans/{id}/override` | yes |
+| `tq agent pause` / `resume` | `POST /agent/pause`, `/agent/resume` | yes |
+| `tq agent decisions` | `GET /agent/decisions` | yes |
+| `tq agent key set <provider>` / `key clear` | `PUT` / `DELETE /agent/key` | yes |
+| `tq agent workload <exe> <kind>` | `PUT /agent/workloads/{exe}` | yes |
+| `tq identity` | `GET /identity` | no |
+| `tq identify [--probe <fan-id>]` | §5.2 | yes (checked before any fan runs) |
+| `tq inventory accept` | `POST /inventory/accept` | yes |
+| `tq history <sensor> [--mins N]` | `GET /history/sensors/{id}`, filtered to the last N minutes (default 10) | no |
+| `tq config show` | `GET /config` | no |
+
+- **Output:** a plain table or `key: value` lines by default; `--json` on any command (except `identify`, which is interactive) prints the daemon's answer unchanged. Ids and names are percent-encoded into the path.
+- **Token:** never an argument (the process list shows argv). `THERMALIQ_TOKEN`, else `token.txt` in `THERMALIQ_DATA_DIR` or `%ProgramData%\ThermalIQ`. If neither works, exit 3 with "run tq elevated or as the installing user". An env token that is not 64 hex digits is an error, not a reason to try the file. Reads never need it. The API key for `agent key set` is read from the first line of stdin and is never printed.
+- **Port:** `api_port` from `config.toml` in the same directory; a missing or unreadable file means 7272.
+- **Exit codes:** 0 ok; 1 any other error (usage, bad input, a 5xx); 2 the daemon is unreachable; 3 no usable token, including a 401 from the daemon; 4 the daemon refused the request (any other 4xx, or an override that is `in_effect: false`); 5 from `tq status` only: degraded, latched, or the engine is not running.
 
 ## 7. Agent
 

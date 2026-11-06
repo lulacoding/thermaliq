@@ -1,5 +1,5 @@
 # Sensor and fan IDs here (cpu_temp, gpu_temp, cpu_fan, gpu_fan, case_fans) are role IDs, not real hardware IDs.
-# roles.toml (written by `thermaliq-daemon identify`, SPEC 5.2) maps them to this PC's hardware when the profile loads.
+# roles.toml (written by `tq identify`, SPEC 5.2) maps them to this PC's hardware when the profile loads.
 
 name = "efficiency"
 description = "Low power: low fan speeds while cool"

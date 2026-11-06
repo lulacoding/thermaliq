@@ -4,6 +4,7 @@
 //! out-of-scope features (SPEC §2) cannot be configured by accident.
 
 mod config;
+pub mod datadir;
 pub mod identity;
 mod profile;
 

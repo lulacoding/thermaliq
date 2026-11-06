@@ -468,7 +468,7 @@ impl Daemon {
                         // A profile whose roles all went unmapped leaves every fan to the BIOS (SPEC §5.2).
                         if engine.controls_nothing() {
                             degraded_reasons.push(format!(
-                                "profile '{}' controls no fans: run thermaliq-daemon identify",
+                                "profile '{}' controls no fans: run tq identify",
                                 shared
                                     .profile
                                     .read()
@@ -1142,7 +1142,7 @@ mod tests {
         let d = Daemon::start(hal, &empty, vec![], db(), fast());
         wait_until(|| d.cache().ticks > 2);
         let c = d.cache();
-        let want = "profile 'bare' controls no fans: run thermaliq-daemon identify";
+        let want = "profile 'bare' controls no fans: run tq identify";
         assert!(c.status.degraded, "{:?}", c.status);
         assert!(
             c.status.degraded_reasons.iter().any(|r| r == want),

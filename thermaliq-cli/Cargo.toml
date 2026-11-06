@@ -4,9 +4,24 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "thermaliq_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "tq"
 path = "src/main.rs"
+
+[dependencies]
+thermaliq-common = { path = "../thermaliq-common" }
+serde_json = "1"
+ureq = "3.5"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console"] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true
