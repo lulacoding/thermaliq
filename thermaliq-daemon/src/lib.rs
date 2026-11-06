@@ -16,6 +16,7 @@ pub mod keychain;
 #[cfg(windows)]
 pub mod lhm_bridge;
 pub mod lifecycle;
+pub mod profile_rules;
 pub mod runtime;
 #[cfg(windows)]
 pub mod service;

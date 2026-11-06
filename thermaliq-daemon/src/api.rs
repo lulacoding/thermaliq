@@ -508,6 +508,19 @@ async fn put_config(State(s): State<ApiState>, Json(cfg): Json<DaemonConfig>) ->
         );
         return Err(ApiError(StatusCode::BAD_REQUEST, m));
     }
+    if let Some(entry) = cfg
+        .schedule
+        .iter()
+        .find(|entry| !s.profiles.iter().any(|p| p.name == entry.profile))
+    {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "schedule profile '{}' is not a known profile",
+                entry.profile
+            ),
+        ));
+    }
     let _one_at_a_time = s.config_lock.lock().await;
     let dir = s.dir.clone();
     let saved = tokio::task::spawn_blocking(move || {
@@ -1445,6 +1458,7 @@ mod tests {
             json!({"api_port": 0, "default_profile": "flat"}),
             json!({"default_profile": ""}),
             json!({"default_profile": "no-such-profile"}),
+            json!({"default_profile": "flat", "schedule": [{"time": "09:00-17:00", "profile": "no-such-profile"}]}),
         ] {
             let (code, _) = call(&r, "PUT", "/config", Some(TOKEN), Some(bad)).await;
             assert_eq!(code, StatusCode::BAD_REQUEST);

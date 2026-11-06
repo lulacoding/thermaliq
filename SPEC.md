@@ -156,6 +156,7 @@ M13 is identity only. Which fan cools which component is M20d.
 
 - One shared data directory: `%ProgramData%\ThermalIQ` (overridable by env var for dev and CI). Config, profiles, token, history DB live there.
 - `config.toml`, written atomically (temp file + rename). Settings changed through the API are saved there.
+- `default_profile` is the user's base profile. Optional `[[schedule]]` entries use `days = ["mon", ...]`, a local 24-hour `time = "22:00-08:00"` window, and a saved `profile`; empty `days` means every day. App rules scan running process names case-insensitively in rule order and are read from the configured base profile, even while another profile is active. The active profile is priority-arbitrated: Agent > matching app rule > matching schedule > user base profile. App/schedule changes use the engine profile-switch safety checks and cannot select an unknown profile, fan or sensor.
 - API keys in the OS keychain, never in TOML.
 - Every mutating endpoint needs `Authorization: Bearer <token>`. Read-only endpoints may be open. CORS lists the real production origins (including `http://tauri.localhost` on Windows).
 - UI gets the token through a Tauri command, not by reading files from the webview.

@@ -186,6 +186,22 @@ pub fn start(
             )
         })?
         .clone();
+    for entry in &cfg.schedule {
+        if !profiles.iter().any(|p| p.name == entry.profile) {
+            return Err(format!(
+                "schedule profile '{}' is not a known profile",
+                entry.profile
+            ));
+        }
+    }
+    for rule in &active.app_rules {
+        if !profiles.iter().any(|p| p.name == rule.profile) {
+            return Err(format!(
+                "app rule '{}' selects unknown profile '{}'",
+                rule.process, rule.profile
+            ));
+        }
+    }
     let history =
         HistoryDb::open(&dir.join("history.db")).map_err(|e| format!("history.db: {e}"))?;
     let history = Arc::new(Mutex::new(history));
@@ -205,6 +221,7 @@ pub fn start(
     let slow = SlowThread::start(SlowParts {
         handle: daemon.handle(),
         profiles: profiles.clone(),
+        config: cfg.clone(),
         history: history.clone(),
         foreground: Arc::new(move || feed.latest()),
         hosted: Some(Box::new(

@@ -15,9 +15,9 @@ use std::time::{Duration, Instant};
 use thermaliq_agent::classifier::Workload;
 use thermaliq_agent::decision::{
     builtin_workload, clean_exe, game_like, why_not_switch, Change, Decision, DecisionProvider,
-    Foreground, Known, Observation, Settled, SlowLayer, Source,
+    Foreground, Known, Observation, Settled, SlowLayer, Source, Step,
 };
-use thermaliq_common::{HardwareSnapshot, MetricKind, Profile, SensorKind};
+use thermaliq_common::{DaemonConfig, HardwareSnapshot, MetricKind, Profile, SensorKind};
 
 const STEP: Duration = Duration::from_secs(1);
 const MAX_LOG: usize = 100;
@@ -165,6 +165,7 @@ impl SlowShared {
 pub struct SlowParts {
     pub handle: Handle,
     pub profiles: Vec<Profile>,
+    pub config: DaemonConfig,
     pub history: Arc<Mutex<HistoryDb>>,
     pub foreground: ForegroundFn,
     pub hosted: Option<Box<dyn DecisionProvider + Send>>,
@@ -286,25 +287,45 @@ fn apply(
     layer: &mut SlowLayer,
     gate: &Gate,
 ) -> Result<bool, String> {
-    if cache.active_profile == c.profile {
+    let changed = match apply_named(c.profile, cache, profiles, rt, handle, gate) {
+        Ok(changed) => changed,
+        Err(error) => {
+            layer.retry();
+            return Err(error);
+        }
+    };
+    if !changed {
         layer.already_active(c);
+        return Ok(false);
+    }
+    layer.applied(gate.now, c);
+    Ok(true)
+}
+
+fn apply_named(
+    profile_name: &str,
+    cache: &crate::runtime::Cache,
+    profiles: &[Profile],
+    rt: &tokio::runtime::Runtime,
+    handle: &Handle,
+    gate: &Gate,
+) -> Result<bool, String> {
+    if cache.active_profile == profile_name {
         return Ok(false);
     }
     // A restarting or degraded backend may be missing fans that come back a moment later.
     if !gate.stable {
-        layer.retry();
         return Err("hardware is changing or degraded: waiting for a stable snapshot".into());
     }
     let find = |name: &str| profiles.iter().find(|p| p.name == name);
-    let next = find(c.profile).ok_or_else(|| format!("no profile '{}' is saved", c.profile))?;
+    let next = find(profile_name).ok_or_else(|| format!("no profile '{profile_name}' is saved"))?;
     let active = find(&cache.active_profile)
         .ok_or_else(|| format!("the active profile '{}' is unknown", cache.active_profile))?;
     if let Some(why) = why_not_switch(next, active, &cache.snapshot, gate.ever_seen) {
         return Err(why);
     }
     rt.block_on(handle.set_profile(next.clone()))
-        .map_err(|e| format!("the engine refused '{}': {e:?}", c.profile))?;
-    layer.applied(gate.now, c);
+        .map_err(|e| format!("the engine refused '{profile_name}': {e:?}"))?;
     Ok(true)
 }
 
@@ -312,6 +333,7 @@ fn run(parts: SlowParts, stopping: &AtomicBool) {
     let SlowParts {
         handle,
         profiles,
+        config,
         history,
         foreground,
         mut hosted,
@@ -331,7 +353,13 @@ fn run(parts: SlowParts, stopping: &AtomicBool) {
     let began = Instant::now();
     let mut settled = Settled::default();
     let mut ever_seen: HashSet<String> = HashSet::new();
+    let mut agent_profile: Option<String> = None;
+    let mut agent_exe: Option<String> = None;
     let mut last_note: Option<String> = None;
+    let base_profile = profiles
+        .iter()
+        .find(|p| p.name == config.default_profile)
+        .expect("the configured default profile is validated at startup");
     while !stopping.load(Ordering::SeqCst) {
         std::thread::sleep(period);
         for (exe, workload) in shared.take_answers() {
@@ -356,7 +384,18 @@ fn run(parts: SlowParts, stopping: &AtomicBool) {
         );
         let seen = foreground();
         shared.update(|v| v.foreground = seen.is_some());
-        if !cache.status.engine_running || cache.status.agent != AgentState::Running {
+        let exe = seen
+            .as_ref()
+            .and_then(|f| f.exe.as_deref())
+            .and_then(clean_exe);
+        if agent_exe != exe {
+            agent_profile = None;
+            agent_exe = exe.clone();
+        }
+        if cache.status.agent != AgentState::Running {
+            agent_profile = None;
+        }
+        if !cache.status.engine_running {
             continue;
         }
         let obs = observation(&cache.snapshot, cache.snapshot_age, seen);
@@ -382,17 +421,21 @@ fn run(parts: SlowParts, stopping: &AtomicBool) {
             });
             game_like(&o, known)
         };
-        let step = layer.step(
-            now,
-            &obs,
-            hosted
-                .as_mut()
-                .map(|p| p.as_mut() as &mut dyn DecisionProvider),
-            local
-                .as_mut()
-                .map(|p| p.as_mut() as &mut dyn DecisionProvider),
-            &cancel,
-        );
+        let step = if cache.status.agent == AgentState::Running {
+            layer.step(
+                now,
+                &obs,
+                hosted
+                    .as_mut()
+                    .map(|p| p.as_mut() as &mut dyn DecisionProvider),
+                local
+                    .as_mut()
+                    .map(|p| p.as_mut() as &mut dyn DecisionProvider),
+                &cancel,
+            )
+        } else {
+            Step::default()
+        };
         for (exe, k) in layer.take_learned() {
             let saved = history
                 .lock()
@@ -418,6 +461,7 @@ fn run(parts: SlowParts, stopping: &AtomicBool) {
             }
         }
         let mut logged = step.decision.as_ref().map(entry);
+        let mut active_profile = cache.active_profile.clone();
         if let Some(c) = &step.change {
             let gate = Gate {
                 now,
@@ -426,6 +470,9 @@ fn run(parts: SlowParts, stopping: &AtomicBool) {
             };
             match apply(c, &cache, &profiles, &rt, &handle, &mut layer, &gate) {
                 Ok(changed) => {
+                    agent_profile = Some(c.profile.to_owned());
+                    agent_exe = Some(c.exe.clone());
+                    active_profile = c.profile.to_owned();
                     last_note = None;
                     if changed {
                         let mut e = logged.take().unwrap_or_else(|| {
@@ -454,6 +501,77 @@ fn run(parts: SlowParts, stopping: &AtomicBool) {
                         });
                         e.note = Some(why.clone());
                         logged = Some(e);
+                    }
+                    last_note = Some(why);
+                }
+            }
+        }
+        #[cfg(windows)]
+        let mut running_processes = crate::win::process_names().unwrap_or_default();
+        #[cfg(not(windows))]
+        let mut running_processes: Vec<String> = exe.iter().cloned().collect();
+        if let Some(exe) = &exe {
+            running_processes.push(exe.clone());
+        }
+        let app_rule = crate::profile_rules::app_rule_profile(base_profile, &running_processes);
+        let (weekday, minute) = crate::profile_rules::local_time();
+        let schedule_profile =
+            crate::profile_rules::scheduled_profile(&config.schedule, weekday, minute);
+        let (selected, source) = crate::profile_rules::arbitrate(
+            agent_profile.as_deref(),
+            app_rule,
+            schedule_profile,
+            &config.default_profile,
+        );
+        if active_profile != selected {
+            let gate = Gate {
+                now,
+                stable: settled.is_settled(now, stable_for),
+                ever_seen: &ever_seen,
+            };
+            let current = crate::runtime::Cache {
+                active_profile: active_profile.clone(),
+                ..cache.clone()
+            };
+            match apply_named(selected, &current, &profiles, &rt, &handle, &gate) {
+                Ok(changed) => {
+                    if changed {
+                        active_profile = selected.into();
+                    }
+                    last_note = None;
+                    if changed && source != crate::profile_rules::ProfileSource::Agent {
+                        logged = Some(LogEntry {
+                            at: unix_now(),
+                            exe: exe.clone().unwrap_or_default(),
+                            workload: None,
+                            source: Some(
+                                match source {
+                                    crate::profile_rules::ProfileSource::Agent => "agent",
+                                    crate::profile_rules::ProfileSource::AppRule => "app-rule",
+                                    crate::profile_rules::ProfileSource::Schedule => "schedule",
+                                    crate::profile_rules::ProfileSource::User => "user",
+                                }
+                                .into(),
+                            ),
+                            confidence: None,
+                            asked: false,
+                            profile: Some(selected.into()),
+                            note: None,
+                        });
+                    }
+                }
+                Err(why) => {
+                    if last_note.as_deref() != Some(&why) {
+                        logged = Some(LogEntry {
+                            at: unix_now(),
+                            exe: exe.clone().unwrap_or_default(),
+                            workload: None,
+                            source: Some("profile-rule".into()),
+                            confidence: None,
+                            asked: false,
+                            profile: Some(selected.into()),
+                            note: Some(why.clone()),
+                        });
                     }
                     last_note = Some(why);
                 }
@@ -596,6 +714,16 @@ mod tests {
         rig_on(hal, profiles, known)
     }
 
+    fn rig_with_config(
+        profiles: Vec<Profile>,
+        known: &[(&str, &str)],
+        config: DaemonConfig,
+    ) -> Rig {
+        let cpu = Tick::Temps(vec![("cpu".into(), SensorKind::Cpu, 40.0)]);
+        let hal = Arc::new(MockHardwareLayer::new(&["f1"], vec![cpu]));
+        rig_on_with_config(hal, profiles, known, config)
+    }
+
     /// Hardware that can lose `f2` (a bridge restarting) or report a fault, as the tests ask.
     struct Flaky {
         inner: MockHardwareLayer,
@@ -725,6 +853,19 @@ mod tests {
         profiles: Vec<Profile>,
         known: &[(&str, &str)],
     ) -> Rig {
+        let config = DaemonConfig {
+            default_profile: profiles[0].name.clone(),
+            ..DaemonConfig::default()
+        };
+        rig_on_with_config(hal, profiles, known, config)
+    }
+
+    fn rig_on_with_config(
+        hal: Arc<dyn thermaliq_hal::HardwareLayer>,
+        profiles: Vec<Profile>,
+        known: &[(&str, &str)],
+        config: DaemonConfig,
+    ) -> Rig {
         let db = Arc::new(Mutex::new(HistoryDb::in_memory().unwrap()));
         for (exe, w) in known {
             db.lock()
@@ -743,6 +884,7 @@ mod tests {
         let slow = SlowThread::start(SlowParts {
             handle: daemon.handle(),
             profiles,
+            config,
             history: db.clone(),
             foreground: Arc::new(move || read.lock().unwrap().clone()),
             hosted: None,
@@ -811,6 +953,82 @@ mod tests {
     }
 
     #[test]
+    fn an_app_rule_stays_available_from_the_base_profile_after_switching() {
+        let base = Profile::from_toml(
+            "name='balanced'\n[[curves]]\ntype='flat'\nid='c'\npwm=30\n[[controls]]\nfan='f1'\ncurve='c'\nstep_up_pct=100\nstep_down_pct=100\n[[app_rules]]\nprocess='game.exe'\nprofile='gaming'",
+        )
+        .unwrap();
+        let r = rig(vec![base, toml("gaming", "f1")], &[]);
+        show(&r, "GAME.EXE");
+        wait_until(|| active(&r) == "gaming");
+
+        // The active `gaming` profile has no app_rules. The stable base profile still does.
+        std::thread::sleep(STABLE * 2);
+        assert_eq!(active(&r), "gaming");
+    }
+
+    #[test]
+    fn an_agent_profile_request_overrides_a_matching_app_rule() {
+        let base = Profile::from_toml(
+            "name='balanced'\n[[curves]]\ntype='flat'\nid='c'\npwm=30\n[[controls]]\nfan='f1'\ncurve='c'\nstep_up_pct=100\nstep_down_pct=100\n[[app_rules]]\nprocess='game.exe'\nprofile='silent'",
+        )
+        .unwrap();
+        let r = rig(
+            vec![base, toml("gaming", "f1"), toml("silent", "f1")],
+            &[("game.exe", "gaming")],
+        );
+        show(&r, "game.exe");
+        wait_until(|| active(&r) == "gaming");
+        std::thread::sleep(STABLE * 2);
+        assert_eq!(active(&r), "gaming");
+    }
+
+    #[test]
+    fn a_matching_schedule_selects_its_profile_when_no_higher_priority_request_exists() {
+        let config = DaemonConfig {
+            default_profile: "balanced".into(),
+            schedule: vec![thermaliq_common::ScheduleEntry {
+                days: vec![],
+                time: "00:00-24:00".into(),
+                profile: "scheduled".into(),
+            }],
+            ..DaemonConfig::default()
+        };
+        let r = rig_with_config(
+            vec![toml("balanced", "f1"), toml("scheduled", "f1")],
+            &[],
+            config,
+        );
+        wait_until(|| active(&r) == "scheduled");
+    }
+
+    #[test]
+    fn an_app_rule_overrides_a_matching_schedule() {
+        let base = Profile::from_toml(
+            "name='balanced'\n[[curves]]\ntype='flat'\nid='c'\npwm=30\n[[controls]]\nfan='f1'\ncurve='c'\nstep_up_pct=100\nstep_down_pct=100\n[[app_rules]]\nprocess='editor.exe'\nprofile='app'",
+        )
+        .unwrap();
+        let config = DaemonConfig {
+            default_profile: "balanced".into(),
+            schedule: vec![thermaliq_common::ScheduleEntry {
+                days: vec![],
+                time: "00:00-24:00".into(),
+                profile: "scheduled".into(),
+            }],
+            ..DaemonConfig::default()
+        };
+        let r = rig_with_config(
+            vec![base, toml("app", "f1"), toml("scheduled", "f1")],
+            &[],
+            config,
+        );
+        show(&r, "editor.exe");
+        wait_until(|| active(&r) == "app");
+        std::thread::sleep(STABLE * 2);
+        assert_eq!(active(&r), "app");
+    }
+
+    #[test]
     fn a_profile_that_would_release_the_real_fan_is_refused_and_says_why() {
         let r = rig(
             vec![toml("balanced", "f1"), toml("gaming", "gpu1")],
@@ -826,6 +1044,28 @@ mod tests {
                 .any(|d| d.note.as_deref().is_some_and(|n| n.contains("f1")))
         });
         assert_eq!(active(&r), "balanced");
+    }
+
+    #[test]
+    fn an_app_rule_that_would_release_a_real_fan_is_refused_and_names_it() {
+        let base = Profile::from_toml(
+            "name='balanced'\n[[curves]]\ntype='flat'\nid='c'\npwm=30\n[[controls]]\nfan='f1'\ncurve='c'\nstep_up_pct=100\nstep_down_pct=100\n[[controls]]\nfan='f2'\ncurve='c'\nstep_up_pct=100\nstep_down_pct=100\n[[app_rules]]\nprocess='game.exe'\nprofile='gaming'",
+        )
+        .unwrap();
+        let (hal, _, _) = flaky();
+        let r = rig_on(hal, vec![base, toml2("gaming", &["f1"])], &[]);
+        wait_until(|| r.daemon.handle().cache().ticks > 0);
+        std::thread::sleep(STABLE * 3);
+        show(&r, "game.exe");
+        std::thread::sleep(STABLE * 3);
+
+        assert_eq!(active(&r), "balanced");
+        assert!(r
+            .shared
+            .view()
+            .decisions
+            .iter()
+            .any(|d| { d.note.as_deref().is_some_and(|note| note.contains("f2")) }));
     }
 
     #[test]
