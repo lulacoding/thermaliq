@@ -10,7 +10,7 @@ mod sensors;
 
 pub use control::{FanControl, Source};
 pub use curves::CurveEngine;
-pub use engine::Engine;
+pub use engine::{Engine, WRITE_FAILS_DEGRADED};
 pub use sensors::SensorEngine;
 
 use std::collections::HashMap;

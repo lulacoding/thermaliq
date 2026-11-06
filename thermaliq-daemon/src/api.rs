@@ -21,6 +21,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use thermaliq_agent::classifier::Workload;
@@ -588,12 +589,17 @@ impl ApiServer {
         let addr = listener.local_addr()?;
         state.port = addr.port();
         let (stop, stopped) = oneshot::channel::<()>();
+        let asked = Arc::new(AtomicBool::new(false));
+        let asked_in = asked.clone();
         let task = rt.spawn(async move {
-            let _ = axum::serve(listener, router(state))
-                .with_graceful_shutdown(async {
+            let ended = axum::serve(listener, router(state))
+                .with_graceful_shutdown(async move {
                     let _ = stopped.await;
+                    asked_in.store(true, Ordering::SeqCst);
                 })
                 .await;
+            // An end nobody asked for would leave the daemon running with no API.
+            crate::lifecycle::api_exited(&mut io::stderr(), asked.load(Ordering::SeqCst), &ended);
         });
         Ok(Self {
             rt: Some(rt),

@@ -106,6 +106,10 @@ One snapshot per tick, cached and shared. API reads use the cache, never the har
 
 A backend that should have started and didn't (the bridge failing to start, or NVML failing while another backend carries on) is listed in `unavailable_sources` and named in `degraded_reasons`, so `degraded` is true. One left off on purpose (no bridge installed, no PawnIO, anti-cheat running at start) is only listed in `unavailable_sources`. A snapshot with no fan at all is `degraded` too, whatever the cause: an empty engine must never look healthy (S8). The service writes everything it prints to `service.log` in the data dir.
 
+**Failed writes.** The engine counts consecutive `set_fan_duty` failures per fan. At 5 in a row the fan is named in `degraded_reasons` with the last HAL error (`fan 'x': 5 or more writes in a row failed (<error>)`); the next write that lands clears it, and so does a profile that no longer controls the fan. A write is still retried every tick.
+
+**Lifecycle lines.** `service.log` gets a stamped (UTC) `lifecycle:` line for: service starting (version, pid), running (API address), startup failure, each stop request with its reason (service manager stop, system shutdown, control handler dropped), how the stop ended (`stopped cleanly`, or `STOP FAILED` when the engine missed its budget), and the API server ending (`UNEXPECTED` unless we asked it to stop). A process that disappears with no such line was killed from outside or crashed natively.
+
 While the bridge is stopped, its sensors are gone. S3 still applies: a GPU fan whose curve reads a bridge sensor goes to 100%. S2 sees a CPU temperature only if HWiNFO supplies one, and the BIOS has the CPU fan. `/status` lists `lhm-bridge` under `unavailable_sources`.
 
 ### 5.2 Fan and sensor identity (M13 brainstorm, Sam, 2026-11-06)

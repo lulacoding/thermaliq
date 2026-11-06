@@ -72,6 +72,11 @@ impl MockHardwareLayer {
         self.state().fail_writes.push(fan.to_string());
     }
 
+    /// Undo `fail_writes` for this fan.
+    pub fn heal_writes(&self, fan: &str) {
+        self.state().fail_writes.retain(|f| f != fan);
+    }
+
     /// Make every later `restore_auto` on this fan fail (the call is still recorded).
     pub fn fail_restores(&self, fan: &str) {
         self.state().fail_restores.push(fan.to_string());

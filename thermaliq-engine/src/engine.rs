@@ -17,6 +17,8 @@ const RELEASE_HOLD: Duration = Duration::from_secs(30);
 /// SPEC S3/S4: consecutive ticks before a fault is acted on.
 const FAULT_TICKS: u8 = 3;
 /// A pump is never written below this (SPEC §7: never stop a pump).
+/// Consecutive failed writes to one fan before the daemon reports it as degraded.
+pub const WRITE_FAILS_DEGRADED: u32 = 5;
 /// shortcut: one fixed floor for every pump; take it from the pump's calibration (M20d) when that exists.
 const PUMP_MIN_DUTY: u8 = 20;
 
@@ -130,6 +132,8 @@ pub struct Engine {
     last: Option<HardwareSnapshot>,
     /// Fans the last snapshot reported as pumps: never written 0 (SPEC §7).
     pumps: HashSet<String>,
+    /// Consecutive failed `set_fan_duty` calls per fan, with the last error.
+    write_fails: HashMap<String, (u32, String)>,
 }
 
 impl Engine {
@@ -146,7 +150,21 @@ impl Engine {
             written: HashMap::new(),
             last: None,
             pumps: HashSet::new(),
+            write_fails: HashMap::new(),
         }
+    }
+
+    /// Fans whose last `WRITE_FAILS_DEGRADED` writes or more all failed, with the last HAL error,
+    /// sorted by fan. A success clears a fan. The daemon reports these in `degraded_reasons`.
+    pub fn failing_writes(&self) -> Vec<(String, String)> {
+        let mut v: Vec<_> = self
+            .write_fails
+            .iter()
+            .filter(|(_, (n, _))| *n >= WRITE_FAILS_DEGRADED)
+            .map(|(f, (_, e))| (f.clone(), e.clone()))
+            .collect();
+        v.sort();
+        v
     }
 
     /// True when the active profile has no controls at all.
@@ -212,6 +230,7 @@ impl Engine {
             .collect();
         for gone in old {
             self.written.remove(&gone.id);
+            self.write_fails.remove(&gone.id);
             if self.touched.remove(&gone.id) {
                 let _ = self.hal.restore_auto(&gone.id);
             }
@@ -402,7 +421,8 @@ impl Engine {
     }
 
     /// The only call site of `set_fan_duty` (S1). Clamps (S7) and never touches a
-    /// read-only fan. shortcut: a failed write is retried next tick, not reported; add logging with the daemon.
+    /// read-only fan. A failed write is retried next tick and counted; `failing_writes` reports a
+    /// fan after `WRITE_FAILS_DEGRADED` in a row.
     fn write(&mut self, fan: &str, duty: u8) {
         if self.controllable.contains(fan) {
             self.touched.insert(fan.to_string());
@@ -410,8 +430,15 @@ impl Engine {
             if self.pumps.contains(fan) {
                 duty = duty.max(PUMP_MIN_DUTY);
             }
-            if self.hal.set_fan_duty(fan, duty).is_ok() {
-                self.written.insert(fan.to_string(), duty);
+            match self.hal.set_fan_duty(fan, duty) {
+                Ok(()) => {
+                    self.written.insert(fan.to_string(), duty);
+                    self.write_fails.remove(fan);
+                }
+                Err(e) => {
+                    let slot = self.write_fails.entry(fan.to_string()).or_default();
+                    *slot = (slot.0.saturating_add(1), e.to_string());
+                }
             }
         }
     }
@@ -595,6 +622,64 @@ step_down_pct = 100
             );
         }
         assert!(w.iter().all(|(_, d)| *d >= 30), "{w:?}");
+    }
+
+    #[test]
+    fn five_failed_writes_in_a_row_are_reported_with_the_hal_error_and_one_success_clears_it() {
+        let (hal, mut e) = rig(&["f1", "f2"], vec![at(40.0, 40.0)]);
+        hal.fail_writes("f1");
+        for t in 0..4 {
+            e.tick(secs(t));
+        }
+        assert!(
+            e.failing_writes().is_empty(),
+            "4 is not 5: {:?}",
+            e.failing_writes()
+        );
+        e.tick(secs(4));
+        let failing = e.failing_writes();
+        assert_eq!(failing.len(), 1, "{failing:?}");
+        assert_eq!(failing[0].0, "f1");
+        assert!(
+            failing[0].1.contains("injected write failure on 'f1'"),
+            "{failing:?}"
+        );
+        hal.heal_writes("f1");
+        e.tick(secs(5));
+        assert!(e.failing_writes().is_empty(), "{:?}", e.failing_writes());
+    }
+
+    #[test]
+    fn a_success_between_failures_restarts_the_count() {
+        let (hal, mut e) = rig(&["f1", "f2"], vec![at(40.0, 40.0)]);
+        hal.fail_writes("f1");
+        for t in 0..4 {
+            e.tick(secs(t));
+        }
+        hal.heal_writes("f1");
+        e.tick(secs(4));
+        hal.fail_writes("f1");
+        for t in 5..9 {
+            e.tick(secs(t));
+        }
+        assert!(e.failing_writes().is_empty(), "{:?}", e.failing_writes());
+    }
+
+    #[test]
+    fn a_profile_that_drops_the_failing_fan_stops_reporting_it() {
+        let (hal, mut e) = rig(&["f1", "f2"], vec![at(40.0, 40.0)]);
+        hal.fail_writes("f1");
+        for t in 0..5 {
+            e.tick(secs(t));
+        }
+        assert_eq!(e.failing_writes().len(), 1);
+        let only_f2 = PROFILE.replace("fan = \"f1\"", "fan = \"f2\"").replacen(
+            "[[controls]]\nfan = \"f2\"\ncurve = \"c\"\nstep_up_pct = 100\nstep_down_pct = 100\n",
+            "",
+            1,
+        );
+        e.set_profile(&Profile::from_toml(&only_f2).unwrap());
+        assert!(e.failing_writes().is_empty(), "{:?}", e.failing_writes());
     }
 
     #[test]

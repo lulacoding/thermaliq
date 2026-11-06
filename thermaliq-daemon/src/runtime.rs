@@ -16,7 +16,7 @@ use thermaliq_agent::optimiser::REQUEST_TTL;
 use thermaliq_common::{
     bundled_profiles, FanReading, HardwareSnapshot, MetricReading, Profile, SensorReading,
 };
-use thermaliq_engine::{Engine, Source};
+use thermaliq_engine::{Engine, Source, WRITE_FAILS_DEGRADED};
 use thermaliq_hal::HardwareLayer;
 use tokio::sync::{oneshot, watch};
 
@@ -457,6 +457,14 @@ impl Daemon {
                         degraded_reasons.extend(engine.missing_fans().into_iter().map(|f| {
                             format!("the active profile controls fan '{f}', which no backend lists")
                         }));
+                        // Writes the HAL keeps refusing (a bridge read-back that never lands, say).
+                        degraded_reasons.extend(engine.failing_writes().into_iter().map(
+                            |(fan, e)| {
+                                format!(
+                                    "fan '{fan}': {WRITE_FAILS_DEGRADED} or more writes in a row failed ({e})"
+                                )
+                            },
+                        ));
                         // A profile whose roles all went unmapped leaves every fan to the BIOS (SPEC §5.2).
                         if engine.controls_nothing() {
                             degraded_reasons.push(format!(
@@ -1105,6 +1113,25 @@ mod tests {
                     .degraded_reasons
                     .contains(&"the board changed".into())
         );
+        d.shutdown().unwrap();
+    }
+
+    #[test]
+    fn a_fan_whose_writes_keep_failing_is_degraded_with_the_error_until_one_lands() {
+        let hal = Arc::new(MockHardwareLayer::new(&["f1", "f2"], vec![at(40.0)]));
+        hal.fail_writes("f1");
+        let active = Profile::from_toml(FLAT).unwrap();
+        let d = Daemon::start(hal.clone(), &active, vec![], db(), fast());
+        wait_until(|| {
+            d.cache()
+                .status
+                .degraded_reasons
+                .iter()
+                .any(|r| r.contains("'f1'") && r.contains("injected write failure on 'f1'"))
+        });
+        assert!(d.cache().status.degraded);
+        hal.heal_writes("f1");
+        wait_until(|| d.cache().status.degraded_reasons.is_empty());
         d.shutdown().unwrap();
     }
 
