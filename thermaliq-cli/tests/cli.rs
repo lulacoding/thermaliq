@@ -612,6 +612,35 @@ fn agent_key_set_reads_the_key_from_stdin_and_never_prints_it() {
 }
 
 #[test]
+fn a_piped_key_prints_no_prompt_and_a_tty_flag_on_a_pipe_still_works() {
+    let r = rig(vec![ok(
+        "PUT",
+        "/agent/key",
+        json!({"hosted_account": "openrouter"}),
+    )]);
+    let args = ["agent", "key", "set", "openrouter"];
+    let quiet = tq_with(&env_of(&r), &args, "sk-secret-123\n");
+    assert_eq!((quiet.code, quiet.err.as_str()), (0, ""), "{}", quiet.err);
+    // tty = true but stdin is not a console: echo cannot be turned off, nothing must break.
+    let mut env = env_of(&r);
+    env.tty = true;
+    let asked = tq_with(&env, &args, "sk-secret-456\n");
+    assert_eq!(asked.code, 0, "{}", asked.err);
+    assert!(asked.err.contains("not shown"), "{}", asked.err);
+    assert!(!asked.err.contains("sk-secret") && !asked.out.contains("sk-secret"));
+    let sent: Vec<_> = r
+        .fake
+        .requests()
+        .into_iter()
+        .map(|q| q.body["key"].clone())
+        .collect();
+    assert_eq!(sent, [json!("sk-secret-123"), json!("sk-secret-456")]);
+    // An empty line on that path is still an error and still sends nothing.
+    assert_eq!(tq_with(&env, &args, "\n").code, 1);
+    assert_eq!(r.fake.requests().len(), 2);
+}
+
+#[test]
 fn agent_key_clear_and_workload() {
     let r = rig(vec![
         ok("DELETE", "/agent/key", json!({"hosted_account": null})),

@@ -151,6 +151,15 @@ T config show
 
 **Pass:** `profile set balanced` prints `active profile: balanced`, `exit=0`; the unknown profile prints `tq: no profile 'nosuchprofile'`, `exit=4`. `agent pause` then `status` shows `agent: paused` (exit 0: pausing is not unhealthy), `resume` brings `running`. `agent decisions` prints the account, local model state, a questions table and a decisions table (possibly empty); `--json` is the daemon's JSON. The unknown provider prints `tq: unknown provider`, `exit=4`, and nothing is stored; the empty key prints `tq: no key on stdin: ...`, `exit=1`, and nothing is sent. The unknown workload prints `tq: unknown workload`, `exit=4`. `inventory accept` prints `inventory saved`, `exit=0`: only run it if `identity` showed nothing new, missing or changed (it is harmless then; if something was listed, skip it and paste the `identity` output).
 
+**Echo off on a console (the review's must-fix).** Run this in a real console window (Windows Terminal or the PowerShell window itself, not the VS Code output pane), and type the made-up text `abc-not-a-key` when asked, then Enter. The provider is invalid on purpose, so nothing is stored:
+
+```powershell
+& $tq agent key set nosuchprovider; "exit=$LASTEXITCODE"
+"typed text shows now:"; Read-Host "type abc and Enter"
+```
+
+**Pass:** it prints `Paste the key and press Enter (not shown): ` and **nothing you type appears**; after Enter it prints `tq: unknown provider` and `exit=4`. The `Read-Host` line then shows what you type (echo is back on). Repeat once and press **Ctrl-C** while it waits for the key; then type something at the prompt: it must show (echo restored when the process is killed). Pipe check: `"abc" | & $tq agent key set nosuchprovider` prints no prompt, `tq: unknown provider`, `exit=4`.
+
 Do **not** run `agent key set` with a real key here: that would store it. Do **not** run `agent key clear` if you have stored a key you want to keep.
 
 ## 6. Override

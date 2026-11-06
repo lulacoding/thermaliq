@@ -2,6 +2,7 @@
 //! never touches hardware, and a fan duty can only be asked for through the engine.
 
 mod client;
+mod echo;
 pub mod identify;
 mod render;
 
@@ -446,16 +447,19 @@ fn dispatch(
         ["agent", "key", "set", provider] => {
             let c = env.client()?;
             c.token()?;
-            if env.tty {
-                let _ = write!(
-                    err,
-                    "Paste the key and press Enter (it shows as you type; pipe it in to hide it): "
-                );
-            }
             let mut line = String::new();
-            input
-                .read_line(&mut line)
-                .map_err(|e| CliError::from(format!("cannot read the key: {e}")))?;
+            {
+                // Echo is off only while the line is read, and comes back on every path out.
+                let _quiet = env.tty.then(echo::off).flatten();
+                if env.tty {
+                    let _ = write!(err, "Paste the key and press Enter (not shown): ");
+                }
+                let read = input.read_line(&mut line);
+                if env.tty {
+                    let _ = writeln!(err);
+                }
+                read.map_err(|e| CliError::from(format!("cannot read the key: {e}")))?;
+            }
             let key = line.trim();
             if key.is_empty() {
                 return Err("no key on stdin: pipe it in or type it and press Enter".into());
