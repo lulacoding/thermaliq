@@ -17,6 +17,8 @@ pub const CALL_TIMEOUT: Duration = Duration::from_secs(2);
 /// The NVML calls this backend needs, so tests can swap in a fake. Indices are NVML's.
 pub trait Nvml: Send + 'static {
     fn gpu_count(&mut self) -> Result<u32, String>;
+    /// NVML's UUID for the GPU: unlike the index, it does not change when the GPUs reorder.
+    fn uuid(&mut self, gpu: u32) -> Result<String, String>;
     /// GPU core temperature in °C.
     fn temperature(&mut self, gpu: u32) -> Result<u32, String>;
     /// GPU core load in %.
@@ -52,15 +54,26 @@ pub struct Nvidia {
     warned: Mutex<HashSet<String>>,
 }
 
-fn fan_id(gpu: u32, fan: u32) -> String {
-    format!("nvml_gpu{gpu}_fan{fan}")
+fn fan_id(uuid: &str, fan: u32) -> String {
+    format!("nvml_{uuid}_fan{fan}")
+}
+
+/// The GPU's UUID, which goes into every id. An empty one or one with `_` would make the ids
+/// ambiguous (SPEC §5.2), so it is an error, not a guess.
+fn gpu_uuid(api: &mut dyn Nvml, gpu: u32) -> Result<String, String> {
+    let uuid = api.uuid(gpu)?;
+    if uuid.is_empty() || uuid.contains(['_', ' ']) {
+        return Err(format!("GPU {gpu} has an unusable UUID {uuid:?}"));
+    }
+    Ok(uuid)
 }
 
 fn enumerate(api: &mut dyn Nvml) -> Result<Vec<(String, u32, u32)>, String> {
     let mut fans = Vec::new();
     for gpu in 0..api.gpu_count()? {
+        let uuid = gpu_uuid(api, gpu)?;
         for fan in 0..api.fan_count(gpu)? {
-            fans.push((fan_id(gpu, fan), gpu, fan));
+            fans.push((fan_id(&uuid, fan), gpu, fan));
         }
     }
     Ok(fans)
@@ -71,8 +84,9 @@ fn read_all(api: &mut dyn Nvml) -> Result<(HardwareSnapshot, Vec<String>), Strin
     let mut snap = HardwareSnapshot::default();
     let mut warnings = Vec::new();
     for gpu in 0..api.gpu_count()? {
+        let uuid = gpu_uuid(api, gpu)?;
         snap.sensors.push(SensorReading {
-            id: format!("nvml_gpu{gpu}_temp"),
+            id: format!("nvml_{uuid}_temp"),
             label: format!("GPU {gpu}"),
             kind: SensorKind::Gpu,
             temp_celsius: api.temperature(gpu)? as f32,
@@ -101,7 +115,7 @@ fn read_all(api: &mut dyn Nvml) -> Result<(HardwareSnapshot, Vec<String>), Strin
             ),
         ];
         for (name, kind, value) in metrics {
-            let id = format!("nvml_gpu{gpu}_{name}");
+            let id = format!("nvml_{uuid}_{name}");
             match value {
                 Ok(value) if kind.is_valid(value) => {
                     snap.metrics.push(MetricReading { id, kind, value })
@@ -112,7 +126,7 @@ fn read_all(api: &mut dyn Nvml) -> Result<(HardwareSnapshot, Vec<String>), Strin
         }
         for fan in 0..api.fan_count(gpu)? {
             snap.fans.push(FanReading {
-                id: fan_id(gpu, fan),
+                id: fan_id(&uuid, fan),
                 label: format!("GPU {gpu} fan {fan}"),
                 // Older drivers have no RPM query; the duty is still real.
                 rpm: api.fan_rpm(gpu, fan).unwrap_or(0),
@@ -253,6 +267,9 @@ mod real {
         fn gpu_count(&mut self) -> Result<u32, String> {
             self.0.device_count().map_err(msg)
         }
+        fn uuid(&mut self, gpu: u32) -> Result<String, String> {
+            self.device(gpu)?.uuid().map_err(msg)
+        }
         fn temperature(&mut self, gpu: u32) -> Result<u32, String> {
             self.device(gpu)?
                 .temperature(TemperatureSensor::Gpu)
@@ -325,6 +342,7 @@ mod tests {
         rpm: u32,
     }
     struct Gpu {
+        uuid: String,
         temp: u32,
         fans: Vec<Fan>,
         load: u32,
@@ -350,7 +368,9 @@ mod tests {
             Self(Arc::new(Mutex::new(World {
                 gpus: gpus
                     .iter()
-                    .map(|(temp, fans)| Gpu {
+                    .enumerate()
+                    .map(|(i, (temp, fans))| Gpu {
+                        uuid: format!("gpu{i}"),
                         temp: *temp,
                         fans: fans.iter().map(|&(duty, rpm)| Fan { duty, rpm }).collect(),
                         load: 37,
@@ -396,6 +416,9 @@ mod tests {
         fn gpu_count(&mut self) -> Result<u32, String> {
             self.enter("count", String::new())?;
             Ok(self.w().gpus.len() as u32)
+        }
+        fn uuid(&mut self, gpu: u32) -> Result<String, String> {
+            Ok(self.w().gpus[gpu as usize].uuid.clone())
         }
         fn temperature(&mut self, gpu: u32) -> Result<u32, String> {
             self.enter("temp", gpu.to_string())?;
@@ -553,6 +576,56 @@ mod tests {
         fake.w().gpus[0].load = 101;
         let snap = nvidia(&fake).snapshot().unwrap();
         assert!(!metrics(&snap).iter().any(|(id, _)| id.ends_with("load")));
+    }
+
+    /// The same two cards, enumerated in either order (a BIOS update, a moved slot).
+    fn cards(order: [usize; 2]) -> Fake {
+        let fake = Fake::new(&[(55, &[(30, 900)]), (70, &[(40, 1200), (50, 1500)])]);
+        for (gpu, uuid) in fake.w().gpus.iter_mut().zip(["GPU-aaa", "GPU-bbb"]) {
+            gpu.uuid = uuid.into();
+        }
+        fake.w()
+            .gpus
+            .sort_by_key(|g| order[(g.uuid == "GPU-bbb") as usize]);
+        fake
+    }
+
+    #[test]
+    fn ids_follow_the_gpu_uuid_not_its_enumeration_index() {
+        let ids = |order| {
+            let n = nvidia(&cards(order));
+            let mut ids = n.capabilities().controllable_fans;
+            ids.extend(n.snapshot().unwrap().sensors.into_iter().map(|s| s.id));
+            ids.sort();
+            ids
+        };
+        let expected = [
+            "nvml_GPU-aaa_fan0",
+            "nvml_GPU-aaa_temp",
+            "nvml_GPU-bbb_fan0",
+            "nvml_GPU-bbb_fan1",
+            "nvml_GPU-bbb_temp",
+        ];
+        assert_eq!(ids([0, 1]), expected);
+        assert_eq!(ids([1, 0]), expected);
+    }
+
+    #[test]
+    fn a_write_after_a_reorder_reaches_the_card_the_id_names() {
+        let fake = cards([1, 0]); // GPU-bbb is index 0 now
+        nvidia(&fake).set_fan_duty("nvml_GPU-aaa_fan0", 60).unwrap();
+        assert_eq!(fake.calls("set"), ["set 1 0 60"]);
+    }
+
+    #[test]
+    fn a_gpu_with_an_unusable_uuid_is_not_started() {
+        for bad in ["", "GPU_1", "GPU 1"] {
+            let fake = Fake::new(&[(55, &[(30, 900)])]);
+            fake.w().gpus[0].uuid = bad.into();
+            let f = fake.clone();
+            let err = Nvidia::with_api(move || Ok(Box::new(f)), FAST).err();
+            assert!(err.is_some_and(|e| e.0.contains("UUID")), "{bad:?}");
+        }
     }
 
     #[test]
@@ -735,12 +808,12 @@ mod tests {
         let before = duty(&hw);
         let _restore = Restore(&hw, id.clone());
 
-        let (g, f) = id
-            .trim_start_matches("nvml_gpu")
-            .split_once("_fan")
+        let (uuid, f) = id
+            .strip_prefix("nvml_")
+            .and_then(|r| r.rsplit_once("_fan"))
             .unwrap();
         let nvml = nvml_wrapper::Nvml::init().unwrap();
-        let dev = nvml.device_by_index(g.parse().unwrap()).unwrap();
+        let dev = nvml.device_by_uuid(uuid).unwrap();
         // The driver clamps writes to the range the card allows, so aim inside it.
         let (min, max) = dev.min_max_fan_speed().unwrap();
         println!("{id}: driver allows {min}-{max} %, now {before} %");

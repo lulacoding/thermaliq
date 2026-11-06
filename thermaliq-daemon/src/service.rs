@@ -4,6 +4,7 @@
 //! Nothing here calls `process::exit` or aborts a thread.
 
 use crate::app::{self, Token};
+use crate::lifecycle::{self, StopReason};
 use crate::{acl, store};
 use std::ffi::OsString;
 use std::io::Write;
@@ -138,16 +139,25 @@ fn service_main(_args: Vec<OsString>) {
     if let Ok(dir) = store::data_dir() {
         let _ = crate::win::redirect_stderr(&dir.join("service.log"));
     }
+    lifecycle::started(
+        &mut std::io::stderr(),
+        env!("CARGO_PKG_VERSION"),
+        std::process::id(),
+    );
     if let Err(e) = run_service() {
         log(&e);
     }
 }
 
 fn run_service() -> Result<(), String> {
-    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    let (stop_tx, stop_rx) = mpsc::channel::<StopReason>();
     let handler = move |event| match event {
-        ServiceControl::Stop | ServiceControl::Shutdown => {
-            let _ = stop_tx.send(());
+        ServiceControl::Stop => {
+            let _ = stop_tx.send(StopReason::ScmStop);
+            ServiceControlHandlerResult::NoError
+        }
+        ServiceControl::Shutdown => {
+            let _ = stop_tx.send(StopReason::Shutdown);
             ServiceControlHandlerResult::NoError
         }
         ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
@@ -185,6 +195,7 @@ fn run_service() -> Result<(), String> {
     let running = match started {
         Ok(a) => a,
         Err(e) => {
+            lifecycle::startup_failed(&mut std::io::stderr(), &e);
             report(
                 ServiceState::Stopped,
                 none,
@@ -195,6 +206,7 @@ fn run_service() -> Result<(), String> {
             return Err(format!("startup failed: {e}"));
         }
     };
+    lifecycle::running(&mut std::io::stderr(), running.api_addr());
     report(
         ServiceState::Running,
         ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
@@ -203,9 +215,11 @@ fn run_service() -> Result<(), String> {
         Duration::ZERO,
     )?;
 
-    let _ = stop_rx.recv(); // a dropped handler also means stop
+    let reason = lifecycle::wait_for_stop(&stop_rx);
+    lifecycle::stop_requested(&mut std::io::stderr(), reason);
     report(ServiceState::StopPending, none, ok, 1, WAIT_HINT)?;
     let stopped = running.stop(STOP_BUDGET);
+    lifecycle::stopped(&mut std::io::stderr(), &stopped);
     let exit = if stopped.is_ok() {
         ok
     } else {

@@ -4,8 +4,35 @@
 //! Only `hwinfo_win` (Windows) touches the real mapping.
 
 use crate::{Capabilities, HalError, HardwareLayer};
+use std::collections::HashMap;
 use std::fmt;
 use thermaliq_common::{HardwareSnapshot, MetricKind, MetricReading, SensorKind};
+
+/// Lower-case ASCII letters and digits, every other run turned into one `-`.
+fn slug(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        } else if !out.is_empty() && !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.trim_end_matches('-').to_owned()
+}
+
+/// `hwinfo_<group>_<reading>`. A second reading with the same names gets `_2`, a third `_3`,
+/// in HWiNFO's order (SPEC §5.2).
+fn reading_id(seen: &mut HashMap<String, u32>, group: &str, label: &str) -> String {
+    let id = format!("hwinfo_{}_{}", slug(group), slug(label));
+    let n = seen.entry(id.clone()).or_insert(0);
+    *n += 1;
+    if *n == 1 {
+        id
+    } else {
+        format!("{id}_{n}")
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HwinfoError {
@@ -209,17 +236,21 @@ pub(crate) fn parse(buf: &[u8], now: i64) -> Result<HardwareSnapshot, HwinfoErro
     }
 
     let mut snap = HardwareSnapshot::default();
+    let mut seen = HashMap::new();
     for r in readings {
         let Some(group) = u32_at(r, 4).and_then(|i| sensors.get(i as usize)) else {
             continue;
         };
         let name = text(&group[8..136]);
-        if let (Some(ty), Some(rid)) = (u32_at(r, 0), u32_at(r, 8)) {
+        // The id comes from HWiNFO's own names (not the user-renamed label), so it survives a
+        // reorder and a rename (SPEC §5.2).
+        let own_label = text(&r[12..140]);
+        if let Some(ty) = u32_at(r, 0) {
             // HWiNFO's own label (not the user-renamed one) and unit pick the metric.
             let unit = r[268..284].split(|&c| c == 0).next().unwrap_or_default();
             // GPU power only: NVML gives the other GPU metrics, but not power on every card
             // (an RTX 4060 answers "not available"); the combined layer prefers NVML's.
-            let metric = match (ty, text(&r[12..140]).as_str(), unit) {
+            let metric = match (ty, own_label.as_str(), unit) {
                 (READING_TYPE_USAGE, "Total CPU Usage", b"%") => {
                     Some((MetricKind::CpuLoad, SensorKind::Cpu))
                 }
@@ -238,13 +269,11 @@ pub(crate) fn parse(buf: &[u8], now: i64) -> Result<HardwareSnapshot, HwinfoErro
             if let Some((kind, group_kind)) = metric {
                 let value = f64::from_le_bytes(r[284..292].try_into().unwrap_or_default());
                 if kind_of(&name) == group_kind && kind.is_valid(value) {
-                    if let (Some(sid), Some(inst)) = (u32_at(group, 0), u32_at(group, 4)) {
-                        snap.metrics.push(MetricReading {
-                            id: format!("hwinfo_{sid:08x}_{inst}_{rid:08x}"),
-                            kind,
-                            value,
-                        });
-                    }
+                    snap.metrics.push(MetricReading {
+                        id: reading_id(&mut seen, &name, &own_label),
+                        kind,
+                        value,
+                    });
                 }
                 continue;
             }
@@ -270,13 +299,8 @@ pub(crate) fn parse(buf: &[u8], now: i64) -> Result<HardwareSnapshot, HwinfoErro
         {
             continue;
         }
-        let (Some(sensor_id), Some(inst), Some(reading_id)) =
-            (u32_at(group, 0), u32_at(group, 4), u32_at(r, 8))
-        else {
-            continue;
-        };
         snap.sensors.push(thermaliq_common::SensorReading {
-            id: format!("hwinfo_{sensor_id:08x}_{inst}_{reading_id:08x}"),
+            id: reading_id(&mut seen, &name, &own_label),
             label: format!("{label} ({name})"),
             kind: match kind_of(&name) {
                 // SPEC S2 thresholds are for core temperature; these run hotter than the core.
@@ -417,17 +441,17 @@ mod tests {
             got,
             [
                 (
-                    "hwinfo_f0000000_0_00000100".into(),
+                    "hwinfo_cpu-0-intel-core-i7-12700k_total-cpu-usage".into(),
                     MetricKind::CpuLoad,
                     23.5
                 ),
                 (
-                    "hwinfo_f0000000_0_00000101".into(),
+                    "hwinfo_cpu-0-intel-core-i7-12700k_cpu-package-power".into(),
                     MetricKind::CpuPower,
                     65.0
                 ),
                 (
-                    "hwinfo_f0000000_0_00000102".into(),
+                    "hwinfo_cpu-0-intel-core-i7-12700k_average-effective-clock".into(),
                     MetricKind::CpuClock,
                     4700.0
                 ),
@@ -448,12 +472,15 @@ mod tests {
                 ],
             )]
         };
-        for label in ["GPU Power (Total)", "GPU Power"] {
+        for (label, id) in [
+            ("GPU Power (Total)", "gpu-power-total"),
+            ("GPU Power", "gpu-power"),
+        ] {
             let got = metrics(&gpu(label));
             assert_eq!(
                 got,
                 [(
-                    "hwinfo_e0000000_0_00000100".into(),
+                    format!("hwinfo_dgpu-0-nvidia-geforce-rtx-4060-pny-rtx-4060-verto_{id}"),
                     MetricKind::GpuPower,
                     51.8
                 )]
@@ -492,11 +519,11 @@ mod tests {
         assert_eq!(
             ids,
             [
-                "hwinfo_f0000000_0_00000100",
-                "hwinfo_f0000000_0_00000101",
-                "hwinfo_e0000000_0_00000100",
-                "hwinfo_e0000000_0_00000101",
-                "hwinfo_80000000_0_00000100",
+                "hwinfo_cpu-0-intel-core-i7-12700k-dts_core-0",
+                "hwinfo_cpu-0-intel-core-i7-12700k-dts_cpu-package",
+                "hwinfo_gpu-0-nvidia-geforce-rtx-3080_gpu-temperature",
+                "hwinfo_gpu-0-nvidia-geforce-rtx-3080_gpu-hot-spot-temperature",
+                "hwinfo_asus-rog-strix-z690-e-gaming-wifi-nuvoton-nct6798d_cpu",
             ]
         );
         assert!(snap.fans.is_empty());
@@ -505,6 +532,70 @@ mod tests {
             snap.sensors[1].label,
             "CPU Package (CPU [#0]: Intel Core i7-12700K: DTS)"
         );
+    }
+
+    fn ids(groups: &[Group]) -> Vec<String> {
+        let snap = parse(&build(NOW, groups), NOW).unwrap();
+        let mut ids: Vec<_> = snap.sensors.iter().map(|s| s.id.clone()).collect();
+        ids.extend(snap.metrics.iter().map(|m| m.id.clone()));
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn ids_survive_a_reorder_of_groups_and_readings() {
+        let mut shuffled = machine();
+        shuffled.reverse();
+        for g in &mut shuffled {
+            g.3.reverse();
+        }
+        // HWiNFO also renumbers its sensor ids and instances when hardware is added.
+        for (i, g) in shuffled.iter_mut().enumerate() {
+            g.0 = 0x1000 + i as u32;
+            g.1 = 7 + i as u32;
+        }
+        assert_eq!(ids(&shuffled), ids(&machine()));
+    }
+
+    #[test]
+    fn a_reading_with_the_same_names_gets_a_numbered_id_in_hwinfos_order() {
+        let two = vec![
+            (
+                0x1,
+                0,
+                "Drive: Samsung SSD",
+                vec![(TEMP, "Drive Temperature", 40.0)],
+            ),
+            (
+                0x2,
+                1,
+                "Drive: Samsung SSD",
+                vec![(TEMP, "Drive Temperature", 50.0)],
+            ),
+        ];
+        let snap = parse(&build(NOW, &two), NOW).unwrap();
+        let got: Vec<_> = snap
+            .sensors
+            .iter()
+            .map(|s| (s.id.as_str(), s.temp_celsius))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("hwinfo_drive-samsung-ssd_drive-temperature", 40.0),
+                ("hwinfo_drive-samsung-ssd_drive-temperature_2", 50.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn slugs_keep_only_lower_case_ascii_letters_digits_and_single_dashes() {
+        assert_eq!(
+            slug("CPU [#0]: AMD Ryzen 5 5600: Enhanced"),
+            "cpu-0-amd-ryzen-5-5600-enhanced"
+        );
+        assert_eq!(slug("  --Core °C (max) "), "core-c-max");
+        assert_eq!(slug(""), "");
     }
 
     #[test]

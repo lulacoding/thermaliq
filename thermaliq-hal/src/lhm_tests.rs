@@ -88,6 +88,7 @@ impl BridgeConnection for FakeConnection {
             "hello" => json!({
                 "ok": true, "protocol": 1, "lhm": "0.9.7-pre742",
                 "controllable": [FAN, PUMP], "refused_chips": [],
+                "board": "TEST BOARD (Nuvoton NCT6687D)",
             }),
             "snapshot" => match self.0.scripted.lock().unwrap().pop_front() {
                 Some(Ok(v)) => v,
@@ -185,6 +186,12 @@ fn start_says_hello_and_lists_the_controllable_fans() {
     let (shared, b) = make();
     assert_eq!(shared.ops()[0], "hello");
     assert_eq!(b.capabilities().controllable_fans, [FAN, PUMP]);
+}
+
+#[test]
+fn hello_gives_the_board_fingerprint() {
+    let (_, b) = make();
+    assert_eq!(b.board().as_deref(), Some("TEST BOARD (Nuvoton NCT6687D)"));
 }
 
 #[test]

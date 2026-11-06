@@ -1,5 +1,5 @@
-# Sensor and fan IDs here (cpu_package, gpu_edge, chassis1, ...) are role IDs, not real hardware IDs.
-# The first-run mapping (PORTING M13) translates them to this PC's hardware before the profile is used.
+# Sensor and fan IDs here (cpu_temp, gpu_temp, cpu_fan, gpu_fan, case_fans) are role IDs, not real hardware IDs.
+# roles.toml (written by `thermaliq-daemon identify`, SPEC 5.2) maps them to this PC's hardware when the profile loads.
 
 name = "gaming"
 description = "Aggressive CPU and GPU curves, chassis reacts to load"
@@ -7,7 +7,7 @@ description = "Aggressive CPU and GPU curves, chassis reacts to load"
 [[curves]]
 id = "cpu_aggressive"
 type = "linear"
-source = "cpu_package"
+source = "cpu_temp"
 min_temp = 35
 max_temp = 75
 min_pwm = 35
@@ -16,7 +16,7 @@ max_pwm = 100
 [[curves]]
 id = "gpu_curve"
 type = "linear"
-source = "gpu_edge"
+source = "gpu_temp"
 min_temp = 35
 max_temp = 75
 min_pwm = 35
@@ -25,7 +25,7 @@ max_pwm = 100
 [[curves]]
 id = "chassis_gaming"
 type = "trigger"
-source = "cpu_package"
+source = "cpu_temp"
 idle_temp = 45
 idle_pwm = 35
 load_temp = 70
@@ -33,34 +33,34 @@ load_pwm = 90
 response_ms = 2000
 
 [[controls]]
-fan = "cpu1"
+fan = "cpu_fan"
 curve = "cpu_aggressive"
 step_up_pct = 15
 step_down_pct = 3
 min_pwm = 35
 
 [[controls]]
-fan = "gpu1"
+fan = "gpu_fan"
 curve = "gpu_curve"
 step_up_pct = 15
 step_down_pct = 3
 min_pwm = 35
 
 [[controls]]
-fan = "chassis1"
+fan = "case_fans"
 curve = "chassis_gaming"
 step_up_pct = 15
 step_down_pct = 3
 min_pwm = 35
 
 [[alerts]]
-sensor = "cpu_package"
+sensor = "cpu_temp"
 threshold = 85
 severity = "warn"
 action = { type = "notify" }
 
 [[alerts]]
-sensor = "gpu_edge"
+sensor = "gpu_temp"
 threshold = 85
 severity = "crit"
 action = { type = "notify" }

@@ -16,7 +16,7 @@ use thermaliq_agent::optimiser::REQUEST_TTL;
 use thermaliq_common::{
     bundled_profiles, FanReading, HardwareSnapshot, MetricReading, Profile, SensorReading,
 };
-use thermaliq_engine::{Engine, Source};
+use thermaliq_engine::{Engine, Source, WRITE_FAILS_DEGRADED};
 use thermaliq_hal::HardwareLayer;
 use tokio::sync::{oneshot, watch};
 
@@ -75,6 +75,8 @@ impl AgentState {
 struct AgentFlags {
     paused: AtomicBool,
     crashed: AtomicBool,
+    /// Reasons set from outside the engine thread (the identity check); shown with every cache read.
+    notes: Mutex<Vec<String>>,
 }
 
 impl AgentFlags {
@@ -197,7 +199,25 @@ impl Handle {
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
         c.status.agent = self.flags.state(); // read live, so pause shows at once
+        let notes = self
+            .flags
+            .notes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !notes.is_empty() {
+            c.status.degraded = true;
+            c.status.degraded_reasons.extend(notes.iter().cloned());
+        }
         c
+    }
+
+    /// Adds a reason that stays in `/status` `degraded_reasons` until the service restarts.
+    pub fn note_degraded(&self, why: String) {
+        self.flags
+            .notes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(why);
     }
 
     /// Withdraws the agent's requests and ignores it until `resume_agent`.
@@ -433,6 +453,29 @@ impl Daemon {
                             ));
                         }
                         let mut degraded_reasons = sources.degraded_reasons();
+                        // Inert controls: the profile names fans that no backend lists (SPEC §5.2).
+                        degraded_reasons.extend(engine.missing_fans().into_iter().map(|f| {
+                            format!("the active profile controls fan '{f}', which no backend lists")
+                        }));
+                        // Writes the HAL keeps refusing (a bridge read-back that never lands, say).
+                        degraded_reasons.extend(engine.failing_writes().into_iter().map(
+                            |(fan, e)| {
+                                format!(
+                                    "fan '{fan}': {WRITE_FAILS_DEGRADED} or more writes in a row failed ({e})"
+                                )
+                            },
+                        ));
+                        // A profile whose roles all went unmapped leaves every fan to the BIOS (SPEC §5.2).
+                        if engine.controls_nothing() {
+                            degraded_reasons.push(format!(
+                                "profile '{}' controls no fans: run thermaliq-daemon identify",
+                                shared
+                                    .profile
+                                    .read()
+                                    .unwrap_or_else(PoisonError::into_inner)
+                                    .name
+                            ));
+                        }
                         // A fresh snapshot with no fan at all means every fan backend failed to
                         // start or lost its fans. An empty engine must not look healthy (S8).
                         if engine.snapshot_fresh() && snapshot.fans.is_empty() {
@@ -791,6 +834,36 @@ mod tests {
     }
 
     #[test]
+    fn an_active_profile_fan_no_backend_lists_is_degraded_and_named() {
+        let hal = Arc::new(MockHardwareLayer::new(&["other"], vec![at(40.0)]));
+        let active = Profile::from_toml(FLAT).unwrap();
+        let d = Daemon::start(hal, &active, vec![], db(), fast());
+        wait_until(|| d.cache().ticks > 3);
+        let c = d.cache();
+        assert!(c.status.degraded);
+        let why = c.status.degraded_reasons.join("\n");
+        assert!(why.contains("'f1'"), "{why}");
+    }
+
+    #[tokio::test]
+    async fn switching_to_a_profile_with_an_unlisted_fan_is_refused_by_name_and_changes_nothing() {
+        let (_, d) = start(vec![at(40.0)], vec![], &db(), fast());
+        wait_until(|| d.cache().ticks > 1);
+        let bad = Profile::from_toml(
+            &FLAT
+                .replace("name = \"flat\"", "name = \"bad\"")
+                .replace("f1", "gone"),
+        )
+        .unwrap();
+        let err = d.handle().set_profile(bad).await.unwrap_err();
+        let CommandError::Rejected(m) = err else {
+            panic!("{err:?}")
+        };
+        assert!(m.contains("'gone'"), "{m}");
+        assert_eq!(d.cache().active_profile, "flat");
+    }
+
+    #[test]
     fn fans_present_means_no_missing_fans_reason() {
         let hal = Arc::new(MockHardwareLayer::new(&["f1"], vec![at(40.0)]));
         let active = Profile::from_toml(FLAT).unwrap();
@@ -1025,6 +1098,63 @@ mod tests {
         ));
         d.shutdown().unwrap();
         assert!(hal.writes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_noted_reason_shows_in_the_cache_and_marks_it_degraded() {
+        let (_, d) = start(vec![at(40.0)], vec![], &db(), fast());
+        wait_until(|| d.cache().ticks > 0);
+        assert!(!d.cache().status.degraded);
+        d.handle().note_degraded("the board changed".into());
+        let c = d.cache();
+        assert!(
+            c.status.degraded
+                && c.status
+                    .degraded_reasons
+                    .contains(&"the board changed".into())
+        );
+        d.shutdown().unwrap();
+    }
+
+    #[test]
+    fn a_fan_whose_writes_keep_failing_is_degraded_with_the_error_until_one_lands() {
+        let hal = Arc::new(MockHardwareLayer::new(&["f1", "f2"], vec![at(40.0)]));
+        hal.fail_writes("f1");
+        let active = Profile::from_toml(FLAT).unwrap();
+        let d = Daemon::start(hal.clone(), &active, vec![], db(), fast());
+        wait_until(|| {
+            d.cache()
+                .status
+                .degraded_reasons
+                .iter()
+                .any(|r| r.contains("'f1'") && r.contains("injected write failure on 'f1'"))
+        });
+        assert!(d.cache().status.degraded);
+        hal.heal_writes("f1");
+        wait_until(|| d.cache().status.degraded_reasons.is_empty());
+        d.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_active_profile_with_no_controls_is_degraded_until_one_with_controls_is_active() {
+        let hal = Arc::new(MockHardwareLayer::new(&["f1", "f2"], vec![at(40.0)]));
+        let empty = Profile::from_toml("name = \"bare\"\n").unwrap();
+        let d = Daemon::start(hal, &empty, vec![], db(), fast());
+        wait_until(|| d.cache().ticks > 2);
+        let c = d.cache();
+        let want = "profile 'bare' controls no fans: run thermaliq-daemon identify";
+        assert!(c.status.degraded, "{:?}", c.status);
+        assert!(
+            c.status.degraded_reasons.iter().any(|r| r == want),
+            "{:?}",
+            c.status
+        );
+        d.handle()
+            .set_profile(Profile::from_toml(FLAT).unwrap())
+            .await
+            .unwrap();
+        wait_until(|| d.cache().status.degraded_reasons.is_empty());
+        d.shutdown().unwrap();
     }
 
     #[tokio::test]

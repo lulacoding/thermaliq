@@ -13,8 +13,9 @@
 param(
     [string]$DataDir = (Join-Path $env:TEMP 'tiq'),
     [int]$Port = 7272,
-    [string]$Fan = 'nvml_gpu0_fan0',
-    [string]$GpuSensor = 'nvml_gpu0_temp',
+    # Blank = the first NVIDIA GPU's `nvml_<uuid>_fan0` / `_temp` (SPEC 5.2), read with nvidia-smi.
+    [string]$Fan = '',
+    [string]$GpuSensor = '',
     [int]$ProfileMin = 40,
     # The agent's GPU target at slider 50 (SPEC 7.2: a line from 80 at quiet to 65 at cool).
     [double]$Target = 72.5,
@@ -31,6 +32,13 @@ param(
     [string]$CheckCsv = ''
 )
 $ErrorActionPreference = 'Stop'
+if (-not $SelfTest -and -not $CheckCsv -and (-not $Fan -or -not $GpuSensor)) {
+    $env:PATH += ";$env:ProgramFiles\NVIDIA Corporation\NVSMI"
+    $uuid = "$(nvidia-smi --query-gpu=uuid --format=csv,noheader | Select-Object -First 1)".Trim()
+    if (-not $uuid) { throw 'nvidia-smi gave no GPU UUID: pass -Fan and -GpuSensor' }
+    if (-not $Fan) { $Fan = "nvml_${uuid}_fan0" }
+    if (-not $GpuSensor) { $GpuSensor = "nvml_${uuid}_temp" }
+}
 $inv = [Globalization.CultureInfo]::InvariantCulture
 $MaxLower = 15      # SPEC 7.2: at most 15 points below the curve
 $BoostLimit = 60    # SPEC 7.2: a boost lasts at most 60 s

@@ -3,6 +3,7 @@
 //! only answers 200 once the engine thread (or the disk) has actually done it.
 
 use crate::history::HistoryDb;
+use crate::identity::{Identity, ProbeError};
 use crate::keychain::{Account, Key};
 use crate::runtime::{clamp_override, Cache, CommandError, Handle};
 use crate::slow::SlowShared;
@@ -16,9 +17,11 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use thermaliq_agent::classifier::Workload;
@@ -47,12 +50,19 @@ pub struct ApiState {
     /// The port we are served on; only `Host: <loopback name>:<port>` is accepted.
     port: u16,
     slow: SlowShared,
+    identity: Arc<Identity>,
 }
 
 impl ApiState {
     /// `ApiServer::start` sets this itself; tests that skip the server set it here.
     pub fn on_port(mut self, port: u16) -> Self {
         self.port = port;
+        self
+    }
+
+    /// The roles, inventory and fan list the daemon loaded at start (SPEC §5.2).
+    pub fn with_identity(mut self, identity: Arc<Identity>) -> Self {
+        self.identity = identity;
         self
     }
 
@@ -69,6 +79,7 @@ impl ApiState {
             profiles: profiles.into(),
             history,
             token: token.into(),
+            identity: Arc::new(Identity::empty(dir.clone())),
             dir: Arc::new(dir),
             config_lock: Arc::default(),
             port: 0,
@@ -117,6 +128,9 @@ pub fn router(state: ApiState) -> Router {
         .route("/agent/decisions", get(agent_decisions))
         .route("/agent/key", put(put_key).delete(delete_key))
         .route("/agent/workloads/{exe}", put(put_workload))
+        .route("/identify/probe", post(identify_probe))
+        .route("/roles", put(put_roles))
+        .route("/inventory/accept", post(accept_inventory))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer,
@@ -133,6 +147,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/fans", get(fans))
         .route("/metrics", get(metrics))
         .route("/profiles", get(profiles))
+        .route("/identity", get(identity))
         .route("/config", get(get_config))
         .route("/history/sensors/{id}", get(history_sensor))
         .route(
@@ -275,6 +290,10 @@ async fn profiles(State(s): State<ApiState>) -> Json<Value> {
     )
 }
 
+async fn identity(State(s): State<ApiState>) -> Json<Value> {
+    Json(s.identity.describe(&s.handle.cache().snapshot))
+}
+
 async fn history_sensor(State(s): State<ApiState>, Path(id): Path<String>) -> ApiResult {
     let rows = tokio::task::spawn_blocking(move || {
         s.history
@@ -307,6 +326,55 @@ async fn set_active_profile(State(s): State<ApiState>, Json(b): Json<ProfileName
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no profile '{}'", b.name)))?;
     s.handle.set_profile(profile.clone()).await?;
     Ok(Json(json!({"active_profile": b.name})))
+}
+
+#[derive(Deserialize)]
+struct ProbeBody {
+    fan: String,
+}
+
+/// Holds one fan at 100% for 5 s and says which tach rose (SPEC §5.2). Answers after the probe.
+async fn identify_probe(State(s): State<ApiState>, Json(b): Json<ProbeBody>) -> ApiResult {
+    match s.identity.probe(&s.handle, &s.profiles, &b.fan).await {
+        Ok(v) => Ok(Json(v)),
+        Err(ProbeError::UnknownFan(f)) => Err(ApiError(
+            StatusCode::NOT_FOUND,
+            format!("no controllable fan '{f}'"),
+        )),
+        Err(ProbeError::Busy) => Err(ApiError(
+            StatusCode::CONFLICT,
+            "another probe is running".into(),
+        )),
+        Err(ProbeError::Latched) => Err(ApiError(
+            StatusCode::CONFLICT,
+            "the safety latch holds every fan at 100%; try again once it releases".into(),
+        )),
+        Err(ProbeError::Engine(e)) => Err(e.into()),
+        Err(ProbeError::NotRestored(m)) => Err(internal(m)),
+    }
+}
+
+#[derive(Deserialize)]
+struct RolesBody {
+    roles: BTreeMap<String, thermaliq_common::identity::Role>,
+}
+
+/// Replaces `roles.toml`. Profiles pick it up when the service next starts.
+async fn put_roles(State(s): State<ApiState>, Json(b): Json<RolesBody>) -> ApiResult {
+    s.identity
+        .set_roles(&b.roles, &s.handle.cache().snapshot)
+        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
+    Ok(Json(json!({
+        "roles": b.roles,
+        "applies": "when the service restarts",
+    })))
+}
+
+async fn accept_inventory(State(s): State<ApiState>) -> ApiResult {
+    s.identity
+        .accept_inventory(&s.handle.cache().snapshot)
+        .map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
+    Ok(Json(json!({"inventory": "saved"})))
 }
 
 #[derive(Deserialize)]
@@ -521,12 +589,17 @@ impl ApiServer {
         let addr = listener.local_addr()?;
         state.port = addr.port();
         let (stop, stopped) = oneshot::channel::<()>();
+        let asked = Arc::new(AtomicBool::new(false));
+        let asked_in = asked.clone();
         let task = rt.spawn(async move {
-            let _ = axum::serve(listener, router(state))
-                .with_graceful_shutdown(async {
+            let ended = axum::serve(listener, router(state))
+                .with_graceful_shutdown(async move {
                     let _ = stopped.await;
+                    asked_in.store(true, Ordering::SeqCst);
                 })
                 .await;
+            // An end nobody asked for would leave the daemon running with no API.
+            crate::lifecycle::api_exited(&mut io::stderr(), asked.load(Ordering::SeqCst), &ended);
         });
         Ok(Self {
             rt: Some(rt),
@@ -730,6 +803,141 @@ mod tests {
         let (code, v) = call(&r, "POST", "/agent/resume", Some(TOKEN), None).await;
         assert_eq!((code, &v["agent"]), (StatusCode::OK, &json!("running")));
         assert_eq!(get(&r, "/status").await.1["agent"], "running");
+    }
+
+    // ---- identity (M13) ----
+
+    fn identified(mut r: Rig) -> Rig {
+        let (id, _) = Identity::load(r.dir.path(), &*r.hal, vec![]);
+        let id = Arc::new(id.with_probe_time(Duration::from_millis(100)));
+        r.state = r.state.clone().with_identity(id);
+        r
+    }
+
+    #[tokio::test]
+    async fn the_identity_endpoints_that_change_things_need_the_token() {
+        let r = identified(rig(vec![at(40.0)]));
+        for (m, path, b) in [
+            ("POST", "/identify/probe", Some(json!({"fan": "f2"}))),
+            (
+                "PUT",
+                "/roles",
+                Some(json!({"roles": {"case_fans": ["f2"]}})),
+            ),
+            ("POST", "/inventory/accept", None),
+        ] {
+            let (code, _) = call(&r, m, path, None, b).await;
+            assert_eq!(code, StatusCode::UNAUTHORIZED, "{m} {path}");
+        }
+        assert!(!r.dir.path().join("roles.toml").exists());
+        assert_eq!(get(&r, "/identity").await.0, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn identity_lists_the_fans_the_unmapped_roles_and_what_to_do_next() {
+        let r = identified(rig(vec![at(40.0)]));
+        ticked(&r).await;
+        let (_, v) = get(&r, "/identity").await;
+        assert_eq!(v["fans"][0]["id"], "f1");
+        assert!(v["unmapped_roles"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("case_fans")));
+        assert_eq!(v["inventory"]["missing"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn a_probe_over_the_api_pairs_the_tach_and_restores_the_profile() {
+        let r = identified(rig(vec![at(40.0)]));
+        ticked(&r).await;
+        let (code, v) = call(
+            &r,
+            "POST",
+            "/identify/probe",
+            Some(TOKEN),
+            Some(json!({"fan": "f2"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{v}");
+        assert_eq!(v["pairing"]["result"], "own");
+        assert_eq!(get(&r, "/status").await.1["active_profile"], "flat");
+        let (code, v) = call(
+            &r,
+            "POST",
+            "/identify/probe",
+            Some(TOKEN),
+            Some(json!({"fan": "nope"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::NOT_FOUND, "{v}");
+    }
+
+    #[tokio::test]
+    async fn put_roles_validates_writes_the_file_and_says_when_it_applies() {
+        let r = identified(rig(vec![at(40.0)]));
+        ticked(&r).await;
+        // One bad member refuses the whole group, and the old per-location roles are gone.
+        for bad in [
+            json!({"roles": {"case_fans": ["f2", "ghost"]}}),
+            json!({"roles": {"case_front": "f2"}}),
+            json!({"roles": {"case_fans": "f2"}}),
+            json!({"roles": {"cpu_fan": ["f2"]}}),
+        ] {
+            let (code, v) = call(&r, "PUT", "/roles", Some(TOKEN), Some(bad.clone())).await;
+            assert_eq!(code, StatusCode::BAD_REQUEST, "{bad} {v}");
+        }
+        let (_, v) = call(
+            &r,
+            "PUT",
+            "/roles",
+            Some(TOKEN),
+            Some(json!({"roles": {"case_fans": ["f2", "ghost"]}})),
+        )
+        .await;
+        assert!(v["error"].as_str().unwrap().contains("ghost"));
+        assert!(!r.dir.path().join("roles.toml").exists());
+        let ok = json!({"roles": {"case_fans": ["f1", "f2"]}});
+        let (code, v) = call(&r, "PUT", "/roles", Some(TOKEN), Some(ok)).await;
+        assert_eq!(code, StatusCode::OK, "{v}");
+        assert!(v["applies"].as_str().unwrap().contains("restart"));
+        let saved = std::fs::read_to_string(r.dir.path().join("roles.toml")).unwrap();
+        assert!(saved.contains("case_fans") && saved.contains("f2"));
+        assert_eq!(
+            get(&r, "/identity").await.1["roles"]["case_fans"],
+            json!(["f1", "f2"])
+        );
+    }
+
+    #[tokio::test]
+    async fn activating_a_profile_with_a_fan_no_backend_lists_is_409_and_names_the_fan() {
+        let r = rig(vec![at(40.0)]);
+        ticked(&r).await;
+        let bad = FLAT
+            .replace("name = \"flat\"", "name = \"ghosty\"")
+            .replace("f1", "ghost");
+        let mut profiles: Vec<Profile> = r.state.profiles.to_vec();
+        profiles.push(Profile::from_toml(&bad).unwrap());
+        let state = ApiState::new(
+            r.daemon.handle(),
+            profiles,
+            r.db.clone(),
+            TOKEN.into(),
+            r.dir.path().into(),
+            SlowShared::new(Arc::new(crate::keychain::MemoryKeys::default()), "x".into()),
+        )
+        .on_port(PORT);
+        let r = Rig { state, ..r };
+        let (code, v) = call(
+            &r,
+            "POST",
+            "/profiles/active",
+            Some(TOKEN),
+            Some(json!({"name": "ghosty"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CONFLICT, "{v}");
+        assert!(v["error"].as_str().unwrap().contains("'ghost'"), "{v}");
+        assert_eq!(get(&r, "/status").await.1["active_profile"], "flat");
     }
 
     // ---- the slow layer's endpoints (M20c) ----

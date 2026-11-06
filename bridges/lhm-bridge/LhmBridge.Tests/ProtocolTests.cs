@@ -29,6 +29,7 @@ public sealed class ProtocolTests : IDisposable
         Assert.Equal(Protocol.Version, r.GetProperty("protocol").GetInt32());
         Assert.Equal(LhmInternals.PinnedVersion, r.GetProperty("lhm").GetString());
         Assert.Equal(FanId, r.GetProperty("controllable")[0].GetString());
+        Assert.Equal(FakeHardware.BoardName, r.GetProperty("board").GetString());
     }
 
     [Fact]

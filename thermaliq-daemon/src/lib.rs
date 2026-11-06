@@ -9,11 +9,13 @@ pub mod app;
 pub mod decision_client;
 pub mod foreground;
 pub mod history;
+pub mod identity;
 #[cfg(feature = "gate-tests")]
 pub mod inject;
 pub mod keychain;
 #[cfg(windows)]
 pub mod lhm_bridge;
+pub mod lifecycle;
 pub mod runtime;
 #[cfg(windows)]
 pub mod service;
