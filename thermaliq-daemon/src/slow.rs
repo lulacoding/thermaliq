@@ -853,8 +853,10 @@ mod tests {
         profiles: Vec<Profile>,
         known: &[(&str, &str)],
     ) -> Rig {
-        let mut config = DaemonConfig::default();
-        config.default_profile = profiles[0].name.clone();
+        let config = DaemonConfig {
+            default_profile: profiles[0].name.clone(),
+            ..DaemonConfig::default()
+        };
         rig_on_with_config(hal, profiles, known, config)
     }
 
@@ -983,13 +985,15 @@ mod tests {
 
     #[test]
     fn a_matching_schedule_selects_its_profile_when_no_higher_priority_request_exists() {
-        let mut config = DaemonConfig::default();
-        config.default_profile = "balanced".into();
-        config.schedule.push(thermaliq_common::ScheduleEntry {
-            days: vec![],
-            time: "00:00-24:00".into(),
-            profile: "scheduled".into(),
-        });
+        let config = DaemonConfig {
+            default_profile: "balanced".into(),
+            schedule: vec![thermaliq_common::ScheduleEntry {
+                days: vec![],
+                time: "00:00-24:00".into(),
+                profile: "scheduled".into(),
+            }],
+            ..DaemonConfig::default()
+        };
         let r = rig_with_config(
             vec![toml("balanced", "f1"), toml("scheduled", "f1")],
             &[],
@@ -1004,13 +1008,15 @@ mod tests {
             "name='balanced'\n[[curves]]\ntype='flat'\nid='c'\npwm=30\n[[controls]]\nfan='f1'\ncurve='c'\nstep_up_pct=100\nstep_down_pct=100\n[[app_rules]]\nprocess='editor.exe'\nprofile='app'",
         )
         .unwrap();
-        let mut config = DaemonConfig::default();
-        config.default_profile = "balanced".into();
-        config.schedule.push(thermaliq_common::ScheduleEntry {
-            days: vec![],
-            time: "00:00-24:00".into(),
-            profile: "scheduled".into(),
-        });
+        let config = DaemonConfig {
+            default_profile: "balanced".into(),
+            schedule: vec![thermaliq_common::ScheduleEntry {
+                days: vec![],
+                time: "00:00-24:00".into(),
+                profile: "scheduled".into(),
+            }],
+            ..DaemonConfig::default()
+        };
         let r = rig_with_config(
             vec![base, toml("app", "f1"), toml("scheduled", "f1")],
             &[],
