@@ -342,6 +342,37 @@ mod tests {
     }
 
     #[test]
+    fn a_matching_app_rule_beats_a_live_agent_intent_offered_under_the_new_generation() {
+        let (mut a, _) = arb(RULES);
+        a.set_foreground(Some("cs2.exe")); // bumps the generation first, as in real use
+        let seen = a.generations();
+        assert_eq!(
+            a.offer_intent(secs(0), "performance", seen, &ALL),
+            Offer::Activated
+        );
+        let s = a.select(secs(0), &ALL);
+        assert_eq!(
+            (s.effective.as_str(), s.source, s.rule_id.as_deref()),
+            ("gaming", ProfileSource::App, Some("cs2")),
+            "the intent is live, and the app rule still wins"
+        );
+    }
+
+    #[test]
+    fn a_live_agent_intent_beats_a_matching_schedule() {
+        let (mut a, _) = arb(RULES); // `night` covers the whole day
+        assert_eq!(sel(&mut a, 0).1, ProfileSource::Schedule, "control");
+        assert_eq!(offer(&mut a, 0, "performance"), Offer::Activated);
+        let (p, s, r) = sel(&mut a, 1);
+        assert_eq!(
+            (p.as_str(), s, r),
+            ("performance", ProfileSource::Agent, None)
+        );
+        // the lease lapses: the schedule is back
+        assert_eq!(sel(&mut a, 10).1, ProfileSource::Schedule);
+    }
+
+    #[test]
     fn manual_choice_never_preempts_a_live_source_and_is_reported_separately() {
         let (mut a, _) = arb(RULES);
         a.set_foreground(Some("cs2.exe"));

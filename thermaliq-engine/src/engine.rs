@@ -181,7 +181,7 @@ impl Engine {
             .iter()
             .any(|f| f.id == fan && f.ctl.request(Source::Override).is_some())
         {
-            return Err(format!("fan '{fan}' has a live override"));
+            return Err(format!("fan has a live override: '{fan}'"));
         }
         if self.probes.iter().any(|p| p.fan == fan) {
             return Err(format!("fan '{fan}' is already being probed"));
@@ -1174,7 +1174,8 @@ mod profile_switch_tests {
         e.submit("f1", Source::Override, 80, Some(secs(99)))
             .unwrap();
         let err = e.start_probe("f1", secs(8)).unwrap_err();
-        assert!(err.contains("live override"), "{err}");
+        assert!(err.contains("fan has a live override"), "{err}");
+        assert!(err.contains("'f1'"), "names the fan: {err}");
         let id = e.start_probe("f2", secs(8)).unwrap();
         assert!(e.start_probe("f2", secs(8)).is_err(), "one probe per fan");
         assert!(!e.end_probe("f2", id + 1), "someone else's id");
