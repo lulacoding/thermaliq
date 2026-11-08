@@ -55,6 +55,27 @@ pub fn array_table(v: &Value, headers: &[&str], fields: &[&str]) -> String {
     table(headers, &rows_of(v, fields))
 }
 
+/// `gaming (app: cs2)`: the profile in effect, what put it there and the rule behind it.
+pub fn winner(profile: &Value, source: &Value, rule_id: &Value) -> String {
+    match (source.as_str(), rule_id.as_str()) {
+        (Some(s), Some(r)) => format!("{} ({s}: {r})", cell(profile)),
+        (Some(s), None) => format!("{} ({s})", cell(profile)),
+        _ => cell(profile),
+    }
+}
+
+fn profile_line(v: &Value) -> String {
+    let effective = winner(
+        &v["active_profile"],
+        &v["profile_source"],
+        &v["profile_rule_id"],
+    );
+    match v["chosen_profile"].as_str() {
+        Some(chosen) => format!("{effective}; chosen: {chosen}"),
+        None => effective,
+    }
+}
+
 pub fn status(v: &Value) -> String {
     let state = if v["latched"] == true {
         "LATCHED (every fan held at 100%)"
@@ -68,7 +89,7 @@ pub fn status(v: &Value) -> String {
     let mut s = format!(
         "state:         {state}\nengine:        {}\nprofile:       {}\nagent:         {}\nticks:         {}\nsnapshot age:  {} s\n",
         if v["engine_running"] == true { "running" } else { "stopped" },
-        cell(&v["active_profile"]),
+        profile_line(v),
         cell(&v["agent"]),
         cell(&v["ticks"]),
         cell(&v["snapshot_age"]),

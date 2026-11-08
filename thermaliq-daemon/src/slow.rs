@@ -1,11 +1,15 @@
-//! The slow layer's thread (SPEC §7.2). Separate from the fast layer, because a local call can
-//! take a minute and hosted can take 2 s. It only submits to the engine (S1): profile changes
-//! through the same validated path as the API. If it dies, fans carry on untouched.
+//! The slow layer's threads (SPEC §7.2, §4.1). The worker is separate from the fast layer,
+//! because a local call can take a minute and hosted can take 2 s; the supervisor picks the
+//! profile (the arbiter) and puts it in the engine through the same validated path as the API.
+//! Both only submit to the engine (S1). If they die, fans carry on untouched.
 
+use crate::arbiter::Generations;
+use crate::arbiter::{Offer, ProfileSource};
 use crate::history::HistoryDb;
 use crate::keychain::KeyStore;
 use crate::runtime::{AgentState, Handle};
 use serde::Serialize;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,13 +18,15 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use thermaliq_agent::classifier::Workload;
 use thermaliq_agent::decision::{
-    builtin_workload, clean_exe, game_like, why_not_switch, Change, Decision, DecisionProvider,
-    Foreground, Known, Observation, Settled, SlowLayer, Source, Step,
+    builtin_workload, clean_exe, game_like, profile_for, why_not_switch, Decision,
+    DecisionProvider, Foreground, Known, Observation, Settled, SlowLayer, Source, Step,
 };
 use thermaliq_common::{DaemonConfig, HardwareSnapshot, MetricKind, Profile, SensorKind};
 
 const STEP: Duration = Duration::from_secs(1);
 const MAX_LOG: usize = 100;
+/// Not a refusal: it passes by itself, so it never gets a log entry of its own.
+const WAITING: &str = "hardware is changing or degraded: waiting for a stable snapshot";
 
 pub type ForegroundFn = Arc<dyn Fn() -> Option<Foreground> + Send + Sync>;
 
@@ -96,11 +102,19 @@ pub struct View {
     pub crashed: bool,
 }
 
-/// What the API shares with the thread.
+/// What the worker decided for the foreground exe, and the generations it started under.
+struct Proposal {
+    exe: String,
+    profile: &'static str,
+    gens: Generations,
+}
+
+/// What the API shares with the threads.
 #[derive(Clone)]
 pub struct SlowShared {
     view: Arc<Mutex<View>>,
     answers: Arc<Mutex<Vec<(String, Workload)>>>,
+    proposal: Arc<Mutex<Option<Proposal>>>,
     keys: Arc<dyn KeyStore>,
     hosted_error: Arc<Mutex<Option<String>>>,
 }
@@ -113,6 +127,7 @@ impl SlowShared {
                 ..View::default()
             })),
             answers: Arc::default(),
+            proposal: Arc::default(),
             keys,
             hosted_error: Arc::default(),
         }
@@ -156,12 +171,23 @@ impl SlowShared {
         std::mem::take(&mut *self.answers.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
+    fn propose(&self, p: Proposal) {
+        *self.proposal.lock().unwrap_or_else(PoisonError::into_inner) = Some(p);
+    }
+
+    fn take_proposal(&self) -> Option<Proposal> {
+        self.proposal
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+
     fn update(&self, f: impl FnOnce(&mut View)) {
         f(&mut self.view.lock().unwrap_or_else(PoisonError::into_inner));
     }
 }
 
-/// What the thread needs.
+/// What the threads need.
 pub struct SlowParts {
     pub handle: Handle,
     pub profiles: Vec<Profile>,
@@ -181,32 +207,58 @@ impl SlowParts {
     pub const DEFAULT_STABLE: Duration = Settled::FOR;
 }
 
+/// Two threads. The worker classifies the foreground app and may block in a provider call for
+/// a minute. The supervisor reads the foreground, renews the Agent's profile lease every period,
+/// asks the arbiter which profile wins and puts it in the engine: app rules and schedules keep
+/// working when the worker is slow, paused or dead.
 pub struct SlowThread {
     stopping: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
+    threads: Vec<JoinHandle<()>>,
 }
 
 impl SlowThread {
     pub fn start(parts: SlowParts) -> Self {
+        parts.handle.configure_selection(&parts.config);
         let stopping = Arc::new(AtomicBool::new(false));
-        let flag = stopping.clone();
-        let shared = parts.shared.clone();
-        let thread = std::thread::Builder::new()
-            .name("thermaliq-slow".into())
-            .spawn(move || {
+        let (worker, supervisor) = split(parts);
+        let spawn = |name: &str, run: Box<dyn FnOnce() + Send>| {
+            std::thread::Builder::new()
+                .name(name.into())
+                .spawn(run)
+                .expect("spawn slow-layer thread")
+        };
+        let (flag, shared) = (stopping.clone(), worker.shared.clone());
+        let worker = spawn(
+            "thermaliq-slow",
+            Box::new(move || {
                 // Only this layer stops: the engine and the fast layer don't depend on it.
-                if catch_unwind(AssertUnwindSafe(|| run(parts, &flag))).is_err() {
+                if catch_unwind(AssertUnwindSafe(|| work(worker, &flag))).is_err() {
                     shared.update(|v| v.crashed = true);
                 }
-            })
-            .expect("spawn slow-layer thread");
+            }),
+        );
+        let (flag, shared, handle) = (
+            stopping.clone(),
+            supervisor.shared.clone(),
+            supervisor.handle.clone(),
+        );
+        let supervisor = spawn(
+            "thermaliq-arbiter",
+            Box::new(move || {
+                if catch_unwind(AssertUnwindSafe(|| supervise(supervisor, &flag))).is_err() {
+                    shared.update(|v| v.crashed = true);
+                }
+                // However it ended, no lease outlives its supervisor.
+                handle.arbiter().invalidate_agent();
+            }),
+        );
         Self {
             stopping,
-            thread: Some(thread),
+            threads: vec![worker, supervisor],
         }
     }
 
-    /// Asks the thread to stop, which also cancels a local call. Doesn't wait.
+    /// Asks the threads to stop, which also cancels a local call. Doesn't wait.
     pub fn request_stop(&self) {
         self.stopping.store(true, Ordering::SeqCst);
     }
@@ -219,10 +271,53 @@ impl SlowThread {
 impl Drop for SlowThread {
     fn drop(&mut self) {
         self.request_stop();
-        if let Some(t) = self.thread.take() {
+        for t in self.threads.drain(..) {
             let _ = t.join();
         }
     }
+}
+
+struct Worker {
+    handle: Handle,
+    history: Arc<Mutex<HistoryDb>>,
+    foreground: ForegroundFn,
+    hosted: Option<Box<dyn DecisionProvider + Send>>,
+    local: Option<Box<dyn DecisionProvider + Send>>,
+    shared: SlowShared,
+    period: Duration,
+}
+
+struct Supervisor {
+    handle: Handle,
+    profiles: Vec<Profile>,
+    history: Arc<Mutex<HistoryDb>>,
+    foreground: ForegroundFn,
+    shared: SlowShared,
+    period: Duration,
+    stable_for: Duration,
+}
+
+fn split(p: SlowParts) -> (Worker, Supervisor) {
+    (
+        Worker {
+            handle: p.handle.clone(),
+            history: p.history.clone(),
+            foreground: p.foreground.clone(),
+            hosted: p.hosted,
+            local: p.local,
+            shared: p.shared.clone(),
+            period: p.period,
+        },
+        Supervisor {
+            handle: p.handle,
+            profiles: p.profiles,
+            history: p.history,
+            foreground: p.foreground,
+            shared: p.shared,
+            period: p.period,
+            stable_for: p.stable_for,
+        },
+    )
 }
 
 fn load_known(db: &Mutex<HistoryDb>) -> HashMap<String, Known> {
@@ -243,6 +338,20 @@ fn load_known(db: &Mutex<HistoryDb>) -> HashMap<String, Known> {
             ))
         })
         .collect()
+}
+
+/// The profile a cached or built-in answer calls for, with no provider call.
+fn known_profile(db: &Mutex<HistoryDb>, exe: &str) -> Option<&'static str> {
+    let saved = db
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .exe_workloads()
+        .unwrap_or_default();
+    let workload = saved
+        .get(exe)
+        .and_then(|(w, _, _)| Workload::from_name(w))
+        .or_else(|| builtin_workload(exe))?;
+    Some(profile_for(workload))
 }
 
 fn unix_now() -> i64 {
@@ -272,36 +381,11 @@ fn push_log(v: &mut View, e: LogEntry) {
 /// When it is, whether the hardware has been steady for long enough, and every fan it has ever
 /// listed.
 struct Gate<'a> {
-    now: Duration,
     stable: bool,
     ever_seen: &'a HashSet<String>,
 }
 
-/// Puts the rule's profile in place through the engine. `Err` says why it wasn't.
-fn apply(
-    c: &Change,
-    cache: &crate::runtime::Cache,
-    profiles: &[Profile],
-    rt: &tokio::runtime::Runtime,
-    handle: &Handle,
-    layer: &mut SlowLayer,
-    gate: &Gate,
-) -> Result<bool, String> {
-    let changed = match apply_named(c.profile, cache, profiles, rt, handle, gate) {
-        Ok(changed) => changed,
-        Err(error) => {
-            layer.retry();
-            return Err(error);
-        }
-    };
-    if !changed {
-        layer.already_active(c);
-        return Ok(false);
-    }
-    layer.applied(gate.now, c);
-    Ok(true)
-}
-
+/// Puts a profile in place through the engine. `Ok(false)`: it already was. `Err` says why not.
 fn apply_named(
     profile_name: &str,
     cache: &crate::runtime::Cache,
@@ -315,7 +399,7 @@ fn apply_named(
     }
     // A restarting or degraded backend may be missing fans that come back a moment later.
     if !gate.stable {
-        return Err("hardware is changing or degraded: waiting for a stable snapshot".into());
+        return Err(WAITING.into());
     }
     let find = |name: &str| profiles.iter().find(|p| p.name == name);
     let next = find(profile_name).ok_or_else(|| format!("no profile '{profile_name}' is saved"))?;
@@ -324,42 +408,24 @@ fn apply_named(
     if let Some(why) = why_not_switch(next, active, &cache.snapshot, gate.ever_seen) {
         return Err(why);
     }
-    rt.block_on(handle.set_profile(next.clone()))
+    rt.block_on(handle.apply_profile(next.clone()))
         .map_err(|e| format!("the engine refused '{profile_name}': {e:?}"))?;
     Ok(true)
 }
 
-fn run(parts: SlowParts, stopping: &AtomicBool) {
-    let SlowParts {
+/// The classifier. Its answer is a proposal, never a profile change: the supervisor decides.
+fn work(w: Worker, stopping: &AtomicBool) {
+    let Worker {
         handle,
-        profiles,
-        config,
         history,
         foreground,
         mut hosted,
         mut local,
         shared,
         period,
-        stable_for,
-    } = parts;
-    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .build()
-    else {
-        shared.update(|v| v.crashed = true);
-        return;
-    };
+    } = w;
     let mut layer = SlowLayer::new(load_known(&history));
     let began = Instant::now();
-    let mut settled = Settled::default();
-    let mut ever_seen: HashSet<String> = HashSet::new();
-    let mut agent_profile: Option<String> = None;
-    let mut agent_exe: Option<String> = None;
-    let mut last_note: Option<String> = None;
-    let base_profile = profiles
-        .iter()
-        .find(|p| p.name == config.default_profile)
-        .expect("the configured default profile is validated at startup");
     while !stopping.load(Ordering::SeqCst) {
         std::thread::sleep(period);
         for (exe, workload) in shared.take_answers() {
@@ -373,28 +439,8 @@ fn run(parts: SlowParts, stopping: &AtomicBool) {
             );
         }
         let cache = handle.cache();
-        // Before anything can `continue`: a pause or a stopped engine is part of what changed.
-        ever_seen.extend(cache.snapshot.fans.iter().map(|f| f.id.clone()));
-        settled.observe(
-            began.elapsed(),
-            &cache.snapshot,
-            &cache.status.unavailable_sources,
-            cache.status.degraded || !cache.status.engine_running,
-            cache.snapshot_age,
-        );
         let seen = foreground();
         shared.update(|v| v.foreground = seen.is_some());
-        let exe = seen
-            .as_ref()
-            .and_then(|f| f.exe.as_deref())
-            .and_then(clean_exe);
-        if agent_exe != exe {
-            agent_profile = None;
-            agent_exe = exe.clone();
-        }
-        if cache.status.agent != AgentState::Running {
-            agent_profile = None;
-        }
         if !cache.status.engine_running {
             continue;
         }
@@ -421,6 +467,8 @@ fn run(parts: SlowParts, stopping: &AtomicBool) {
             });
             game_like(&o, known)
         };
+        // The answer is only good for the app and settings it was asked under.
+        let started = handle.arbiter().generations();
         let step = if cache.status.agent == AgentState::Running {
             layer.step(
                 now,
@@ -460,123 +508,14 @@ fn run(parts: SlowParts, stopping: &AtomicBool) {
                 });
             }
         }
-        let mut logged = step.decision.as_ref().map(entry);
-        let mut active_profile = cache.active_profile.clone();
         if let Some(c) = &step.change {
-            let gate = Gate {
-                now,
-                stable: settled.is_settled(now, stable_for),
-                ever_seen: &ever_seen,
-            };
-            match apply(c, &cache, &profiles, &rt, &handle, &mut layer, &gate) {
-                Ok(changed) => {
-                    agent_profile = Some(c.profile.to_owned());
-                    agent_exe = Some(c.exe.clone());
-                    active_profile = c.profile.to_owned();
-                    last_note = None;
-                    if changed {
-                        let mut e = logged.take().unwrap_or_else(|| {
-                            entry(&Decision {
-                                exe: c.exe.clone(),
-                                workload: Some(c.workload),
-                                source: Some(c.source),
-                                confidence: c.confidence,
-                                asked: false,
-                            })
-                        });
-                        e.profile = Some(c.profile.into());
-                        logged = Some(e);
-                    }
-                }
-                Err(why) => {
-                    if last_note.as_deref() != Some(&why) {
-                        let mut e = logged.take().unwrap_or_else(|| {
-                            entry(&Decision {
-                                exe: c.exe.clone(),
-                                workload: Some(c.workload),
-                                source: Some(c.source),
-                                confidence: c.confidence,
-                                asked: false,
-                            })
-                        });
-                        e.note = Some(why.clone());
-                        logged = Some(e);
-                    }
-                    last_note = Some(why);
-                }
-            }
+            shared.propose(Proposal {
+                exe: c.exe.clone(),
+                profile: c.profile,
+                gens: started,
+            });
         }
-        #[cfg(windows)]
-        let mut running_processes = crate::win::process_names().unwrap_or_default();
-        #[cfg(not(windows))]
-        let mut running_processes: Vec<String> = exe.iter().cloned().collect();
-        if let Some(exe) = &exe {
-            running_processes.push(exe.clone());
-        }
-        let app_rule = crate::profile_rules::app_rule_profile(base_profile, &running_processes);
-        let (weekday, minute) = crate::profile_rules::local_time();
-        let schedule_profile =
-            crate::profile_rules::scheduled_profile(&config.schedule, weekday, minute);
-        let (selected, source) = crate::profile_rules::arbitrate(
-            agent_profile.as_deref(),
-            app_rule,
-            schedule_profile,
-            &config.default_profile,
-        );
-        if active_profile != selected {
-            let gate = Gate {
-                now,
-                stable: settled.is_settled(now, stable_for),
-                ever_seen: &ever_seen,
-            };
-            let current = crate::runtime::Cache {
-                active_profile: active_profile.clone(),
-                ..cache.clone()
-            };
-            match apply_named(selected, &current, &profiles, &rt, &handle, &gate) {
-                Ok(changed) => {
-                    if changed {
-                        active_profile = selected.into();
-                    }
-                    last_note = None;
-                    if changed && source != crate::profile_rules::ProfileSource::Agent {
-                        logged = Some(LogEntry {
-                            at: unix_now(),
-                            exe: exe.clone().unwrap_or_default(),
-                            workload: None,
-                            source: Some(
-                                match source {
-                                    crate::profile_rules::ProfileSource::Agent => "agent",
-                                    crate::profile_rules::ProfileSource::AppRule => "app-rule",
-                                    crate::profile_rules::ProfileSource::Schedule => "schedule",
-                                    crate::profile_rules::ProfileSource::User => "user",
-                                }
-                                .into(),
-                            ),
-                            confidence: None,
-                            asked: false,
-                            profile: Some(selected.into()),
-                            note: None,
-                        });
-                    }
-                }
-                Err(why) => {
-                    if last_note.as_deref() != Some(&why) {
-                        logged = Some(LogEntry {
-                            at: unix_now(),
-                            exe: exe.clone().unwrap_or_default(),
-                            workload: None,
-                            source: Some("profile-rule".into()),
-                            confidence: None,
-                            asked: false,
-                            profile: Some(selected.into()),
-                            note: Some(why.clone()),
-                        });
-                    }
-                    last_note = Some(why);
-                }
-            }
-        }
+        let logged = step.decision.as_ref().map(entry);
         let questions: Vec<QuestionView> = layer
             .questions()
             .iter()
@@ -594,6 +533,196 @@ fn run(parts: SlowParts, stopping: &AtomicBool) {
             }
         });
     }
+}
+
+/// Reads the foreground, keeps the Agent's profile lease alive, and puts the winning profile in
+/// the engine. Nothing here calls a provider, so a slow classifier cannot let a lease lapse.
+fn supervise(s: Supervisor, stopping: &AtomicBool) {
+    let Supervisor {
+        handle,
+        profiles,
+        history,
+        foreground,
+        shared,
+        period,
+        stable_for,
+    } = s;
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+    else {
+        shared.update(|v| v.crashed = true);
+        return;
+    };
+    let mut settled = Settled::default();
+    let mut ever_seen: HashSet<String> = HashSet::new();
+    // The last accepted decision per exe, re-offered every period with no provider call.
+    let mut accepted: HashMap<String, &'static str> = HashMap::new();
+    let mut probed: HashSet<String> = HashSet::new();
+    let mut config_gen = handle.arbiter().generations().config;
+    let mut last_note: Option<String> = None;
+    while !stopping.load(Ordering::SeqCst) {
+        std::thread::sleep(period);
+        let cache = handle.cache();
+        let now = handle.elapsed();
+        // Before anything can `continue`: a pause or a stopped engine is part of what changed.
+        ever_seen.extend(cache.snapshot.fans.iter().map(|f| f.id.clone()));
+        settled.observe(
+            now,
+            &cache.snapshot,
+            &cache.status.unavailable_sources,
+            cache.status.degraded || !cache.status.engine_running,
+            cache.snapshot_age,
+        );
+        if !cache.status.engine_running {
+            continue;
+        }
+        let exe = foreground()
+            .as_ref()
+            .and_then(|f| f.exe.as_deref())
+            .and_then(clean_exe);
+        let agent_up = cache.status.agent == AgentState::Running && !shared.view().crashed;
+        // A target is usable when it exists and the engine would not release a fan for it.
+        let skipped = RefCell::new(Vec::<String>::new());
+        let usable = |name: &str| -> bool {
+            if name == cache.active_profile {
+                return true;
+            }
+            let find = |n: &str| profiles.iter().find(|p| p.name == n);
+            let Some(next) = find(name) else {
+                skipped
+                    .borrow_mut()
+                    .push(format!("no profile '{name}' is saved"));
+                return false;
+            };
+            let Some(active) = find(&cache.active_profile) else {
+                return true; // `apply_named` reports an unknown active profile
+            };
+            match why_not_switch(next, active, &cache.snapshot, &ever_seen) {
+                Some(why) => {
+                    skipped.borrow_mut().push(why);
+                    false
+                }
+                None => true,
+            }
+        };
+        let selection = {
+            let mut a = handle.arbiter();
+            if a.generations().config != config_gen {
+                config_gen = a.generations().config;
+                accepted.clear();
+                probed.clear();
+            }
+            a.set_foreground(exe.as_deref());
+            if agent_up {
+                if let Some(p) = shared.take_proposal() {
+                    if matches!(
+                        a.offer_intent(now, p.profile, p.gens, &usable),
+                        Offer::Activated | Offer::Renewed
+                    ) {
+                        accepted.insert(p.exe, p.profile);
+                    }
+                }
+                if let Some(exe) = &exe {
+                    if !accepted.contains_key(exe) && probed.insert(exe.clone()) {
+                        if let Some(p) = known_profile(&history, exe) {
+                            accepted.insert(exe.clone(), p);
+                        }
+                    }
+                    if let Some(&profile) = accepted.get(exe) {
+                        let now_gens = a.generations();
+                        a.offer_intent(now, profile, now_gens, &usable);
+                    }
+                }
+            } else {
+                a.invalidate_agent();
+            }
+            a.select(now, &usable)
+        };
+        let mut logged: Option<LogEntry> = None;
+        if let Some(why) = skipped.into_inner().into_iter().next() {
+            if last_note.as_deref() != Some(&why) {
+                note(&shared, &exe, &selection.effective, &why);
+                last_note = Some(why);
+            }
+        }
+        if selection.effective != cache.active_profile {
+            let gate = Gate {
+                stable: settled.is_settled(now, stable_for),
+                ever_seen: &ever_seen,
+            };
+            match apply_named(&selection.effective, &cache, &profiles, &rt, &handle, &gate) {
+                Ok(changed) => {
+                    last_note = None;
+                    if changed && selection.source == ProfileSource::Agent {
+                        handle.arbiter().agent_applied(now);
+                        let profile = selection.effective.clone();
+                        let exe = exe.clone().unwrap_or_default();
+                        shared.update(|v| {
+                            // The decision that asked for it shows what it put in place.
+                            if let Some(e) =
+                                v.decisions.iter_mut().rev().find(|e| {
+                                    e.exe == exe && e.profile.is_none() && e.note.is_none()
+                                })
+                            {
+                                e.profile = Some(profile);
+                            }
+                        });
+                    } else if changed {
+                        logged = Some(LogEntry {
+                            at: unix_now(),
+                            exe: exe.clone().unwrap_or_default(),
+                            workload: None,
+                            source: Some(selection.source.as_str().into()),
+                            confidence: None,
+                            asked: false,
+                            profile: Some(selection.effective.clone()),
+                            note: selection.rule_id.clone().map(|r| format!("rule {r}")),
+                        });
+                    }
+                }
+                Err(why) => {
+                    if last_note.as_deref() != Some(&why) {
+                        note(&shared, &exe, &selection.effective, &why);
+                    }
+                    last_note = Some(why);
+                }
+            }
+        }
+        if let Some(e) = logged {
+            shared.update(|v| push_log(v, e));
+        }
+    }
+}
+
+/// Says why a profile was not put in place: on the decision that asked for it if there is one,
+/// else as an entry of its own.
+fn note(shared: &SlowShared, exe: &Option<String>, profile: &str, why: &str) {
+    let exe = exe.clone().unwrap_or_default();
+    shared.update(|v| {
+        let open = v
+            .decisions
+            .iter_mut()
+            .rev()
+            .find(|e| e.exe == exe && e.profile.is_none() && e.note.is_none());
+        match open {
+            Some(e) => e.note = Some(why.into()),
+            None if why == WAITING => {}
+            None => push_log(
+                v,
+                LogEntry {
+                    at: unix_now(),
+                    exe,
+                    workload: None,
+                    source: Some("profile-rule".into()),
+                    confidence: None,
+                    asked: false,
+                    profile: Some(profile.into()),
+                    note: Some(why.into()),
+                },
+            ),
+        }
+    });
 }
 
 #[cfg(test)]
@@ -929,6 +1058,82 @@ mod tests {
         }
     }
 
+    fn source(r: &Rig) -> Option<ProfileSource> {
+        r.daemon.handle().cache().selection.map(|s| s.source)
+    }
+
+    /// Rewritten from the reviewer's patch (it flipped the profile by hand, which a manual
+    /// choice no longer does): pause drops the intent, resume registers it again.
+    #[test]
+    fn reviewer_agent_reactivations_obey_six_per_hour_limit() {
+        let gaming = toml("gaming", "f1");
+        let r = rig(
+            vec![toml("balanced", "f1"), gaming.clone()],
+            &[("game.exe", "gaming")],
+        );
+        let h = r.daemon.handle();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        show(&r, "game.exe");
+        wait_until(|| active(&r) == "gaming"); // effective activation 1
+        for _ in 2..=6 {
+            rt.block_on(h.pause_agent()).unwrap();
+            wait_until(|| active(&r) == "balanced");
+            rt.block_on(h.resume_agent()).unwrap();
+            wait_until(|| active(&r) == "gaming");
+        }
+        rt.block_on(h.pause_agent()).unwrap();
+        wait_until(|| active(&r) == "balanced");
+        rt.block_on(h.resume_agent()).unwrap();
+        let ticks = h.cache().ticks;
+        wait_until(|| h.cache().ticks > ticks + 100);
+        assert_eq!(active(&r), "balanced", "the seventh activation got through");
+        assert_eq!(source(&r), Some(ProfileSource::Fallback));
+
+        // An intent whose profile is already effective is checked against the limit too.
+        rt.block_on(h.set_profile(gaming)).unwrap();
+        let ticks = h.cache().ticks;
+        wait_until(|| h.cache().ticks > ticks + 100);
+        assert_eq!(active(&r), "gaming");
+        assert_eq!(
+            source(&r),
+            Some(ProfileSource::Fallback),
+            "the agent's intent for gaming was still refused"
+        );
+    }
+    #[test]
+    fn reviewer_manual_profile_selection_is_not_undone_without_automation() {
+        let manual = toml("manual", "f1");
+        let r = rig(vec![toml("balanced", "f1"), manual.clone()], &[]);
+        wait_until(|| r.daemon.handle().cache().ticks > 100);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(r.daemon.handle().pause_agent()).unwrap();
+        rt.block_on(r.daemon.handle().set_profile(manual)).unwrap();
+        let ticks = r.daemon.handle().cache().ticks;
+        wait_until(|| r.daemon.handle().cache().ticks > ticks + 100);
+        assert_eq!(
+            active(&r),
+            "manual",
+            "manual choice was undone even with no app, schedule or agent request"
+        );
+    }
+
+    #[test]
+    fn reviewer_two_exes_with_same_workload_keep_agent_profile_ownership() {
+        let r = rig(
+            vec![toml("balanced", "f1"), toml("gaming", "f1")],
+            &[("a.exe", "gaming"), ("b.exe", "gaming")],
+        );
+        show(&r, "a.exe");
+        wait_until(|| active(&r) == "gaming");
+        show(&r, "b.exe");
+        let ticks = r.daemon.handle().cache().ticks;
+        wait_until(|| r.daemon.handle().cache().ticks > ticks + 100);
+        assert_eq!(
+            active(&r),
+            "gaming",
+            "second exe lost ownership because its desired profile was already active"
+        );
+    }
     #[test]
     fn a_cached_exe_switches_the_profile_by_the_rule_through_the_engine() {
         let r = rig(
@@ -952,80 +1157,143 @@ mod tests {
         assert_eq!(d.workload.as_deref(), Some("gaming"));
     }
 
-    #[test]
-    fn an_app_rule_stays_available_from_the_base_profile_after_switching() {
-        let base = Profile::from_toml(
-            "name='balanced'\n[[curves]]\ntype='flat'\nid='c'\npwm=30\n[[controls]]\nfan='f1'\ncurve='c'\nstep_up_pct=100\nstep_down_pct=100\n[[app_rules]]\nprocess='game.exe'\nprofile='gaming'",
-        )
-        .unwrap();
-        let r = rig(vec![base, toml("gaming", "f1")], &[]);
-        show(&r, "GAME.EXE");
-        wait_until(|| active(&r) == "gaming");
+    fn cfg(extra: &str) -> DaemonConfig {
+        DaemonConfig::from_toml(&format!("default_profile='balanced'\n{extra}")).unwrap()
+    }
 
-        // The active `gaming` profile has no app_rules. The stable base profile still does.
-        std::thread::sleep(STABLE * 2);
-        assert_eq!(active(&r), "gaming");
+    const ALWAYS: &str = "[[schedule]]\nid='all-day'\ntime='00:00-24:00'\nprofile='scheduled'\n";
+
+    fn rule(exe: &str, profile: &str) -> String {
+        format!("[[app_rule]]\nid='r-{exe}'\nexe='{exe}'\nprofile='{profile}'\n")
+    }
+
+    fn quiet() -> Vec<Profile> {
+        ["balanced", "gaming", "silent", "app", "scheduled"]
+            .map(|n| toml(n, "f1"))
+            .into()
     }
 
     #[test]
-    fn an_agent_profile_request_overrides_a_matching_app_rule() {
-        let base = Profile::from_toml(
-            "name='balanced'\n[[curves]]\ntype='flat'\nid='c'\npwm=30\n[[controls]]\nfan='f1'\ncurve='c'\nstep_up_pct=100\nstep_down_pct=100\n[[app_rules]]\nprocess='game.exe'\nprofile='silent'",
-        )
-        .unwrap();
+    fn a_config_app_rule_wins_while_its_exe_is_in_the_foreground_and_lets_go_after() {
+        let r = rig_with_config(quiet(), &[], cfg(&rule("game.exe", "gaming")));
+        show(&r, "GAME.EXE");
+        wait_until(|| active(&r) == "gaming");
+        let s = r.daemon.handle().cache().selection.unwrap();
+        assert_eq!(
+            (s.source, s.rule_id.as_deref(), s.chosen.as_str()),
+            (ProfileSource::App, Some("r-game.exe"), "balanced")
+        );
+        show(&r, "notepad.exe");
+        wait_until(|| active(&r) == "balanced");
+        assert_eq!(source(&r), Some(ProfileSource::Fallback));
+    }
+
+    #[test]
+    fn an_app_rule_beats_the_agents_profile_intent_and_the_schedule() {
+        let r = rig_with_config(
+            quiet(),
+            &[("game.exe", "gaming")],
+            cfg(&format!("{}{ALWAYS}", rule("game.exe", "silent"))),
+        );
+        wait_until(|| active(&r) == "scheduled");
+        show(&r, "game.exe");
+        wait_until(|| active(&r) == "silent");
+        std::thread::sleep(STABLE * 2);
+        assert_eq!(active(&r), "silent", "the agent would have chosen gaming");
+        assert_eq!(source(&r), Some(ProfileSource::App));
+    }
+
+    #[test]
+    fn the_agents_intent_beats_the_schedule_and_the_schedule_beats_the_fallback() {
+        let r = rig_with_config(quiet(), &[("game.exe", "gaming")], cfg(ALWAYS));
+        wait_until(|| active(&r) == "scheduled");
+        assert_eq!(source(&r), Some(ProfileSource::Schedule));
+        show(&r, "game.exe");
+        wait_until(|| active(&r) == "gaming");
+        assert_eq!(source(&r), Some(ProfileSource::Agent));
+    }
+
+    #[test]
+    fn app_rules_and_schedules_keep_working_while_the_agent_is_paused() {
+        let r = rig_with_config(
+            quiet(),
+            &[("game.exe", "gaming")],
+            cfg(&format!("{}{ALWAYS}", rule("editor.exe", "app"))),
+        );
+        let h = r.daemon.handle();
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(h.pause_agent())
+            .unwrap();
+        wait_until(|| active(&r) == "scheduled");
+        show(&r, "game.exe");
+        std::thread::sleep(STABLE * 2);
+        assert_eq!(active(&r), "scheduled", "the paused agent chose nothing");
+        show(&r, "editor.exe");
+        wait_until(|| active(&r) == "app");
+    }
+
+    #[test]
+    fn a_crashed_worker_drops_the_intent_but_not_app_rules_or_schedules() {
+        let r = rig_with_config(
+            quiet(),
+            &[("game.exe", "gaming")],
+            cfg(&format!("{}{ALWAYS}", rule("editor.exe", "app"))),
+        );
+        show(&r, "game.exe");
+        wait_until(|| active(&r) == "gaming");
+        r.shared.update(|v| v.crashed = true); // what the worker's panic handler does
+        wait_until(|| active(&r) == "scheduled");
+        show(&r, "editor.exe");
+        wait_until(|| active(&r) == "app");
+    }
+
+    #[test]
+    fn an_intent_is_a_lease_that_the_supervisor_renews_without_the_worker() {
         let r = rig(
-            vec![base, toml("gaming", "f1"), toml("silent", "f1")],
+            vec![toml("balanced", "f1"), toml("gaming", "f1")],
             &[("game.exe", "gaming")],
         );
         show(&r, "game.exe");
         wait_until(|| active(&r) == "gaming");
-        std::thread::sleep(STABLE * 2);
+        // The worker would decide again only at the one-minute cadence; the lease is 3 s.
+        std::thread::sleep(crate::arbiter::LEASE + Duration::from_secs(1));
         assert_eq!(active(&r), "gaming");
+        assert_eq!(source(&r), Some(ProfileSource::Agent));
+    }
+
+    fn propose(r: &Rig, exe: &str, gens: Generations) {
+        r.shared.propose(Proposal {
+            exe: exe.into(),
+            profile: "gaming",
+            gens,
+        });
     }
 
     #[test]
-    fn a_matching_schedule_selects_its_profile_when_no_higher_priority_request_exists() {
-        let config = DaemonConfig {
-            default_profile: "balanced".into(),
-            schedule: vec![thermaliq_common::ScheduleEntry {
-                days: vec![],
-                time: "00:00-24:00".into(),
-                profile: "scheduled".into(),
-            }],
-            ..DaemonConfig::default()
-        };
-        let r = rig_with_config(
-            vec![toml("balanced", "f1"), toml("scheduled", "f1")],
-            &[],
-            config,
-        );
-        wait_until(|| active(&r) == "scheduled");
-    }
-
-    #[test]
-    fn an_app_rule_overrides_a_matching_schedule() {
-        let base = Profile::from_toml(
-            "name='balanced'\n[[curves]]\ntype='flat'\nid='c'\npwm=30\n[[controls]]\nfan='f1'\ncurve='c'\nstep_up_pct=100\nstep_down_pct=100\n[[app_rules]]\nprocess='editor.exe'\nprofile='app'",
-        )
-        .unwrap();
-        let config = DaemonConfig {
-            default_profile: "balanced".into(),
-            schedule: vec![thermaliq_common::ScheduleEntry {
-                days: vec![],
-                time: "00:00-24:00".into(),
-                profile: "scheduled".into(),
-            }],
-            ..DaemonConfig::default()
-        };
-        let r = rig_with_config(
-            vec![base, toml("app", "f1"), toml("scheduled", "f1")],
-            &[],
-            config,
-        );
-        show(&r, "editor.exe");
-        wait_until(|| active(&r) == "app");
+    fn a_decision_started_under_an_old_foreground_or_config_is_discarded() {
+        let r = rig(vec![toml("balanced", "f1"), toml("gaming", "f1")], &[]);
+        let h = r.daemon.handle();
+        wait_until(|| h.cache().ticks > 0);
+        let old = h.arbiter().generations();
+        show(&r, "x.exe");
+        wait_until(|| h.arbiter().generations().foreground > old.foreground);
+        propose(&r, "x.exe", old); // the provider answered after the app changed
         std::thread::sleep(STABLE * 2);
-        assert_eq!(active(&r), "app");
+        assert_eq!(active(&r), "balanced", "late work from the old foreground");
+
+        let current = h.arbiter().generations();
+        h.configure_selection(&cfg(&rule("other.exe", "silent")));
+        propose(&r, "x.exe", current); // started before the configuration was replaced
+        std::thread::sleep(STABLE * 2);
+        assert_eq!(
+            active(&r),
+            "balanced",
+            "late work from the old configuration"
+        );
+
+        propose(&r, "x.exe", h.arbiter().generations());
+        wait_until(|| active(&r) == "gaming");
     }
 
     #[test]
@@ -1047,25 +1315,24 @@ mod tests {
     }
 
     #[test]
-    fn an_app_rule_that_would_release_a_real_fan_is_refused_and_names_it() {
-        let base = Profile::from_toml(
-            "name='balanced'\n[[curves]]\ntype='flat'\nid='c'\npwm=30\n[[controls]]\nfan='f1'\ncurve='c'\nstep_up_pct=100\nstep_down_pct=100\n[[controls]]\nfan='f2'\ncurve='c'\nstep_up_pct=100\nstep_down_pct=100\n[[app_rules]]\nprocess='game.exe'\nprofile='gaming'",
-        )
-        .unwrap();
+    fn an_app_rule_that_would_release_a_real_fan_is_skipped_and_names_it() {
         let (hal, _, _) = flaky();
-        let r = rig_on(hal, vec![base, toml2("gaming", &["f1"])], &[]);
+        let r = rig_on_with_config(
+            hal,
+            vec![toml2("balanced", &["f1", "f2"]), toml2("gaming", &["f1"])],
+            &[],
+            cfg(&rule("game.exe", "gaming")),
+        );
         wait_until(|| r.daemon.handle().cache().ticks > 0);
         std::thread::sleep(STABLE * 3);
         show(&r, "game.exe");
         std::thread::sleep(STABLE * 3);
-
         assert_eq!(active(&r), "balanced");
-        assert!(r
-            .shared
-            .view()
-            .decisions
-            .iter()
-            .any(|d| { d.note.as_deref().is_some_and(|note| note.contains("f2")) }));
+        assert_eq!(
+            source(&r),
+            Some(ProfileSource::Fallback),
+            "skipped, not applied"
+        );
     }
 
     #[test]

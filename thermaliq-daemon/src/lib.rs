@@ -6,6 +6,7 @@ pub mod agent;
 pub mod anti_cheat;
 pub mod api;
 pub mod app;
+pub mod arbiter;
 pub mod decision_client;
 pub mod foreground;
 pub mod history;
@@ -16,7 +17,6 @@ pub mod keychain;
 #[cfg(windows)]
 pub mod lhm_bridge;
 pub mod lifecycle;
-pub mod profile_rules;
 pub mod runtime;
 #[cfg(windows)]
 pub mod service;

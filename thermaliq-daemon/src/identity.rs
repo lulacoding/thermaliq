@@ -15,12 +15,11 @@ use thermaliq_common::identity::{
     diff, missing_fans, missing_message, pair, propose, resolve, unmapped_lines, Inventory,
     InventoryDiff, Role, Roles, CASE_FANS,
 };
-use thermaliq_common::{Control, Curve, HardwareSnapshot, Profile};
+use thermaliq_common::{HardwareSnapshot, Profile};
 use thermaliq_hal::HardwareLayer;
 
 /// How long a probe holds a fan at 100% before it reads the tachs.
 pub const PROBE_FOR: Duration = Duration::from_secs(5);
-const PROBE_CURVE: &str = "identify_probe";
 
 pub struct Identity {
     dir: PathBuf,
@@ -292,18 +291,15 @@ impl Identity {
         save_inventory(&self.dir, &Inventory::of(snap, self.board.clone()))
     }
 
-    /// Holds `fan` at 100% for `probe_for` through the engine, then puts the profile back
-    /// (SPEC §5.2). It only raises a fan, so a pump is only ever raised.
+    /// Holds `fan` at 100% for `probe_for` through the engine (SPEC §5.2). It only raises a fan,
+    /// so a pump is only ever raised.
     ///
-    /// The hold and the restore run in their own task: if the request drops (Ctrl-C in
-    /// `identify`), the profile still comes back. The agent is paused meanwhile, so a profile
-    /// switch cannot land inside the hold and be undone by the restore.
-    pub async fn probe(
-        &self,
-        handle: &Handle,
-        profiles: &[Profile],
-        fan: &str,
-    ) -> Result<Value, ProbeError> {
+    /// The hold is a request of its own that expires 2 s after the hold, not a profile swap: a
+    /// profile an app rule, schedule or the user picks meanwhile stays, and ending the probe
+    /// withdraws only this request. The hold and its end run in their own task, so if the request
+    /// drops (Ctrl-C in `identify`) the engine is still told. The agent is paused for the hold
+    /// (and resumed only if this probe paused it).
+    pub async fn probe(&self, handle: &Handle, fan: &str) -> Result<Value, ProbeError> {
         if !self.controllable.iter().any(|f| f == fan) {
             return Err(ProbeError::UnknownFan(fan.to_owned()));
         }
@@ -314,33 +310,25 @@ impl Identity {
         if before.status.latched {
             return Err(ProbeError::Latched);
         }
-        let Some(original) = profiles
-            .iter()
-            .find(|p| p.name == before.active_profile)
-            .cloned()
-        else {
-            return Err(ProbeError::Engine(CommandError::Rejected(format!(
-                "the active profile '{}' is not a known profile",
-                before.active_profile
-            ))));
-        };
         let (handle, fan, hold) = (handle.clone(), fan.to_owned(), self.probe_for);
         tokio::spawn(async move {
             let _one_at_a_time = one_at_a_time;
-            hold_and_restore(&handle, original, before, &fan, hold).await
+            hold_and_release(&handle, before, &fan, hold).await
         })
         .await
         .unwrap_or_else(|e| {
             Err(ProbeError::NotRestored(format!(
-                "the probe task failed ({e}); fan may stay at 100% until you switch profile"
+                "the probe task failed ({e}); the hold ends by itself within seconds"
             )))
         })
     }
 }
 
-async fn hold_and_restore(
+/// The engine ends the hold by itself this long after `hold`, if nobody ends it first.
+const PROBE_GRACE: Duration = Duration::from_secs(2);
+
+async fn hold_and_release(
     handle: &Handle,
-    original: Profile,
     before: Cache,
     fan: &str,
     hold: Duration,
@@ -349,21 +337,22 @@ async fn hold_and_restore(
     // crashed agent cannot be paused, and cannot switch either.
     let paused_here =
         before.status.agent == AgentState::Running && handle.pause_agent().await.is_ok();
-    let held = handle.set_profile(with_probe(&original, fan)).await;
+    let held = handle.start_probe(fan, hold + PROBE_GRACE).await;
     if held.is_ok() {
         tokio::time::sleep(hold).await;
     }
     let during = handle.cache();
-    let restored = handle.set_profile(original.clone()).await;
+    let released = match &held {
+        Ok(id) => handle.end_probe(fan, *id).await,
+        Err(_) => Ok(()),
+    };
     if paused_here {
         let _ = handle.resume_agent().await;
     }
     held.map_err(ProbeError::Engine)?;
-    restored.map_err(|e| {
+    released.map_err(|e| {
         ProbeError::NotRestored(format!(
-            "could not put profile '{}' back ({e:?}); fan '{fan}' may stay at 100% until you \
-             switch profile",
-            original.name
+            "could not end the hold on fan '{fan}' ({e:?}); it ends by itself within seconds"
         ))
     })?;
     if during.status.latched {
@@ -402,27 +391,6 @@ fn rpms(c: &Cache) -> Vec<(String, u32)> {
         .iter()
         .map(|f| (f.id.clone(), f.rpm))
         .collect()
-}
-
-/// `p` with `fan` on a flat 100% curve and its step-up at once, in place of any control it had.
-fn with_probe(p: &Profile, fan: &str) -> Profile {
-    let mut p = p.clone();
-    p.controls.retain(|c| c.fan != fan);
-    p.curves.retain(|c| c.id() != PROBE_CURVE);
-    p.curves.push(Curve::Flat {
-        id: PROBE_CURVE.into(),
-        pwm: 100,
-    });
-    p.controls.push(Control {
-        fan: fan.to_owned(),
-        curve: PROBE_CURVE.into(),
-        step_up_pct: 100,
-        step_down_pct: 100,
-        min_pwm: 0,
-        start_percent: None,
-        stop_percent: None,
-    });
-    p
 }
 
 #[cfg(test)]
@@ -717,11 +685,34 @@ mod tests {
         id
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reviewer_probe_completion_does_not_restore_a_stale_profile() {
+        let (h, d, profiles) = running(&["f1", "f2"]);
+        let id = Arc::new(identity_for(&["f1", "f2"]));
+        let run = tokio::spawn({
+            let (id, handle) = (id.clone(), d.handle());
+            async move { id.probe(&handle, "f2").await }
+        });
+        wait_until(|| {
+            h.writes()
+                .iter()
+                .any(|(fan, duty)| fan == "f2" && *duty == 100)
+        });
+        let mut selected = profiles[0].clone();
+        selected.name = "new-selection".into();
+        d.handle().set_profile(selected).await.unwrap();
+        run.await.unwrap().unwrap();
+        assert_eq!(
+            d.cache().active_profile,
+            "new-selection",
+            "probe completion overwrote the newer selection"
+        );
+    }
     #[tokio::test]
     async fn a_probe_raises_the_fan_pairs_its_tach_and_puts_the_profile_back() {
-        let (h, d, profiles) = running(&["f1", "f2"]);
+        let (h, d, _) = running(&["f1", "f2"]);
         let id = identity_for(&["f1", "f2"]);
-        let r = id.probe(&d.handle(), &profiles, "f2").await.unwrap();
+        let r = id.probe(&d.handle(), "f2").await.unwrap();
         assert_eq!(r["pairing"]["result"], "own", "{r}");
         assert!(h.writes().iter().any(|(f, duty)| f == "f2" && *duty == 100));
         assert_eq!(d.cache().active_profile, "flat");
@@ -737,14 +728,10 @@ mod tests {
     // Multi-thread: `wait_until` blocks, and the probe's own task has to keep running meanwhile.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_probe_dropped_mid_hold_still_puts_the_profile_back() {
-        let (h, d, profiles) = running(&["f1", "f2"]);
+        let (h, d, _) = running(&["f1", "f2"]);
         let id = identity_for(&["f1", "f2"]);
         // The client leaves (Ctrl-C in identify) after the 100% write; axum drops the future.
-        let r = tokio::time::timeout(
-            Duration::from_millis(60),
-            id.probe(&d.handle(), &profiles, "f2"),
-        )
-        .await;
+        let r = tokio::time::timeout(Duration::from_millis(60), id.probe(&d.handle(), "f2")).await;
         assert!(r.is_err(), "the probe should still be holding");
         wait_until(|| h.writes().iter().any(|(f, duty)| f == "f2" && *duty == 100));
         // `flat` never controls f2, so the original profile back means f2 is handed to the BIOS.
@@ -753,7 +740,7 @@ mod tests {
         // builds its result), so a new probe may be Busy until then; once it is not, it must work.
         let end = Instant::now() + Duration::from_secs(2);
         loop {
-            match id.probe(&d.handle(), &profiles, "f1").await {
+            match id.probe(&d.handle(), "f1").await {
                 Err(ProbeError::Busy) if Instant::now() < end => {
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
@@ -767,15 +754,15 @@ mod tests {
 
     #[tokio::test]
     async fn the_agent_is_paused_for_a_probe_and_resumed_only_if_it_was_running() {
-        let (_, d, profiles) = running(&["f1", "f2"]);
+        let (_, d, _) = running(&["f1", "f2"]);
         let id = std::sync::Arc::new(identity_for(&["f1", "f2"]));
         for was_paused in [false, true] {
             if was_paused {
                 d.handle().pause_agent().await.unwrap();
             }
             let run = tokio::spawn({
-                let (id, h, p) = (id.clone(), d.handle(), profiles.clone());
-                async move { id.probe(&h, &p, "f2").await }
+                let (id, h) = (id.clone(), d.handle());
+                async move { id.probe(&h, "f2").await }
             });
             tokio::time::sleep(Duration::from_millis(50)).await;
             assert_eq!(d.cache().status.agent, crate::runtime::AgentState::Paused);
@@ -836,15 +823,15 @@ mod tests {
 
     #[tokio::test]
     async fn a_probe_says_whether_the_write_landed_and_where_the_chip_ended_up() {
-        let (h, d, profiles) = running(&["f1", "f2"]);
+        let (h, d, _) = running(&["f1", "f2"]);
         let id = identity_for(&["f1", "f2"]);
-        let ok = id.probe(&d.handle(), &profiles, "f2").await.unwrap();
+        let ok = id.probe(&d.handle(), "f2").await.unwrap();
         assert_eq!(ok["landed"], true, "{ok}");
         assert_eq!(ok["duty_after"], 100, "{ok}");
 
         // A header whose writes the HAL refuses: commanded never reaches 100.
         h.fail_writes("f1");
-        let bad = id.probe(&d.handle(), &profiles, "f1").await.unwrap();
+        let bad = id.probe(&d.handle(), "f1").await.unwrap();
         assert_eq!(bad["landed"], false, "{bad}");
         assert!(
             bad["duty_after"].is_u64(),
@@ -854,23 +841,20 @@ mod tests {
 
     #[tokio::test]
     async fn a_probe_of_a_fan_no_backend_lists_is_refused_and_touches_nothing() {
-        let (h, d, profiles) = running(&["f1"]);
+        let (h, d, _) = running(&["f1"]);
         let id = identity_for(&["f1"]);
         let before = h.writes().len();
-        let err = id.probe(&d.handle(), &profiles, "nope").await.unwrap_err();
+        let err = id.probe(&d.handle(), "nope").await.unwrap_err();
         assert!(matches!(err, ProbeError::UnknownFan(f) if f == "nope"));
         assert_eq!(h.writes().len(), before);
     }
 
     #[tokio::test]
     async fn two_probes_at_once_are_refused_not_stacked() {
-        let (_, d, profiles) = running(&["f1", "f2"]);
+        let (_, d, _) = running(&["f1", "f2"]);
         let id = identity_for(&["f1", "f2"]);
         let handle = d.handle();
-        let (a, b) = tokio::join!(
-            id.probe(&handle, &profiles, "f1"),
-            id.probe(&handle, &profiles, "f2")
-        );
+        let (a, b) = tokio::join!(id.probe(&handle, "f1"), id.probe(&handle, "f2"));
         assert!(a.is_ok() ^ b.is_ok(), "{a:?} {b:?}");
         assert!(matches!(a.err().or(b.err()), Some(ProbeError::Busy)));
     }
@@ -881,38 +865,57 @@ mod tests {
             &["f1"],
             vec![Tick::Temps(vec![("cpu".into(), SensorKind::Cpu, 97.0)])],
         ));
-        let profiles = vec![Profile::from_toml(
+        let flat = Profile::from_toml(
             "name = \"flat\"\n[[curves]]\ntype = \"flat\"\nid = \"c\"\npwm = 30\n[[controls]]\nfan = \"f1\"\ncurve = \"c\"\n",
         )
-        .unwrap()];
+        .unwrap();
         let db = Arc::new(Mutex::new(HistoryDb::in_memory().unwrap()));
-        let d = Daemon::start(h, &profiles[0], vec![], db, fast());
+        let d = Daemon::start(h, &flat, vec![], db, fast());
         wait_until(|| d.cache().status.latched);
         let err = identity_for(&["f1"])
-            .probe(&d.handle(), &profiles, "f1")
+            .probe(&d.handle(), "f1")
             .await
             .unwrap_err();
         assert!(matches!(err, ProbeError::Latched), "{err:?}");
     }
 
-    #[test]
-    fn the_probe_profile_replaces_the_fans_control_and_nothing_else() {
-        let p = Profile::from_toml(
-            "name = \"p\"\n[[curves]]\ntype = \"flat\"\nid = \"c\"\npwm = 30\n[[controls]]\nfan = \"a\"\ncurve = \"c\"\n[[controls]]\nfan = \"b\"\ncurve = \"c\"\n",
-        )
-        .unwrap();
-        let q = with_probe(&p, "b");
-        assert_eq!(q.controls.len(), 2);
-        assert_eq!(q.controls[0], p.controls[0]);
-        let probe = q.controls.iter().find(|c| c.fan == "b").unwrap();
-        assert_eq!(
-            (probe.curve.as_str(), probe.step_up_pct),
-            (PROBE_CURVE, 100)
+    #[tokio::test]
+    async fn a_probe_is_refused_on_a_fan_with_a_live_override() {
+        let (h, d, _) = running(&["f1", "f2"]);
+        let id = identity_for(&["f1", "f2"]);
+        d.handle().set_override("f1", 80, 60).await.unwrap();
+        let err = id.probe(&d.handle(), "f1").await.unwrap_err();
+        assert!(
+            matches!(&err, ProbeError::Engine(CommandError::Rejected(m)) if m.contains("live override")),
+            "{err:?}"
         );
-        assert!(q
-            .curves
-            .iter()
-            .any(|c| matches!(c, Curve::Flat { id, pwm: 100 } if id == PROBE_CURVE)));
-        assert_eq!(with_probe(&q, "b"), q, "probing twice adds nothing");
+        assert!(!h.writes().iter().any(|(f, duty)| f == "f1" && *duty == 100));
+        assert_eq!(
+            d.cache().status.agent,
+            crate::runtime::AgentState::Running,
+            "resumed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_probe_keeps_holding_and_leaves_a_concurrent_automatic_switch_alone() {
+        let (h, d, profiles) = running(&["f1", "f2"]);
+        let id = Arc::new(identity_for(&["f1", "f2"]));
+        let run = tokio::spawn({
+            let (id, handle) = (id.clone(), d.handle());
+            async move { id.probe(&handle, "f2").await }
+        });
+        wait_until(|| {
+            h.writes()
+                .iter()
+                .any(|(fan, duty)| fan == "f2" && *duty == 100)
+        });
+        // What the supervisor does when an app rule or schedule wins mid-hold.
+        let mut automatic = profiles[0].clone();
+        automatic.name = "automatic".into();
+        d.handle().apply_profile(automatic).await.unwrap();
+        let r = run.await.unwrap().unwrap();
+        assert_eq!(r["landed"], true, "{r}");
+        assert_eq!(d.cache().active_profile, "automatic");
     }
 }

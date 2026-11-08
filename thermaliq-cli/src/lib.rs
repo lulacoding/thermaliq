@@ -343,7 +343,11 @@ fn dispatch(
                 out,
                 json,
                 &v,
-                &format!("active profile: {}", render::cell(&v["active_profile"])),
+                &format!(
+                    "chosen: {}\neffective: {}",
+                    render::cell(&v["chosen"]),
+                    render::winner(&v["effective"], &v["source"], &v["rule_id"])
+                ),
             )
         }
         ["history", sensor] => {

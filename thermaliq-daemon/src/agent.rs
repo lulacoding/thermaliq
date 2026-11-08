@@ -245,6 +245,10 @@ impl Agent {
             return;
         }
         self.last_refresh = Some(now);
+        if profile.name != self.profile_name {
+            // Each optimiser holds a raise measured against the old profile's curve.
+            self.optimisers.clear();
+        }
         self.profile_name = profile.name.clone();
         let mut old = std::mem::take(&mut self.bound);
         let hourly = self
@@ -586,6 +590,28 @@ mod tests {
             a.step(&tick(45.0, 55), secs(61)).len(),
             1,
             "fitted at the minute"
+        );
+    }
+
+    #[test]
+    fn a_profile_switch_starts_every_fan_from_its_curve_again() {
+        let p = Arc::new(RwLock::new(profile()));
+        let mut a = Agent::new(
+            Arc::new(Mutex::new(HistoryDb::in_memory().unwrap())),
+            p.clone(),
+            50,
+        );
+        for t in 0..3 {
+            a.step(&tick(80.0, 40), secs(t));
+        }
+        assert_eq!(a.step(&tick(80.0, 40), secs(3)), [("f1".to_string(), 48)]);
+        let mut other = profile();
+        other.name = "other".into();
+        *p.write().unwrap() = other;
+        assert_eq!(
+            a.step(&tick(80.0, 40), secs(4)),
+            [("f1".to_string(), 42)],
+            "what the optimiser held described the old profile's curve"
         );
     }
 

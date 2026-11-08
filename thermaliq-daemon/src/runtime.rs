@@ -2,12 +2,13 @@
 //! and the history thread. Only `thermaliq-engine` writes to fans.
 
 use crate::agent::{Agent, AgentTick, Brain, DEFAULT_SLIDER};
+use crate::arbiter::{Arbiter, Selection, SystemClock};
 use crate::history::{recorded_sensor_ids, HistoryDb};
 use std::collections::HashMap;
 use std::fs;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::thread::JoinHandle;
@@ -43,10 +44,16 @@ type Reply = oneshot::Sender<Done>;
 
 enum Cmd {
     SetProfile(Profile, Reply),
+    /// Only the engine's checks (fan coverage, pumps, owned fans); nothing changes.
+    CheckProfile(Profile, Reply),
+    /// A 100% hold on one fan that expires on its own; answers with the id that ends it.
+    StartProbe(String, Duration, oneshot::Sender<Result<u64, CommandError>>),
+    EndProbe(String, u64, Reply),
     Override(String, u8, Duration, Reply),
     Cancel(String, Reply),
     /// The agent's wish for this tick: replaces its previous requests (S1: it only submits).
-    Agent(Vec<(String, u8)>),
+    /// The number is the profile generation it was decided under; a switch since makes it late.
+    Agent(Vec<(String, u8)>, u64),
     /// Pause and agent crash: drop every Agent request now.
     WithdrawAgent(Reply),
 }
@@ -112,9 +119,12 @@ fn apply(
     cmd: Cmd,
 ) {
     let (result, reply) = match cmd {
-        Cmd::Agent(asks) => {
-            // A paused agent's late asks are dropped here, so pause can't be raced.
-            if !agent.flags.paused.load(Ordering::SeqCst) {
+        Cmd::Agent(asks, generation) => {
+            // A paused agent's late asks are dropped here, so pause can't be raced; so are asks
+            // decided under a profile that has since been replaced.
+            if !agent.flags.paused.load(Ordering::SeqCst)
+                && generation == agent.profile_gen.load(Ordering::SeqCst)
+            {
                 engine.withdraw_all(Source::Agent);
                 let until = began.elapsed() + REQUEST_TTL;
                 for (fan, duty) in asks {
@@ -128,9 +138,28 @@ fn apply(
             engine.withdraw_all(Source::Agent);
             (Ok(None), reply)
         }
+        Cmd::StartProbe(fan, ttl, reply) => {
+            let started = engine
+                .start_probe(&fan, began.elapsed() + ttl)
+                .map_err(CommandError::Rejected);
+            let _ = reply.send(started);
+            return;
+        }
+        Cmd::EndProbe(fan, id, reply) => {
+            engine.end_probe(&fan, id);
+            (Ok(None), reply)
+        }
+        Cmd::CheckProfile(p, reply) => (
+            engine
+                .check_profile(&p)
+                .map(|()| None)
+                .map_err(CommandError::Rejected),
+            reply,
+        ),
         Cmd::SetProfile(p, reply) => match engine.check_profile(&p) {
             Ok(()) => {
                 engine.set_profile(&p);
+                agent.profile_gen.fetch_add(1, Ordering::SeqCst);
                 *agent
                     .profile
                     .write()
@@ -175,6 +204,8 @@ fn apply(
 struct AgentShared {
     flags: Arc<AgentFlags>,
     profile: Arc<RwLock<Profile>>,
+    /// Counts profile switches the engine has applied (the fast layer's generation).
+    profile_gen: Arc<AtomicU64>,
 }
 
 /// A cheap, cloneable way for the API to read the cache and talk to the engine thread.
@@ -184,9 +215,28 @@ pub struct Handle {
     tx: mpsc::Sender<Msg>,
     ticks: watch::Receiver<u64>,
     flags: Arc<AgentFlags>,
+    selection: Arc<Mutex<Arbiter>>,
+    began: Instant,
 }
 
 impl Handle {
+    /// Time since the daemon started: the clock the profile leases run on.
+    pub fn elapsed(&self) -> Duration {
+        self.began.elapsed()
+    }
+
+    /// The one place that decides which profile is in effect (SPEC §4.1).
+    pub fn arbiter(&self) -> std::sync::MutexGuard<'_, Arbiter> {
+        self.selection
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Loads the app rules, schedules and the chosen fallback from `config.toml`.
+    pub fn configure_selection(&self, cfg: &thermaliq_common::DaemonConfig) {
+        self.arbiter().replace_config(cfg);
+    }
+
     /// Changes after every tick's cache update; closes when the engine thread ends.
     pub fn ticks(&self) -> watch::Receiver<u64> {
         self.ticks.clone()
@@ -199,6 +249,7 @@ impl Handle {
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
         c.status.agent = self.flags.state(); // read live, so pause shows at once
+        c.selection = self.arbiter().last().cloned();
         let notes = self
             .flags
             .notes
@@ -257,7 +308,49 @@ impl Handle {
         }
     }
 
+    /// The user's manual choice: validated, then kept as the chosen fallback. It takes effect at
+    /// once only when no app rule, Agent intent or schedule wins; it never preempts one.
+    pub async fn choose_profile(&self, profile: Profile) -> Result<Selection, CommandError> {
+        self.ask(|r| Cmd::CheckProfile(profile.clone(), r)).await?;
+        let now = self.elapsed();
+        let selection = {
+            let mut a = self.arbiter();
+            a.choose(&profile.name);
+            a.select(now, &|_| true)
+        };
+        if selection.effective == profile.name && self.cache().active_profile != profile.name {
+            self.apply_profile(profile).await?;
+        }
+        Ok(selection)
+    }
+
     pub async fn set_profile(&self, profile: Profile) -> Result<(), CommandError> {
+        self.choose_profile(profile).await.map(drop)
+    }
+
+    /// Holds `fan` at 100% for at most `ttl`. Refused while the fan has a live override. The
+    /// hold ends by itself if nobody calls `end_probe`, so a lost caller cannot leave a fan at 100%.
+    pub async fn start_probe(&self, fan: &str, ttl: Duration) -> Result<u64, CommandError> {
+        let (reply, answer) = oneshot::channel();
+        self.tx
+            .send(Msg::Cmd(Cmd::StartProbe(fan.into(), ttl, reply)))
+            .map_err(|_| CommandError::Unavailable)?;
+        match tokio::time::timeout(COMMAND_WAIT, answer).await {
+            Ok(Ok(result)) => result,
+            _ => Err(CommandError::Unavailable),
+        }
+    }
+
+    /// Ends the hold with this id; nothing else on the fan is touched.
+    pub async fn end_probe(&self, fan: &str, id: u64) -> Result<(), CommandError> {
+        self.ask(|r| Cmd::EndProbe(fan.into(), id, r))
+            .await
+            .map(drop)
+    }
+
+    /// Puts a profile into the engine without touching the chosen fallback: for what the
+    /// arbiter selected. The engine still refuses one that releases a fan or drops an owned one.
+    pub async fn apply_profile(&self, profile: Profile) -> Result<(), CommandError> {
         self.ask(|r| Cmd::SetProfile(profile, r)).await.map(drop)
     }
 
@@ -309,6 +402,8 @@ pub struct Cache {
     /// Ticks since `snapshot` was read from the hardware; 0 = fresh (S4 starts at 3).
     pub snapshot_age: u64,
     pub active_profile: String,
+    /// The user's choice and what wins now; filled in when read (`Handle::cache`).
+    pub selection: Option<Selection>,
     /// Per fan in the snapshot: what the curve, the agent and the engine's last write say.
     pub fan_info: HashMap<String, FanInfo>,
 }
@@ -329,6 +424,8 @@ pub struct Daemon {
     tx: mpsc::Sender<Msg>,
     ticks: watch::Receiver<u64>,
     flags: Arc<AgentFlags>,
+    selection: Arc<Mutex<Arbiter>>,
+    began: Instant,
     engine: Option<JoinHandle<()>>,
     history: Option<JoinHandle<()>>,
     agent: Option<JoinHandle<()>>,
@@ -344,6 +441,7 @@ fn agent_loop(
     ticks: &mpsc::Receiver<AgentTick>,
     tx: &mpsc::Sender<Msg>,
     flags: &AgentFlags,
+    profile_gen: &AtomicU64,
 ) {
     let began = Instant::now();
     let run = catch_unwind(AssertUnwindSafe(|| {
@@ -351,8 +449,10 @@ fn agent_loop(
             if flags.paused.load(Ordering::SeqCst) {
                 continue;
             }
+            // Read before the step: a switch while the brain works makes its answer late.
+            let generation = profile_gen.load(Ordering::SeqCst);
             let asks = brain.step(&tick, began.elapsed());
-            if tx.send(Msg::Cmd(Cmd::Agent(asks))).is_err() {
+            if tx.send(Msg::Cmd(Cmd::Agent(asks, generation))).is_err() {
                 return;
             }
         }
@@ -394,8 +494,13 @@ impl Daemon {
         let shared = AgentShared {
             flags: Arc::default(),
             profile: Arc::new(RwLock::new(active.clone())),
+            profile_gen: Arc::default(),
         };
         let flags = shared.flags.clone();
+        let selection = Arc::new(Mutex::new(Arbiter::new(
+            &active.name,
+            Arc::new(SystemClock),
+        )));
         let brain = make_brain(shared.profile.clone());
         let (agent_tx, agent_rx) = mpsc::sync_channel::<AgentTick>(AGENT_QUEUE);
         let cache = Arc::new(RwLock::new(Cache {
@@ -411,10 +516,10 @@ impl Daemon {
         let (history_tx, rx) = mpsc::sync_channel::<HistoryTick>(HISTORY_QUEUE);
         let history = std::thread::spawn(move || history_loop(&rx, &history, opts.prune_every));
         let agent = {
-            let (tx, flags) = (tx.clone(), flags.clone());
+            let (tx, flags, generation) = (tx.clone(), flags.clone(), shared.profile_gen.clone());
             std::thread::Builder::new()
                 .name("thermaliq-agent".into())
-                .spawn(move || agent_loop(brain, &agent_rx, &tx, &flags))
+                .spawn(move || agent_loop(brain, &agent_rx, &tx, &flags, &generation))
                 .expect("spawn agent thread")
         };
         let engine = {
@@ -556,6 +661,8 @@ impl Daemon {
             tx,
             ticks,
             flags,
+            selection,
+            began: Instant::now(),
             engine: Some(engine),
             history: Some(history),
             agent: Some(agent),
@@ -572,6 +679,8 @@ impl Daemon {
             tx: self.tx.clone(),
             ticks: self.ticks.clone(),
             flags: self.flags.clone(),
+            selection: self.selection.clone(),
+            began: self.began,
         }
     }
 
@@ -706,6 +815,51 @@ mod tests {
 
     fn db() -> Arc<Mutex<HistoryDb>> {
         Arc::new(Mutex::new(HistoryDb::in_memory().unwrap()))
+    }
+
+    #[test]
+    fn a_late_agent_ask_from_an_old_profile_generation_is_dropped() {
+        let hal = Arc::new(MockHardwareLayer::new(&["f1"], vec![at(40.0)]));
+        let p = Profile::from_toml(FLAT).unwrap();
+        let mut engine = Engine::new(hal, &p);
+        engine.tick(Duration::ZERO);
+        let began = Instant::now();
+        let cache = RwLock::new(Cache::default());
+        let shared = AgentShared {
+            flags: Arc::default(),
+            profile: Arc::new(RwLock::new(p.clone())),
+            profile_gen: Arc::new(AtomicU64::new(0)),
+        };
+        let old = shared.profile_gen.load(Ordering::SeqCst);
+        let (reply, _) = oneshot::channel();
+        apply(
+            &mut engine,
+            began,
+            &cache,
+            &shared,
+            Cmd::SetProfile(p, reply),
+        );
+        apply(
+            &mut engine,
+            began,
+            &cache,
+            &shared,
+            Cmd::Agent(vec![("f1".into(), 90)], old),
+        );
+        assert_eq!(
+            engine.agent_request("f1"),
+            None,
+            "decided under the old profile"
+        );
+        let now = shared.profile_gen.load(Ordering::SeqCst);
+        apply(
+            &mut engine,
+            began,
+            &cache,
+            &shared,
+            Cmd::Agent(vec![("f1".into(), 90)], now),
+        );
+        assert_eq!(engine.agent_request("f1"), Some(90));
     }
 
     fn start(
@@ -1356,6 +1510,7 @@ mod tests {
         let agent = AgentShared {
             flags: Arc::default(),
             profile: Arc::new(RwLock::new(active)),
+            profile_gen: Arc::default(),
         };
         let began = Instant::now();
         engine.tick(Duration::ZERO);
@@ -1365,7 +1520,7 @@ mod tests {
             began,
             &cache,
             &agent,
-            Cmd::Agent(vec![("f1".into(), 80)]),
+            Cmd::Agent(vec![("f1".into(), 80)], 0),
         );
         engine.tick(began.elapsed());
         assert_eq!(last_write(&hal), Some(("f1".into(), 30)));
@@ -1375,7 +1530,7 @@ mod tests {
             began,
             &cache,
             &agent,
-            Cmd::Agent(vec![("f1".into(), 80)]),
+            Cmd::Agent(vec![("f1".into(), 80)], 0),
         );
         engine.tick(began.elapsed());
         assert_eq!(

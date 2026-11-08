@@ -194,11 +194,11 @@ pub fn start(
             ));
         }
     }
-    for rule in &active.app_rules {
+    for rule in &cfg.app_rule {
         if !profiles.iter().any(|p| p.name == rule.profile) {
             return Err(format!(
-                "app rule '{}' selects unknown profile '{}'",
-                rule.process, rule.profile
+                "app_rule '{}' selects unknown profile '{}'",
+                rule.id, rule.profile
             ));
         }
     }

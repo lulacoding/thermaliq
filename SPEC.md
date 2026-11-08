@@ -61,6 +61,19 @@ Every one of these has an automated test before any code that writes to real fan
 
 The engine resolves this every tick. A lower source never overwrites a higher one. A profile change ramps using that fan's `step_up_pct` / `step_down_pct`; safety does not ramp.
 
+### 4.1 Which profile is in effect
+
+One arbiter decides it; nothing else switches profiles. Highest first:
+
+1. **App rule:** an enabled `[[app_rule]]` whose `exe` equals the foreground executable (the whole name, ASCII case-insensitive; never a substring, never a background process). Highest `priority` wins; a tie goes to the earlier rule in the file.
+2. **Agent profile intent:** the profile for the foreground app's workload. It is a 3 s lease that the supervisor renews every second with no provider call. A new intent counts against six Agent-selected changes an hour: the limit is checked at every activation, including one whose profile is already in effect, and a change is counted when the engine applies it.
+3. **Schedule:** an enabled `[[schedule]]` that matches the OS local wall clock, evaluated again every tick (so DST jumps, a clock change and a resume need no special case). Start is included, end excluded. The after-midnight part of an overnight window belongs to the weekday on which it started. Highest `priority`, then file order. During the repeated fall-back hour a window can be active twice; that is accepted.
+4. **Chosen fallback:** `default_profile`. A manual choice (`POST /profiles/active`, `tq profile set`) is validated, saved to `config.toml` (temp file + rename), and takes effect only if nothing above it wins. It never preempts a live source.
+
+One winner supplies every setting (curves, controls, alerts); settings are never blended. A target that does not exist, or that the engine would refuse because it releases a real fan, is skipped: the next candidate of the same source is tried, then the next source. The fast Agent duty floor comes from the winner's curve for that fan, minus 15 points, then that control's `min_pwm`; an expired request of any other source has no say. App rules and schedules keep working while the Agent is paused, crashed or slow.
+
+Generations: a foreground, a config and a profile counter. Foreground moves when the foreground exe changes; config when the app rules or schedules change (a change of `default_profile` alone does not move it); profile when the winner changes. Work started under an older tuple (a provider answer, a fast request) is discarded. Pause, an Agent crash or the supervisor ending drop the intent; a profile switch drops the fast requests of the old profile and resets each optimiser. A fan probe (§5.2) is a request of its own, not a profile swap.
+
 ## 5. Architecture
 
 ```
@@ -148,7 +161,7 @@ A dropped fan goes to the BIOS or driver, not to a guess. The report is one line
 3. `identify` prints the proposals, including the `case_fans` list and what was left out, then asks "Save these? [Y/n]". `y` or a bare Enter saves `roles.toml` and accepts the inventory; `n`, `q` or end of input saves nothing.
 4. **`tq identify --probe <fan-id>`:** runs the probe on that one fan and reports the tach pairing (the fan whose RPM rose) and whether the write landed. A rise on another fan's tach is reported, never guessed. It saves nothing.
 
-A probe only ever raises a fan, never lowers one. It adds one flat-100% control for that fan to the active profile for 5 s, then restores the profile, so the engine stays the only writer (S1) and S2–S4 still win. The hold and the restore run in their own task, so a dropped request (Ctrl-C) still restores. The agent is paused for the probe and resumed afterwards only if it was running, so no profile switch can land inside the hold and be undone. `roles.toml` is written atomically.
+A probe only ever raises a fan, never lowers one. It is a request of its own in the engine (calibration tier, §4): the fan at 100%, no ramp, per fan, ending 2 s after the 5 s hold if nobody ends it first. It is not a profile swap, so the engine stays the only writer (S1), S2–S4 still win, and it works for a fan the active profile does not control (that fan goes back to the BIOS afterwards). It refuses a fan with a live override (409, `tq` exit 4, "fan has a live override"): the user's override is never replaced. Ending it withdraws only that probe's request (matched by id), so a profile an app rule, a schedule or the user picks meanwhile stays. The hold runs in its own task, so a dropped request (Ctrl-C) still ends it. The agent is paused for the probe and resumed afterwards only if this probe paused it. `roles.toml` is written atomically.
 
 M13 is identity only. Which fan cools which component is M20d.
 
@@ -156,7 +169,7 @@ M13 is identity only. Which fan cools which component is M20d.
 
 - One shared data directory: `%ProgramData%\ThermalIQ` (overridable by env var for dev and CI). Config, profiles, token, history DB live there.
 - `config.toml`, written atomically (temp file + rename). Settings changed through the API are saved there.
-- `default_profile` is the user's base profile. Optional `[[schedule]]` entries use `days = ["mon", ...]`, a local 24-hour `time = "22:00-08:00"` window, and a saved `profile`; empty `days` means every day. App rules scan running process names case-insensitively in rule order and are read from the configured base profile, even while another profile is active. The active profile is priority-arbitrated: Agent > matching app rule > matching schedule > user base profile. App/schedule changes use the engine profile-switch safety checks and cannot select an unknown profile, fan or sensor.
+- `default_profile` is the user's chosen fallback (§4.1). `[[app_rule]]` (`id`, `enabled` default true, `exe`, `profile`, `priority` default 0) and `[[schedule]]` (`id`, `enabled`, `priority`, `days = ["mon", ...]` with empty meaning every day, local 24-hour `time = "22:00-08:00"`, `profile`) belong to `config.toml`, not to profiles; a profile file with `[[app_rules]]` is refused ("app_rules moved to config.toml [[app_rule]]"). Ids must be unique and non-empty. They apply after a restart, like the rest of `PUT /config`. `POST /profiles/active` answers `{chosen, effective, source, rule_id}`, even when they differ. `/status` keeps `active_profile` as the effective profile and adds `chosen_profile`, `profile_source` (`app`, `agent`, `schedule` or `fallback`) and `profile_rule_id`.
 - API keys in the OS keychain, never in TOML.
 - Every mutating endpoint needs `Authorization: Bearer <token>`. Read-only endpoints may be open. CORS lists the real production origins (including `http://tauri.localhost` on Windows).
 - UI gets the token through a Tauri command, not by reading files from the webview.
@@ -211,7 +224,7 @@ Decided in the agent brainstorm (Sam, 2026-11-04). Research: `docs/dev/research/
 **Fast layer: every tick (1 s), CPU only, microseconds, always on, including while gaming.**
 - *Workload classifier:* small gradient-boosted trees over the inputs give idle / browsing / gaming / compiling / rendering / other. It is trained on history labelled by the slow layer and by the user's corrections.
 - *Thermal model:* small, learned per component. It predicts each controlled temperature 10–30 s ahead from duty, load and power.
-- *Live optimiser:* it adjusts each fan up or down from its curve output to meet the slider target. Ramping up early for a predicted spike counts as a **short boost**, which expires in ≤ 60 s. Limits: it may raise any fan freely. It may lower a fan by at most 15 points below the curve output, and only while every temperature that fan cools is under its target and predicted to stay there. Requests expire in 3 s and are renewed every tick.
+- *Live optimiser:* it adjusts each fan up or down from its curve output to meet the slider target. Ramping up early for a predicted spike counts as a **short boost**, which expires in ≤ 60 s. Limits: it may raise any fan freely. It may lower a fan by at most 15 points below the winning profile's curve output (§4.1), and only while every temperature that fan cools is under its target and predicted to stay there. Requests expire in 3 s and are renewed every tick.
   - *Over target now* (a real reading above the target, not a prediction): the request goes up 2 points per tick above the curve, up to 100, with no time cap. It is held while any temperature is within 2 °C of the target. Once every temperature has been 2 °C under target for 10 s, it eases back 1 point per tick to the curve. An unknown reading holds it. Predicted-only boosts keep +20 and the 60 s cap, and being over target does not use that window up. The thermal model gives no prediction for inputs outside the range it was fitted on (a fan spinning up reads duty 0 and a linear fit would predict +40 °C).
   - *Targets from the slider* (0 = quiet, 100 = cool): a straight line between two targets per component. GPU 80 → 65 °C, CPU 85 → 70 °C. At 50: GPU 72.5, CPU 77.5. Safety (S2–S4) never sees them.
   - *Which fan cools what:* until setup mapping (M20d) exists, a fan cools the component whose temperature sensor its profile curve reads. If the GPU, its load or its power cannot be named unambiguously, or no fan follows it, the agent leaves those fans to their curves.

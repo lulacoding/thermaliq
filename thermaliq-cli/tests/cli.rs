@@ -149,6 +149,7 @@ fn status_body(degraded: bool, latched: bool, running: bool) -> Value {
         "degraded_reasons": if degraded { json!(["profile 'balanced' controls no fans"]) } else { json!([]) },
         "waiting_on": [], "unavailable_sources": [], "snapshot_age": 0.4,
         "active_profile": "balanced", "ticks": 120, "agent": "running",
+        "chosen_profile": "balanced", "profile_source": "fallback", "profile_rule_id": null,
     })
 }
 
@@ -166,6 +167,30 @@ fn status_shows_the_state_and_exits_0_when_all_is_well() {
     for want in ["balanced", "running", "120"] {
         assert!(o.out.contains(want), "{want}: {}", o.out);
     }
+}
+
+#[test]
+fn status_shows_the_effective_profile_its_source_and_the_users_choice() {
+    let r = rig(vec![ok("GET", "/status", status_body(false, false, true))]);
+    let o = tq(&r, &["status"]);
+    assert!(
+        o.out
+            .contains("profile:       balanced (fallback); chosen: balanced"),
+        "{}",
+        o.out
+    );
+    let mut body = status_body(false, false, true);
+    body["active_profile"] = json!("gaming");
+    body["profile_source"] = json!("app");
+    body["profile_rule_id"] = json!("cs2");
+    let r = rig(vec![ok("GET", "/status", body)]);
+    let o = tq(&r, &["status"]);
+    assert!(
+        o.out
+            .contains("profile:       gaming (app: cs2); chosen: balanced"),
+        "{}",
+        o.out
+    );
 }
 
 #[test]
@@ -481,14 +506,28 @@ fn profile_set_posts_the_name_with_the_token() {
     let r = rig(vec![ok(
         "POST",
         "/profiles/active",
-        json!({"active_profile": "silent"}),
+        json!({"chosen": "silent", "effective": "silent", "source": "fallback", "rule_id": null}),
     )]);
     let o = tq(&r, &["profile", "set", "silent"]);
     assert_eq!(o.code, 0, "{}", o.err);
-    assert!(o.out.contains("silent"), "{}", o.out);
+    assert!(o.out.contains("chosen: silent"), "{}", o.out);
+    assert!(o.out.contains("effective: silent (fallback)"), "{}", o.out);
     let q = &r.fake.requests()[0];
     assert_eq!(q.body, json!({"name": "silent"}));
     assert_eq!(q.auth.as_deref(), Some(format!("Bearer {TOKEN}").as_str()));
+}
+
+#[test]
+fn profile_set_prints_both_lines_when_a_rule_wins_over_the_choice() {
+    let r = rig(vec![ok(
+        "POST",
+        "/profiles/active",
+        json!({"chosen": "silent", "effective": "gaming", "source": "app", "rule_id": "cs2"}),
+    )]);
+    let o = tq(&r, &["profile", "set", "silent"]);
+    assert_eq!(o.code, 0, "{}", o.err);
+    assert!(o.out.contains("chosen: silent"), "{}", o.out);
+    assert!(o.out.contains("effective: gaming (app: cs2)"), "{}", o.out);
 }
 
 #[test]
