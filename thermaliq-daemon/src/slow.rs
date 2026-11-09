@@ -663,9 +663,8 @@ fn supervise(s: Supervisor, stopping: &AtomicBool) {
             match apply_named(&selection.effective, &cache, &profiles, &rt, &handle, &gate) {
                 Ok(changed) => {
                     last_note = None;
-                    handle.arbiter().applied(&selection);
+                    handle.arbiter().record_applied(&selection, changed, now);
                     if changed && selection.source == ProfileSource::Agent {
-                        handle.arbiter().agent_applied(now);
                         let profile = selection.effective.clone();
                         let exe = exe.clone().unwrap_or_default();
                         shared.update(|v| {
@@ -1076,7 +1075,8 @@ mod tests {
     }
 
     fn wait_until(mut ok: impl FnMut() -> bool) {
-        let end = Instant::now() + Duration::from_secs(5);
+        // Generous: a slow CI runner must not turn a wait into a failure.
+        let end = Instant::now() + Duration::from_secs(10);
         while !ok() {
             assert!(Instant::now() < end, "timed out");
             std::thread::sleep(Duration::from_millis(5));
@@ -1111,15 +1111,18 @@ mod tests {
         let h = r.daemon.handle();
         let rt = tokio::runtime::Runtime::new().unwrap();
         show(&r, "game.exe");
-        wait_until(|| active(&r) == "gaming"); // effective activation 1
+        // The activation is counted once the supervisor has recorded it (`source`), not when the
+        // engine applies the profile (`active`): pausing in between would lose the count.
+        let by_agent = |r: &Rig| active(r) == "gaming" && source(r) == Some(ProfileSource::Agent);
+        wait_until(|| by_agent(&r)); // effective activation 1
         for _ in 2..=6 {
             rt.block_on(h.pause_agent()).unwrap();
-            wait_until(|| active(&r) == "balanced");
+            wait_until(|| active(&r) == "balanced" && source(&r) == Some(ProfileSource::Fallback));
             rt.block_on(h.resume_agent()).unwrap();
-            wait_until(|| active(&r) == "gaming");
+            wait_until(|| by_agent(&r));
         }
         rt.block_on(h.pause_agent()).unwrap();
-        wait_until(|| active(&r) == "balanced");
+        wait_until(|| active(&r) == "balanced" && source(&r) == Some(ProfileSource::Fallback));
         rt.block_on(h.resume_agent()).unwrap();
         let ticks = h.cache().ticks;
         wait_until(|| h.cache().ticks > ticks + 100);
@@ -1251,15 +1254,15 @@ mod tests {
     fn a_config_app_rule_wins_while_its_exe_is_in_the_foreground_and_lets_go_after() {
         let r = rig_with_config(quiet(), &[], cfg(&rule("game.exe", "gaming")));
         show(&r, "GAME.EXE");
-        wait_until(|| active(&r) == "gaming");
+        // `selection` is recorded just after the engine applies the profile: wait for it.
+        wait_until(|| active(&r) == "gaming" && source(&r) == Some(ProfileSource::App));
         let s = r.daemon.handle().cache().selection.unwrap();
         assert_eq!(
             (s.source, s.rule_id.as_deref(), s.chosen.as_str()),
             (ProfileSource::App, Some("r-game.exe"), "balanced")
         );
         show(&r, "notepad.exe");
-        wait_until(|| active(&r) == "balanced");
-        assert_eq!(source(&r), Some(ProfileSource::Fallback));
+        wait_until(|| active(&r) == "balanced" && source(&r) == Some(ProfileSource::Fallback));
     }
 
     #[test]

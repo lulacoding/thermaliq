@@ -242,6 +242,15 @@ impl Arbiter {
         self.last = Some(s.clone());
     }
 
+    /// `applied`, and when the engine just changed to an Agent profile, the hourly count too, in
+    /// one call: a pause between the two would otherwise drop the intent uncounted.
+    pub fn record_applied(&mut self, s: &Selection, changed: bool, now: Duration) {
+        self.applied(s);
+        if changed && s.source == ProfileSource::Agent {
+            self.agent_applied(now);
+        }
+    }
+
     /// The profile that wins now. A different winner starts a new profile generation.
     pub fn select(&mut self, now: Duration, usable: Usable) -> Selection {
         let s = self.pick(now, usable);
@@ -327,6 +336,24 @@ mod tests {
     fn offer(a: &mut Arbiter, now: u64, profile: &str) -> Offer {
         let seen = a.generations();
         a.offer_intent(secs(now), profile, seen, &ALL)
+    }
+
+    /// A pause that lands right after the engine took an Agent profile must not lose the
+    /// activation: recording the selection and counting it are one call (one lock hold).
+    #[test]
+    fn an_applied_agent_selection_is_counted_by_the_call_that_records_it() {
+        let (mut a, _) = arb("");
+        for i in 0..6 {
+            assert_eq!(
+                offer(&mut a, i, "performance"),
+                Offer::Activated,
+                "activation {i}"
+            );
+            let s = a.select(secs(i), &ALL);
+            a.record_applied(&s, true, secs(i));
+            a.invalidate_agent(); // the pause arrives straight after
+        }
+        assert_eq!(offer(&mut a, 10, "performance"), Offer::LimitReached);
     }
 
     #[test]
