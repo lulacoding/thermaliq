@@ -12,10 +12,10 @@ use std::sync::{Mutex, PoisonError};
 
 use std::time::Duration;
 use thermaliq_common::identity::{
-    diff, missing_fans, missing_message, pair, propose, resolve, unmapped_lines, Inventory,
-    InventoryDiff, Role, Roles, CASE_FANS,
+    diff, missing_fans, missing_message, pair, propose, resolve, resolve_alerts, unmapped_lines,
+    Inventory, InventoryDiff, Role, Roles, CASE_FANS,
 };
-use thermaliq_common::{HardwareSnapshot, Profile};
+use thermaliq_common::{AlertEntry, HardwareSnapshot, Profile};
 use thermaliq_hal::HardwareLayer;
 
 /// How long a probe holds a fan at 100% before it reads the tachs.
@@ -284,6 +284,20 @@ impl Identity {
         Ok(())
     }
 
+    /// The config's alerts with sensor roles turned into real ids. An alert on a role nothing is
+    /// mapped to is dropped, printed, and listed in `problems` (SPEC §4.2).
+    pub fn resolve_alerts(&self, alerts: &[AlertEntry]) -> Vec<AlertEntry> {
+        let (kept, skipped) = resolve_alerts(alerts, &self.roles());
+        for line in &skipped {
+            eprintln!("thermaliq: {line}");
+        }
+        self.late
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(skipped);
+        kept
+    }
+
     /// Makes today's fans the saved inventory. An empty snapshot is refused: saving it would
     /// make every fan look new next time.
     pub fn accept_inventory(&self, snap: &HardwareSnapshot) -> Result<(), String> {
@@ -448,8 +462,7 @@ mod tests {
 
     const BAL: &str = "name = \"bal\"\n\
         [[curves]]\nid = \"c\"\ntype = \"linear\"\nsource = \"cpu_temp\"\nmin_temp = 30\nmax_temp = 90\nmin_pwm = 20\nmax_pwm = 100\n\
-        [[controls]]\nfan = \"case_fans\"\ncurve = \"c\"\n\
-        [[alerts]]\nsensor = \"cpu_temp\"\nthreshold = 85\nseverity = \"warn\"\naction = { type = \"log\" }\n";
+        [[controls]]\nfan = \"case_fans\"\ncurve = \"c\"\n";
 
     fn at() -> Tick {
         Tick::Temps(vec![("cpu".into(), SensorKind::Cpu, 40.0)])

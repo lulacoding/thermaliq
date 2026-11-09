@@ -13,10 +13,15 @@ const DAY: i64 = 86_400;
 const KEEP_DAYS: i64 = 90;
 
 /// Ids of the snapshot sensors to record (SPEC §6): every CPU/GPU sensor plus every
-/// sensor any saved profile references. Ids that name custom sensors aren't in the
+/// sensor any saved profile references, plus the sensors of the global alerts
+/// (`alert_sensors`, roles already resolved). Ids that name custom sensors aren't in the
 /// snapshot, so they drop out here.
-pub fn recorded_sensor_ids(profiles: &[Profile], snapshot: &HardwareSnapshot) -> HashSet<String> {
-    let mut refs: HashSet<&str> = HashSet::new();
+pub fn recorded_sensor_ids(
+    profiles: &[Profile],
+    alert_sensors: &[String],
+    snapshot: &HardwareSnapshot,
+) -> HashSet<String> {
+    let mut refs: HashSet<&str> = alert_sensors.iter().map(String::as_str).collect();
     for p in profiles {
         for c in &p.curves {
             match c {
@@ -38,7 +43,6 @@ pub fn recorded_sensor_ids(profiles: &[Profile], snapshot: &HardwareSnapshot) ->
                 }
             }
         }
-        refs.extend(p.alerts.iter().map(|a| a.sensor.as_str()));
     }
     snapshot
         .sensors
@@ -432,12 +436,7 @@ mod tests {
             type = "offset"
             id = "custom"
             source = "mb_custom"
-            offset = 1.0
-            [[alerts]]
-            sensor = "mb_alert"
-            threshold = 80.0
-            severity = "warn"
-            action = { type = "log" }"#);
+            offset = 1.0"#);
         let mut unused = s("mb_unused", 30.0);
         unused.kind = SensorKind::Other;
         let named = |id: &str| {
@@ -459,7 +458,8 @@ mod tests {
             fans: vec![],
             ..Default::default()
         };
-        let got = recorded_sensor_ids(&[active, other], &snap);
+        // Alerts are global (config.toml), so their sensors come in on their own.
+        let got = recorded_sensor_ids(&[active, other], &["mb_alert".to_owned()], &snap);
         let want: HashSet<String> = ["cpu0", "gpu0", "mb_curve", "mb_custom", "mb_alert"]
             .map(String::from)
             .into();
@@ -475,7 +475,7 @@ mod tests {
             fans: vec![],
             ..Default::default()
         };
-        let got = recorded_sensor_ids(&[], &snap);
+        let got = recorded_sensor_ids(&[], &[], &snap);
         assert_eq!(got, HashSet::from(["cpu0".to_string()]));
     }
 
@@ -488,7 +488,7 @@ mod tests {
             fans: vec![],
             ..Default::default()
         };
-        assert_eq!(recorded_sensor_ids(&[], &snap).len(), 3);
+        assert_eq!(recorded_sensor_ids(&[], &[], &snap).len(), 3);
     }
 
     #[test]

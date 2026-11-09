@@ -2,6 +2,7 @@
 //! and the history thread. Only `thermaliq-engine` writes to fans.
 
 use crate::agent::{Agent, AgentTick, Brain, DEFAULT_SLIDER};
+use crate::alerts::AlertHub;
 use crate::arbiter::{Arbiter, Selection, SystemClock};
 use crate::history::{recorded_sensor_ids, HistoryDb};
 use std::collections::HashMap;
@@ -216,10 +217,35 @@ pub struct Handle {
     ticks: watch::Receiver<u64>,
     flags: Arc<AgentFlags>,
     selection: Arc<Mutex<Arbiter>>,
+    alerts: Arc<Mutex<AlertHub>>,
     began: Instant,
 }
 
 impl Handle {
+    fn hub(&self) -> std::sync::MutexGuard<'_, AlertHub> {
+        self.alerts.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Replaces the global alerts (sensor roles already resolved); their state starts again.
+    pub fn configure_alerts(&self, alerts: Vec<thermaliq_common::AlertEntry>) {
+        self.hub().configure(alerts);
+    }
+
+    /// What `GET /alerts` answers.
+    pub fn alerts(&self) -> serde_json::Value {
+        self.hub().describe()
+    }
+
+    /// Ids of the alerts active now.
+    pub fn active_alerts(&self) -> Vec<String> {
+        self.hub().active()
+    }
+
+    /// `(alert id, profile)` an active `apply_profile` alert asks the arbiter for.
+    pub fn alert_profile(&self) -> Option<(String, String)> {
+        self.hub().wanted_profile()
+    }
+
     /// Time since the daemon started: the clock the profile leases run on.
     pub fn elapsed(&self) -> Duration {
         self.began.elapsed()
@@ -431,6 +457,7 @@ pub struct Daemon {
     ticks: watch::Receiver<u64>,
     flags: Arc<AgentFlags>,
     selection: Arc<Mutex<Arbiter>>,
+    alerts: Arc<Mutex<AlertHub>>,
     began: Instant,
     engine: Option<JoinHandle<()>>,
     history: Option<JoinHandle<()>>,
@@ -507,6 +534,7 @@ impl Daemon {
             &active.name,
             Arc::new(SystemClock),
         )));
+        let alerts = Arc::new(Mutex::new(AlertHub::default()));
         let brain = make_brain(shared.profile.clone());
         let (agent_tx, agent_rx) = mpsc::sync_channel::<AgentTick>(AGENT_QUEUE);
         let cache = Arc::new(RwLock::new(Cache {
@@ -530,6 +558,7 @@ impl Daemon {
         };
         let engine = {
             let (cache, active, tick) = (cache.clone(), active.clone(), opts.tick);
+            let alerts = alerts.clone();
             std::thread::spawn(move || {
                 let run = catch_unwind(AssertUnwindSafe(|| {
                     // The engine is dropped when this closure ends or unwinds, which hands the fans back (S5).
@@ -548,7 +577,15 @@ impl Daemon {
                             snapshot_age + 1
                         };
                         if engine.snapshot_fresh() {
-                            let sensors = recorded_sensor_ids(&saved, &snapshot);
+                            // Global alerts (config.toml) run on every fresh tick, whatever the
+                            // profile; their sensors are recorded even if no profile names them.
+                            let alert_sensors = {
+                                let mut hub =
+                                    alerts.lock().unwrap_or_else(PoisonError::into_inner);
+                                hub.step(t0 - began, unix_now(), &snapshot);
+                                hub.sensors()
+                            };
+                            let sensors = recorded_sensor_ids(&saved, &alert_sensors, &snapshot);
                             let sensors = snapshot
                                 .sensors
                                 .iter()
@@ -669,6 +706,7 @@ impl Daemon {
             ticks,
             flags,
             selection,
+            alerts,
             began: Instant::now(),
             engine: Some(engine),
             history: Some(history),
@@ -687,6 +725,7 @@ impl Daemon {
             ticks: self.ticks.clone(),
             flags: self.flags.clone(),
             selection: self.selection.clone(),
+            alerts: self.alerts.clone(),
             began: self.began,
         }
     }
@@ -887,6 +926,53 @@ mod tests {
             assert!(Instant::now() < end, "timed out");
             std::thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    fn alert(id: &str, action: thermaliq_common::AlertAction) -> thermaliq_common::AlertEntry {
+        thermaliq_common::AlertEntry {
+            id: id.into(),
+            enabled: true,
+            sensor: "cpu".into(),
+            threshold: 85.0,
+            severity: thermaliq_common::Severity::Warn,
+            action,
+        }
+    }
+
+    /// M16: the engine thread feeds the alerts every fresh tick, whichever profile is active.
+    #[test]
+    fn alerts_run_every_tick_and_their_state_survives_a_profile_switch() {
+        let (_, d) = start(vec![at(90.0)], vec![], &db(), fast());
+        let h = d.handle();
+        h.configure_alerts(vec![alert("hot", thermaliq_common::AlertAction::Notify)]);
+        wait_until(|| h.alerts()["alerts"][0]["state"] == "active");
+        assert_eq!(h.alerts()["events"][0]["event"], "fired");
+        assert_eq!(h.alerts()["events"][0]["notify"], true);
+
+        let other = Profile::from_toml(ON_X).unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(h.apply_profile(other)).unwrap();
+        let ticks = h.cache().ticks;
+        wait_until(|| h.cache().ticks > ticks + 20);
+        assert_eq!(h.alerts()["alerts"][0]["state"], "active", "a switch is not a clear");
+        assert_eq!(h.alerts()["events"].as_array().unwrap().len(), 1, "and does not fire again");
+        d.shutdown().unwrap();
+    }
+
+    #[test]
+    fn history_records_the_alert_sensors_even_when_no_profile_names_them() {
+        let hal = Arc::new(MockHardwareLayer::new(
+            &["f1"],
+            vec![Tick::Temps(vec![("ssd".into(), SensorKind::Other, 50.0)])],
+        ));
+        let database = db();
+        let active = Profile::from_toml(FLAT).unwrap();
+        let d = Daemon::start(hal, &active, vec![], database.clone(), fast());
+        let mut a = alert("ssd-hot", thermaliq_common::AlertAction::Log);
+        a.sensor = "ssd".into();
+        d.handle().configure_alerts(vec![a]);
+        wait_until(|| !database.lock().unwrap().sensor_rows("ssd").unwrap().is_empty());
+        d.shutdown().unwrap();
     }
 
     #[test]
