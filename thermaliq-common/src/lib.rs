@@ -6,6 +6,7 @@
 pub mod alert;
 mod config;
 pub mod datadir;
+pub mod health;
 pub mod identity;
 mod profile;
 
