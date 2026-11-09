@@ -57,8 +57,9 @@ pub struct AlertHub {
     fired_at: HashMap<String, i64>,
     conds: BTreeMap<String, Active>,
     stall: StallTracker,
-    /// Per fan, the 10-point duty buckets it has reported RPM at (history, then live).
-    spun: HashMap<String, HashSet<u8>>,
+    /// Fans that have ever reported RPM above 0: from the inventory and history at start, then
+    /// every live reading. Once in, a fan never leaves.
+    tach_seen: HashSet<String>,
     fan_health: HashMap<String, String>,
 }
 
@@ -110,31 +111,28 @@ impl AlertHub {
         self.log.push_back(r);
     }
 
-    /// A fan reading 0 RPM for 30 s at a duty it has spun at is stalled (critical). A fan that
-    /// never spun there is unmonitored, not stalled.
+    /// A fan whose tach has been seen, reading 0 RPM for 30 s at the start duty or above, is
+    /// stalled (critical) for as long as that holds. A fan that never reported RPM is
+    /// unmonitored, not stalled.
     fn step_stalls(&mut self, now: Duration, unix: i64, snapshot: &HardwareSnapshot) {
         let fans: Vec<(String, u32, u8)> = snapshot
             .fans
             .iter()
             .map(|f| (f.id.clone(), f.rpm, f.duty_percent))
             .collect();
-        for (id, rpm, duty) in &fans {
+        for (id, rpm, _) in &fans {
             if *rpm > 0 {
-                self.spun.entry(id.clone()).or_default().insert(duty / 10);
+                self.tach_seen.insert(id.clone());
             }
         }
-        let spun = &self.spun;
-        let stalled = self.stall.step(now, &fans, |id, duty| {
-            let b = duty / 10;
-            spun.get(id)
-                .is_some_and(|s| (b.saturating_sub(1)..=b + 1).any(|x| s.contains(&x)))
-        });
+        let seen = &self.tach_seen;
+        let stalled = self.stall.step(now, &fans, |id| seen.contains(id));
         let active = stalled
             .into_iter()
             .map(|fan| Condition {
                 key: format!("fan-stalled:{fan}"),
                 message: format!(
-                    "fan '{fan}' reads 0 RPM at a duty it has spun at: it may have stalled"
+                    "fan '{fan}' reads 0 RPM although its tach has worked before: it may have stalled"
                 ),
                 severity: Severity::Crit,
                 sensor: fan,
@@ -197,11 +195,14 @@ impl AlertHub {
         });
     }
 
-    /// History's view of the fans: the duty buckets each has spun at, learned at start and hourly.
-    pub fn set_spun(&mut self, spun: HashMap<String, HashSet<u8>>) {
-        for (fan, buckets) in spun {
-            self.spun.entry(fan).or_default().extend(buckets);
-        }
+    /// Fans already known to have reported RPM (the inventory, history). Added to, never removed.
+    pub fn set_tach_seen(&mut self, seen: HashSet<String>) {
+        self.tach_seen.extend(seen);
+    }
+
+    /// Every fan seen turning so far: what the health thread saves in the inventory.
+    pub fn tach_seen(&self) -> HashSet<String> {
+        self.tach_seen.clone()
     }
 
     /// `ok`, `declining`, `unmonitored` or `insufficient_history` per fan, from history.
@@ -481,10 +482,53 @@ mod tests {
         h.step(Duration::from_secs(at), 1_000 + at as i64, &s);
     }
 
+    /// M16 review: a fan that stalls and stays dead must not clear its own alert after 30 days.
     #[test]
-    fn a_stall_is_critical_after_30_seconds_at_a_duty_the_fan_has_spun_at_and_clears() {
+    fn a_dead_fan_stays_stalled_after_31_days_and_a_fan_never_seen_turning_is_unmonitored() {
+        let day = 86_400;
         let mut h = AlertHub::default();
-        h.set_spun([("f".to_owned(), [6u8].into())].into());
+        h.set_tach_seen(["f".to_owned()].into());
+        fan_tick(&mut h, 0, 0, 60);
+        fan_tick(&mut h, 30, 0, 60);
+        assert_eq!(h.fan_health("f"), "stalled");
+        // 31 days of 0 RPM at 60% duty: the history window holds no RPM at all.
+        fan_tick(&mut h, 31 * day, 0, 60);
+        assert_eq!(h.fan_health("f"), "stalled", "still stalled");
+        assert!(
+            h.log().iter().all(|r| r.event != "cleared"),
+            "it never cleared: {:?}",
+            h.log()
+        );
+        assert_eq!(
+            h.log().last().unwrap().event,
+            "repeated",
+            "the weekly repeat goes on"
+        );
+
+        // A fan whose tach was never seen is not stalled, however long it reads 0.
+        let mut h = AlertHub::default();
+        fan_tick(&mut h, 0, 0, 60);
+        fan_tick(&mut h, 31 * day, 0, 60);
+        assert!(h.log().is_empty());
+        assert!(!h.tach_seen().contains("f"));
+    }
+
+    #[test]
+    fn rpm_above_zero_marks_the_tach_seen_for_good() {
+        let mut h = AlertHub::default();
+        fan_tick(&mut h, 0, 900, 60);
+        assert!(h.tach_seen().contains("f"));
+        fan_tick(&mut h, 1, 0, 60);
+        assert!(
+            h.tach_seen().contains("f"),
+            "reading 0 later does not undo it"
+        );
+    }
+
+    #[test]
+    fn a_stall_is_critical_after_30_seconds_for_a_fan_whose_tach_was_seen_and_clears() {
+        let mut h = AlertHub::default();
+        h.set_tach_seen(["f".to_owned()].into());
         fan_tick(&mut h, 0, 0, 60);
         fan_tick(&mut h, 29, 0, 60);
         assert!(h.log().is_empty());

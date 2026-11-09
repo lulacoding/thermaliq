@@ -234,7 +234,7 @@ impl Handle {
     /// Hands the hub what the hourly history check found.
     pub fn apply_health(&self, e: crate::health::Evaluation, now: i64) {
         let mut h = self.hub();
-        h.set_spun(e.spun);
+        h.set_tach_seen(e.tach_seen);
         h.set_fan_health(e.fan_health);
         let (fans, dusts) = e
             .conditions
@@ -242,6 +242,11 @@ impl Handle {
             .partition(|c| c.key.starts_with("fan-health:"));
         h.update_conditions("fan-health:", now, fans);
         h.update_conditions("dust:", now, dusts);
+    }
+
+    /// Fans seen reporting RPM above 0, live or from history.
+    pub fn tach_seen(&self) -> std::collections::HashSet<String> {
+        self.hub().tach_seen()
     }
 
     /// `tq alerts ack`: a new dust baseline starts now, so the old finding ends.

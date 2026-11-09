@@ -74,6 +74,42 @@ fn save_inventory(dir: &Path, inv: &Inventory) -> Result<(), String> {
     write_atomic(&dir.join("inventory.json"), &json).map_err(|e| format!("inventory.json: {e}"))
 }
 
+/// Fans `inventory.json` says have reported RPM above 0. Empty without an inventory.
+pub fn tach_seen(dir: &Path) -> std::collections::HashSet<String> {
+    match read_inventory(dir) {
+        Ok(Some(inv)) => inv
+            .fans
+            .into_iter()
+            .filter(|f| f.tach_seen)
+            .map(|f| f.id)
+            .collect(),
+        _ => Default::default(),
+    }
+}
+
+/// Saves that these fans have reported RPM, once and for good (a fan that later dies is still a
+/// fan with a tach). Without a saved inventory there is nowhere to keep it: the next hourly
+/// pass tries again.
+pub fn mark_tach_seen(dir: &Path, fans: &std::collections::HashSet<String>) {
+    let Ok(Some(mut inv)) = read_inventory(dir) else {
+        return;
+    };
+    let mut changed = false;
+    for f in inv
+        .fans
+        .iter_mut()
+        .filter(|f| fans.contains(&f.id) && !f.tach_seen)
+    {
+        f.tach_seen = true;
+        changed = true;
+    }
+    if changed {
+        if let Err(e) = save_inventory(dir, &inv) {
+            eprintln!("thermaliq: could not remember which fans have a tach: {e}");
+        }
+    }
+}
+
 impl Identity {
     /// No roles, no inventory: what the API tests and an unconfigured state use.
     pub fn empty(dir: PathBuf) -> Self {
@@ -306,7 +342,7 @@ impl Identity {
         }
         let mut now = Inventory::of(snap, self.board.clone());
         if let Ok(Some(saved)) = read_inventory(&self.dir) {
-            now.keep_rejected_from(&saved);
+            now.keep_flags_from(&saved);
         }
         save_inventory(&self.dir, &now)
     }
@@ -951,6 +987,45 @@ mod tests {
             !saved_flag(dir.path(), "f2"),
             "a write that landed clears it"
         );
+    }
+
+    fn two_fans() -> HardwareSnapshot {
+        let fan = |id: &str| thermaliq_common::FanReading {
+            id: id.into(),
+            label: id.into(),
+            rpm: 0,
+            duty_percent: 0,
+            kind: thermaliq_common::FanKind::Fan,
+        };
+        HardwareSnapshot {
+            fans: vec![fan("f1"), fan("f2")],
+            ..Default::default()
+        }
+    }
+
+    /// M16 review: "has this fan ever reported RPM" lives in `inventory.json`, so a fan that
+    /// died is still a fan with a tach after a restart, and accepting the inventory keeps it.
+    #[test]
+    fn tach_seen_is_saved_in_the_inventory_once_and_survives_accepting_it() {
+        let dir = dir();
+        let id = Identity::empty(dir.path().to_owned());
+        assert!(tach_seen(dir.path()).is_empty(), "no inventory yet");
+        mark_tach_seen(dir.path(), &["f1".to_owned()].into()); // nowhere to keep it: no panic
+        assert!(!dir.path().join("inventory.json").exists());
+
+        id.check_inventory(&two_fans());
+        assert!(tach_seen(dir.path()).is_empty());
+        mark_tach_seen(dir.path(), &["f1".to_owned(), "gone".to_owned()].into());
+        assert_eq!(tach_seen(dir.path()), ["f1".to_owned()].into());
+
+        id.accept_inventory(&two_fans()).unwrap();
+        assert_eq!(
+            tach_seen(dir.path()),
+            ["f1".to_owned()].into(),
+            "accept kept it"
+        );
+        id.check_inventory(&two_fans());
+        assert_eq!(id.describe(&two_fans())["inventory"]["changed"], json!([]));
     }
 
     #[test]

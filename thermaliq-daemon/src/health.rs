@@ -20,8 +20,8 @@ const FILE: &str = "health.json";
 pub struct Evaluation {
     /// `ok`, `declining`, `unmonitored` or `insufficient_history` per fan.
     pub fan_health: HashMap<String, String>,
-    /// Per fan, the 10-point duty buckets it has reported RPM at in the last 30 days.
-    pub spun: HashMap<String, HashSet<u8>>,
+    /// Every fan whose tach has been seen: the ones passed in plus any with RPM in history.
+    pub tach_seen: HashSet<String>,
     /// `fan-health:` and `dust:` findings that hold now.
     pub conditions: Vec<Condition>,
 }
@@ -61,20 +61,26 @@ fn minute_means<T: Copy + Into<f64>>(rows: &[(i64, T)]) -> BTreeMap<i64, f32> {
         .collect()
 }
 
+/// `tach_known`: fans already known to have reported RPM (the inventory, the live hub). A fan is
+/// `unmonitored` only if it is in neither that set nor has RPM in history: the last 30 days of
+/// silence from a fan that once turned is a dead fan, not a missing tach wire.
 pub fn evaluate(
     db: &HistoryDb,
     snapshot: &HardwareSnapshot,
     now: i64,
     baseline_from: i64,
+    tach_known: &HashSet<String>,
 ) -> rusqlite::Result<Evaluation> {
     let mut out = Evaluation::default();
     let mut duty_at: BTreeMap<i64, Vec<f32>> = BTreeMap::new();
     for f in &snapshot.fans {
         let rows = db.fan_rows_since(&f.id, now - 30 * DAY)?;
-        let verdict = fan_history(&rows, now);
-        let spun: HashSet<u8> = rows.iter().filter(|r| r.1 > 0).map(|r| r.2 / 10).collect();
-        if !spun.is_empty() {
-            out.spun.insert(f.id.clone(), spun);
+        let mut verdict = fan_history(&rows, now);
+        if rows.iter().any(|r| r.1 > 0) || tach_known.contains(&f.id) {
+            out.tach_seen.insert(f.id.clone());
+        }
+        if verdict == FanHealth::Unmonitored && out.tach_seen.contains(&f.id) {
+            verdict = FanHealth::InsufficientHistory;
         }
         let name = match verdict {
             FanHealth::Ok => "ok",
@@ -179,33 +185,59 @@ pub fn evaluate(
     Ok(out)
 }
 
-/// Hourly, from the first minute after start: reads history, tells the hub.
+/// The hourly history check. `stop` ends it and waits for it, so the shutdown lines in
+/// `service.log` cannot race a thread that is still reading history.
+pub struct HealthThread {
+    stop: std::sync::mpsc::Sender<()>,
+    join: std::thread::JoinHandle<()>,
+}
+
+impl HealthThread {
+    /// Wakes the thread (it sleeps between passes) and joins it.
+    pub fn stop(self) {
+        let _ = self.stop.send(());
+        if self.join.join().is_err() {
+            eprintln!("thermaliq: the health check thread had panicked");
+        }
+        eprintln!("thermaliq: health check stopped");
+    }
+}
+
+/// Starts the check: after `first`, then every `every`. Reads history, tells the hub, and saves
+/// which fans have reported RPM in `inventory.json`.
 pub fn spawn(
     handle: Handle,
     history: Arc<Mutex<HistoryDb>>,
     dir: std::path::PathBuf,
     first: std::time::Duration,
     every: std::time::Duration,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
-        std::thread::sleep(first);
-        loop {
+) -> HealthThread {
+    let (stop, wake) = std::sync::mpsc::channel::<()>();
+    let join = std::thread::spawn(move || {
+        let mut wait = first;
+        // A message or a closed channel is the stop; only a timeout means "run a pass".
+        while wake.recv_timeout(wait) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+            wait = every;
             let snap = handle.cache().snapshot;
-            if !snap.fans.is_empty() {
-                let now = crate::runtime::unix_now();
-                let found = {
-                    let db = history.lock().unwrap_or_else(PoisonError::into_inner);
-                    let from = baseline_from(&dir, &db);
-                    evaluate(&db, &snap, now, from)
-                };
-                match found {
-                    Ok(e) => handle.apply_health(e, now),
-                    Err(e) => eprintln!("thermaliq: health check failed: {e}"),
-                }
+            if snap.fans.is_empty() {
+                continue;
             }
-            std::thread::sleep(every);
+            let now = crate::runtime::unix_now();
+            let mut known = crate::identity::tach_seen(&dir);
+            known.extend(handle.tach_seen());
+            let found = {
+                let db = history.lock().unwrap_or_else(PoisonError::into_inner);
+                let from = baseline_from(&dir, &db);
+                evaluate(&db, &snap, now, from, &known)
+            };
+            match found {
+                Ok(e) => handle.apply_health(e, now),
+                Err(e) => eprintln!("thermaliq: health check failed: {e}"),
+            }
+            crate::identity::mark_tach_seen(&dir, &handle.tach_seen());
         }
-    })
+    });
+    HealthThread { stop, join }
 }
 
 #[cfg(test)]
@@ -284,7 +316,7 @@ mod tests {
                 vec![],
             )
         });
-        let e = evaluate(&db, &now_snapshot(), NOW, NOW - 30 * DAY).unwrap();
+        let e = evaluate(&db, &now_snapshot(), NOW, NOW - 30 * DAY, &HashSet::new()).unwrap();
         assert_eq!(e.fan_health["tach"], "declining");
         assert_eq!(e.fan_health["case"], "unmonitored");
         assert_eq!(e.conditions.len(), 1, "{:?}", e.conditions);
@@ -295,13 +327,29 @@ mod tests {
             "{}",
             c.message
         );
-        assert!(e.spun["tach"].contains(&6) && !e.spun.contains_key("case"));
+        assert!(e.tach_seen.contains("tach") && !e.tach_seen.contains("case"));
+    }
+
+    /// M16 review: unmonitored means the tach was never seen, not "no RPM in the last 30 days".
+    #[test]
+    fn a_fan_that_turned_once_and_reads_zero_for_31_days_is_not_unmonitored() {
+        let db = history(31, |_| (vec![], vec![fan("tach", 0, 60)], vec![]));
+        let snap = HardwareSnapshot {
+            fans: vec![fan("tach", 0, 60)],
+            ..Default::default()
+        };
+        let seen: HashSet<String> = ["tach".to_owned()].into();
+        let e = evaluate(&db, &snap, NOW, NOW - 31 * DAY, &seen).unwrap();
+        assert_eq!(e.fan_health["tach"], "insufficient_history");
+        assert!(e.tach_seen.contains("tach"), "a known tach stays known");
+        let e = evaluate(&db, &snap, NOW, NOW - 31 * DAY, &HashSet::new()).unwrap();
+        assert_eq!(e.fan_health["tach"], "unmonitored", "never seen turning");
     }
 
     #[test]
     fn a_healthy_fan_has_no_condition() {
         let db = history(30, |_| (vec![], vec![fan("tach", 1000, 60)], vec![]));
-        let e = evaluate(&db, &now_snapshot(), NOW, NOW - 30 * DAY).unwrap();
+        let e = evaluate(&db, &now_snapshot(), NOW, NOW - 30 * DAY, &HashSet::new()).unwrap();
         assert_eq!(e.fan_health["tach"], "ok");
         assert!(e.conditions.is_empty());
     }
@@ -326,7 +374,14 @@ mod tests {
 
     #[test]
     fn dust_is_reported_with_the_baseline_date_when_it_is_hotter_and_the_fans_are_faster() {
-        let e = evaluate(&dusty_history(), &now_snapshot(), NOW, NOW - 30 * DAY).unwrap();
+        let e = evaluate(
+            &dusty_history(),
+            &now_snapshot(),
+            NOW,
+            NOW - 30 * DAY,
+            &HashSet::new(),
+        )
+        .unwrap();
         let c = e
             .conditions
             .iter()
@@ -347,8 +402,99 @@ mod tests {
     #[test]
     fn a_baseline_that_is_not_a_week_old_says_nothing() {
         // Acknowledged 5 days ago: not enough since then to compare.
-        let e = evaluate(&dusty_history(), &now_snapshot(), NOW, NOW - 5 * DAY).unwrap();
+        let e = evaluate(
+            &dusty_history(),
+            &now_snapshot(),
+            NOW,
+            NOW - 5 * DAY,
+            &HashSet::new(),
+        )
+        .unwrap();
         assert!(e.conditions.iter().all(|c| c.key != "dust:cpu"));
+    }
+
+    fn mock_daemon() -> (crate::runtime::Daemon, Arc<Mutex<HistoryDb>>) {
+        use thermaliq_hal::{MockHardwareLayer, Tick};
+        let hal = Arc::new(MockHardwareLayer::new(
+            &["f1"],
+            vec![Tick::Temps(vec![("cpu".into(), SensorKind::Cpu, 40.0)])],
+        ));
+        let profile = thermaliq_common::Profile::from_toml(
+            "name = \"flat\"\n[[curves]]\ntype = \"flat\"\nid = \"c\"\npwm = 30\n[[controls]]\nfan = \"f1\"\ncurve = \"c\"\nstep_up_pct = 100\nstep_down_pct = 100\n",
+        )
+        .unwrap();
+        let db = Arc::new(Mutex::new(HistoryDb::in_memory().unwrap()));
+        let opts = crate::runtime::Options {
+            tick: std::time::Duration::from_millis(5),
+            prune_every: std::time::Duration::from_secs(3600),
+        };
+        (
+            crate::runtime::Daemon::start(hal, &profile, vec![], db.clone(), opts),
+            db,
+        )
+    }
+
+    /// M16 review: shutdown joins the thread, even while it sleeps for an hour.
+    #[test]
+    fn stopping_joins_the_thread_at_once_even_between_hourly_passes() {
+        let (d, db) = mock_daemon();
+        let dir = tempfile::tempdir().unwrap();
+        let hour = std::time::Duration::from_secs(3600);
+        let before = Arc::strong_count(&db);
+        let t = spawn(d.handle(), db.clone(), dir.path().to_owned(), hour, hour);
+        assert_eq!(
+            Arc::strong_count(&db),
+            before + 1,
+            "the thread holds the history"
+        );
+        let began = std::time::Instant::now();
+        t.stop(); // returns only after the join
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            began.elapsed()
+        );
+        assert_eq!(
+            Arc::strong_count(&db),
+            before,
+            "the thread is gone: it let go of the history before stop returned"
+        );
+        d.shutdown().unwrap();
+    }
+
+    /// M16 review: a pass saves the fans that have turned, so they stay "stallable" after a
+    /// restart however long they have read 0.
+    #[test]
+    fn a_pass_saves_the_fans_that_have_turned_in_the_inventory() {
+        let (d, db) = mock_daemon();
+        let dir = tempfile::tempdir().unwrap();
+        let h = d.handle();
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while h.cache().snapshot.fans.is_empty() || !h.tach_seen().contains("f1") {
+            assert!(
+                std::time::Instant::now() < end,
+                "the mock fan never reported RPM"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        crate::identity::Identity::empty(dir.path().to_owned())
+            .check_inventory(&h.cache().snapshot);
+        assert!(crate::identity::tach_seen(dir.path()).is_empty());
+        let t = spawn(
+            h,
+            db,
+            dir.path().to_owned(),
+            std::time::Duration::ZERO,
+            std::time::Duration::from_secs(3600),
+        );
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while crate::identity::tach_seen(dir.path()).is_empty() {
+            assert!(std::time::Instant::now() < end, "the pass never saved it");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        t.stop();
+        assert!(crate::identity::tach_seen(dir.path()).contains("f1"));
+        d.shutdown().unwrap();
     }
 
     #[test]

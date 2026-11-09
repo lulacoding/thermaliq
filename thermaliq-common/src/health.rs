@@ -12,9 +12,10 @@ pub const DECLINE_PCT: u32 = 15;
 /// A component this much hotter at the same load, with fans this many points faster.
 pub const DUST_TEMP_C: f32 = 5.0;
 pub const DUST_DUTY_PTS: f32 = 10.0;
-/// Zero RPM for this long, at a duty the fan has spun at, is a stall.
+/// Zero RPM for this long, from a fan whose tach has been seen, is a stall.
 pub const STALL_SECS: u64 = 30;
-/// Below this duty a fan may legitimately be stopped (0-RPM mode) or not yet turning.
+/// Below this duty a fan may legitimately be stopped (0-RPM mode) or not yet turning: the
+/// start duty, as far as the daemon knows it (a profile's per-fan `start_percent` is not here).
 pub const MIN_STALL_DUTY: u8 = 20;
 /// A fan must show this much history before a decline is judged.
 const MIN_SPAN_DAYS: i64 = 14;
@@ -90,26 +91,28 @@ pub fn fan_history(rows: &[(i64, u32, u8)], now: i64) -> FanHealth {
     }
 }
 
-/// Live stall detection: a fan reading 0 RPM for `STALL_SECS` at a duty it has spun at.
+/// Live stall detection: a fan whose tach has been seen reading 0 RPM for `STALL_SECS` at or
+/// above the start duty. It stays stalled for as long as that holds, however long ago the fan
+/// last turned: a dead fan must not clear its own alert.
 #[derive(Default)]
 pub struct StallTracker {
     zero_since: HashMap<String, Duration>,
 }
 
 impl StallTracker {
-    /// `fans` are `(id, rpm, duty)`; `spun(id, duty)` says whether the fan has reported RPM
-    /// at about that duty (history, or since start). Returns the ids stalled now.
+    /// `fans` are `(id, rpm, duty)`; `tach_seen(id)` says whether the fan has ever reported
+    /// RPM above 0. Returns the ids stalled now.
     pub fn step(
         &mut self,
         now: Duration,
         fans: &[(String, u32, u8)],
-        spun: impl Fn(&str, u8) -> bool,
+        tach_seen: impl Fn(&str) -> bool,
     ) -> Vec<String> {
         let mut stalled = Vec::new();
         self.zero_since
             .retain(|id, _| fans.iter().any(|f| &f.0 == id));
         for (id, rpm, duty) in fans {
-            if *rpm == 0 && *duty >= MIN_STALL_DUTY && spun(id, *duty) {
+            if *rpm == 0 && *duty >= MIN_STALL_DUTY && tach_seen(id) {
                 let since = *self.zero_since.entry(id.clone()).or_insert(now);
                 if now.saturating_sub(since).as_secs() >= STALL_SECS {
                     stalled.push(id.clone());
@@ -274,46 +277,71 @@ mod tests {
         Duration::from_secs(n)
     }
 
-    fn spun_at_60(_: &str, duty: u8) -> bool {
-        (50..=70).contains(&duty)
+    /// Only `f` has ever reported RPM.
+    fn tach_seen(id: &str) -> bool {
+        id == "f"
     }
 
     #[test]
-    fn a_stall_needs_30_seconds_of_zero_rpm_at_a_duty_it_has_spun_at() {
+    fn a_stall_needs_30_seconds_of_zero_rpm_from_a_fan_whose_tach_has_been_seen() {
         let mut t = StallTracker::default();
         let fan = |rpm| vec![("f".to_owned(), rpm, 60u8)];
-        assert!(t.step(secs(0), &fan(0), spun_at_60).is_empty());
-        assert!(t.step(secs(29), &fan(0), spun_at_60).is_empty());
-        assert_eq!(t.step(secs(30), &fan(0), spun_at_60), ["f"]);
-        assert_eq!(
-            t.step(secs(40), &fan(0), spun_at_60),
-            ["f"],
-            "still stalled"
-        );
+        assert!(t.step(secs(0), &fan(0), tach_seen).is_empty());
+        assert!(t.step(secs(29), &fan(0), tach_seen).is_empty());
+        assert_eq!(t.step(secs(30), &fan(0), tach_seen), ["f"]);
+        assert_eq!(t.step(secs(40), &fan(0), tach_seen), ["f"], "still stalled");
         assert!(
-            t.step(secs(41), &fan(900), spun_at_60).is_empty(),
+            t.step(secs(41), &fan(900), tach_seen).is_empty(),
             "it spins again"
         );
         assert!(
-            t.step(secs(42), &fan(0), spun_at_60).is_empty(),
+            t.step(secs(42), &fan(0), tach_seen).is_empty(),
             "the clock restarted"
         );
     }
 
+    /// M16 review: a fan that stalls and stays dead must stay stalled, however long that is.
     #[test]
-    fn zero_rpm_is_no_stall_for_a_fan_that_never_spun_near_that_duty_or_runs_in_0_rpm_mode() {
+    fn a_dead_fan_stays_stalled_for_as_long_as_it_reads_zero() {
         let mut t = StallTracker::default();
-        let low = vec![("f".to_owned(), 0u32, 10u8)];
-        let never = |_: &str, _: u8| false;
+        let dead = [("f".to_owned(), 0u32, 60u8)];
+        t.step(secs(0), &dead, tach_seen);
+        assert_eq!(t.step(secs(30), &dead, tach_seen), ["f"]);
+        for days in [1, 30, 31, 90] {
+            assert_eq!(
+                t.step(secs(30 + days * 86_400), &dead, tach_seen),
+                ["f"],
+                "after {days} days"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_rpm_is_no_stall_for_a_fan_with_no_tach_or_below_the_start_duty() {
+        let mut t = StallTracker::default();
+        let never = |_: &str| false;
         for s in [0, 31, 60] {
             assert!(
-                t.step(secs(s), &low, spun_at_60).is_empty(),
-                "duty 10: below any start"
+                t.step(secs(s), &[("f".to_owned(), 0, 60)], never)
+                    .is_empty(),
+                "a tach that never read anything is unmonitored, not stalled"
             );
-            assert!(t
-                .step(secs(s), &[("f".to_owned(), 0, 60)], never)
-                .is_empty());
+            assert!(
+                t.step(
+                    secs(s),
+                    &[("f".to_owned(), 0u32, MIN_STALL_DUTY - 1)],
+                    tach_seen
+                )
+                .is_empty(),
+                "below the start duty a fan may be stopped"
+            );
         }
+        t.step(secs(100), &[("f".to_owned(), 0, MIN_STALL_DUTY)], tach_seen);
+        assert_eq!(
+            t.step(secs(130), &[("f".to_owned(), 0, MIN_STALL_DUTY)], tach_seen),
+            ["f"],
+            "at the start duty it counts"
+        );
     }
 
     fn a(temp: f32, load: f32, duty: f32) -> Aligned {

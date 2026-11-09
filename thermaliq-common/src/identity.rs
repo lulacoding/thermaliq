@@ -389,6 +389,10 @@ pub struct InventoryFan {
     /// A probe found that the chip ignores writes to this header. Absent in older files: false.
     #[serde(default)]
     pub rejected_writes: bool,
+    /// The fan has reported RPM above 0 at least once. A fan that never did has no tach wire
+    /// (`unmonitored`); one that did and reads 0 now is stalled. Absent in older files: false.
+    #[serde(default)]
+    pub tach_seen: bool,
 }
 
 /// What `inventory.json` holds: the board and every fan.
@@ -408,16 +412,19 @@ impl Inventory {
                 label: f.label.clone(),
                 kind: f.kind,
                 rejected_writes: false,
+                tach_seen: false,
             })
             .collect();
         fans.sort_by(|a, b| a.id.cmp(&b.id));
         Self { board, fans }
     }
 
-    /// Accepting today's fans must not forget which headers rejected writes.
-    pub fn keep_rejected_from(&mut self, saved: &Inventory) {
+    /// Accepting today's fans must not forget which headers rejected writes or have turned.
+    pub fn keep_flags_from(&mut self, saved: &Inventory) {
         for f in &mut self.fans {
-            f.rejected_writes = saved.fans.iter().any(|s| s.id == f.id && s.rejected_writes);
+            let before = saved.fans.iter().find(|s| s.id == f.id);
+            f.rejected_writes = before.is_some_and(|s| s.rejected_writes);
+            f.tach_seen = before.is_some_and(|s| s.tach_seen);
         }
     }
 }
@@ -861,8 +868,26 @@ mod tests {
         assert!(diff(&saved, &inv(None, &[("a", "Fan")])).is_empty());
 
         let mut now = inv(None, &[("a", "Fan"), ("b", "Fan 2")]);
-        now.keep_rejected_from(&saved);
+        now.keep_flags_from(&saved);
         assert!(now.fans[0].rejected_writes && !now.fans[1].rejected_writes);
+    }
+
+    /// M16 review: whether a fan has ever reported RPM decides `unmonitored`, so it lives in the
+    /// inventory like `rejected_writes`: absent reads false, never a change, kept by accept.
+    #[test]
+    fn tach_seen_is_remembered_but_is_never_a_change() {
+        let mut saved = inv(None, &[("a", "Fan"), ("b", "Fan 2")]);
+        saved.fans[0].tach_seen = true;
+        assert!(
+            !saved.fans[1].tach_seen,
+            "a new fan has not been seen turning"
+        );
+        assert!(diff(&saved, &inv(None, &[("a", "Fan"), ("b", "Fan 2")])).is_empty());
+
+        let mut now = inv(None, &[("a", "Fan"), ("b", "Fan 2"), ("c", "Fan 3")]);
+        now.keep_flags_from(&saved);
+        let seen: Vec<_> = now.fans.iter().map(|f| f.tach_seen).collect();
+        assert_eq!(seen, [true, false, false]);
     }
 
     fn sensor(id: &str, kind: SensorKind) -> SensorReading {

@@ -21,6 +21,7 @@ pub struct App {
     daemon: Daemon,
     api: ApiServer,
     slow: SlowThread,
+    health: crate::health::HealthThread,
 }
 
 /// Whether startup may create `token.txt`. The installer creates it with its ACL; a service
@@ -224,8 +225,8 @@ pub fn start(
         .handle()
         .configure_alerts(identity.resolve_alerts(&cfg.alert));
     // Fan health and dust from history (SPEC §7.6): a minute after start, then hourly. It only
-    // raises alerts. shortcut: the thread is not joined; it ends with the process.
-    crate::health::spawn(
+    // raises alerts. `App::stop` joins it; if start fails after this, dropping it ends the thread.
+    let health = crate::health::spawn(
         daemon.handle(),
         history.clone(),
         dir.to_owned(),
@@ -267,7 +268,12 @@ pub fn start(
     // the fans back.
     let api = ApiServer::start(state, cfg.api_port)
         .map_err(|e| format!("cannot listen on 127.0.0.1:{}: {e}", cfg.api_port))?;
-    Ok(App { daemon, api, slow })
+    Ok(App {
+        daemon,
+        api,
+        slow,
+        health,
+    })
 }
 
 impl App {
@@ -278,7 +284,12 @@ impl App {
     /// Hands the fans back (the engine is dropped, S5), then stops the API. Errors if the
     /// engine has not stopped within `budget` (a stuck HAL call); the caller then ends the process.
     pub fn stop(self, budget: Duration) -> Result<(), String> {
-        let Self { daemon, api, slow } = self;
+        let Self {
+            daemon,
+            api,
+            slow,
+            health,
+        } = self;
         // At once, so a local model unloads whatever else is going on. If the budget runs out
         // the process ends, and the job object takes the model with it.
         slow.request_stop();
@@ -286,6 +297,9 @@ impl App {
         // Off-thread so a stuck HAL call can't hold us past `budget`. The API is stopped after
         // the fans are back, and is not waited for: it holds nothing that needs flushing.
         std::thread::spawn(move || {
+            // Joined before the stop is reported, so no thread is left to race the log lines. It
+            // only reads history and the cache, never hardware, so it cannot hold the fans back.
+            health.stop();
             let _ = done.send(daemon.shutdown());
             slow.stop();
             api.shutdown();
