@@ -148,6 +148,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/metrics", get(metrics))
         .route("/profiles", get(profiles))
         .route("/identity", get(identity))
+        .route("/alerts", get(alerts))
         .route("/config", get(get_config))
         .route("/history/sensors/{id}", get(history_sensor))
         .route(
@@ -254,7 +255,15 @@ fn status_json(c: &Cache) -> Value {
 }
 
 async fn status(State(s): State<ApiState>) -> Json<Value> {
-    Json(status_json(&s.handle.cache()))
+    let mut v = status_json(&s.handle.cache());
+    v["alerts_active"] = json!(s.handle.active_alerts());
+    Json(v)
+}
+
+/// Every configured alert with its state, and the last events. `notify` marks the ones the
+/// tray shows (M18); a service in session 0 cannot show UI itself.
+async fn alerts(State(s): State<ApiState>) -> Json<Value> {
+    Json(s.handle.alerts())
 }
 
 async fn sensors(State(s): State<ApiState>) -> Json<Value> {
@@ -881,6 +890,38 @@ mod tests {
         }
         assert!(!r.dir.path().join("roles.toml").exists());
         assert_eq!(get(&r, "/identity").await.0, StatusCode::OK);
+    }
+
+    /// M16: alerts are readable without a token, like status, and `/status` names the active ones.
+    #[tokio::test]
+    async fn alerts_are_listed_with_their_state_and_status_names_the_active_ones() {
+        let r = rig(vec![at(90.0)]);
+        ticked(&r).await;
+        let (code, v) = get(&r, "/alerts").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v, json!({"alerts": [], "events": []}));
+
+        r.state
+            .handle
+            .configure_alerts(vec![thermaliq_common::AlertEntry {
+                id: "hot".into(),
+                enabled: true,
+                sensor: "cpu".into(),
+                threshold: 85.0,
+                severity: thermaliq_common::Severity::Warn,
+                action: thermaliq_common::AlertAction::Notify,
+            }]);
+        for _ in 0..200 {
+            if get(&r, "/status").await.1["alerts_active"] == json!(["hot"]) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(get(&r, "/status").await.1["alerts_active"], json!(["hot"]));
+        let (_, v) = get(&r, "/alerts").await;
+        assert_eq!(v["alerts"][0]["state"], "active");
+        assert_eq!(v["events"][0]["event"], "fired");
+        assert_eq!(v["events"][0]["notify"], true);
     }
 
     #[tokio::test]
@@ -1725,6 +1766,7 @@ mod tests {
                 ("GET", "/metrics"),
                 ("GET", "/profiles"),
                 ("GET", "/config"),
+                ("GET", "/alerts"),
                 ("GET", "/history/sensors/cpu"),
                 ("GET", "/ws"),
                 ("POST", "/profiles/active"),

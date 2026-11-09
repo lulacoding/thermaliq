@@ -1,4 +1,4 @@
-use crate::{invalid, Error};
+use crate::{invalid, Error, MAX_VALID_TEMP_C, MIN_VALID_TEMP_C};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,6 +161,75 @@ fn parse_hhmm(s: &str, allow_24: bool) -> Option<u16> {
     Some(hour * 60 + minute)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    Warn,
+    Crit,
+}
+
+/// SPEC §2: log, notify, apply-profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AlertAction {
+    Log,
+    /// Recorded and shown by `tq alerts` and `/status`; the tray shows the toast (M18).
+    Notify,
+    ApplyProfile {
+        profile: String,
+    },
+}
+
+/// A global temperature alert (`[[alert]]`, SPEC §6). It is evaluated every tick whichever
+/// profile is active, so its state survives profile switches.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AlertEntry {
+    pub id: String,
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    /// A sensor role (`cpu_temp`) or a sensor id.
+    pub sensor: String,
+    pub threshold: f32,
+    pub severity: Severity,
+    pub action: AlertAction,
+}
+
+/// The alerts the bundled profiles carried before M16 moved them here.
+fn default_alerts() -> Vec<AlertEntry> {
+    let a = |id: &str, sensor: &str, threshold, severity, action| AlertEntry {
+        id: id.into(),
+        enabled: true,
+        sensor: sensor.into(),
+        threshold,
+        severity,
+        action,
+    };
+    vec![
+        a(
+            "cpu-warm",
+            "cpu_temp",
+            85.0,
+            Severity::Warn,
+            AlertAction::Notify,
+        ),
+        a(
+            "cpu-hot",
+            "cpu_temp",
+            92.0,
+            Severity::Crit,
+            AlertAction::Log,
+        ),
+        a(
+            "gpu-hot",
+            "gpu_temp",
+            85.0,
+            Severity::Crit,
+            AlertAction::Notify,
+        ),
+    ]
+}
+
 /// `config.toml`. No secrets: API keys live in the OS keychain (SPEC §6).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -174,6 +243,9 @@ pub struct DaemonConfig {
     pub app_rule: Vec<AppRuleEntry>,
     #[serde(default)]
     pub schedule: Vec<ScheduleEntry>,
+    /// Without any `[[alert]]` in the file these are `default_alerts`; disable one with
+    /// `enabled = false`.
+    pub alert: Vec<AlertEntry>,
 }
 
 impl Default for DaemonConfig {
@@ -185,6 +257,7 @@ impl Default for DaemonConfig {
             default_profile: "balanced".into(),
             app_rule: Vec::new(),
             schedule: Vec::new(),
+            alert: default_alerts(),
         }
     }
 }
@@ -215,6 +288,27 @@ impl DaemonConfig {
             }
         }
         let mut ids = std::collections::HashSet::new();
+        for a in &c.alert {
+            if a.id.is_empty() || a.sensor.is_empty() {
+                return invalid("alert needs a non-empty id and sensor".into());
+            }
+            if !ids.insert(a.id.as_str()) {
+                return invalid(format!("duplicate alert id '{}'", a.id));
+            }
+            if !(a.threshold >= MIN_VALID_TEMP_C && a.threshold <= MAX_VALID_TEMP_C) {
+                return invalid(format!(
+                    "alert '{}': threshold {} is outside {MIN_VALID_TEMP_C}..{MAX_VALID_TEMP_C}",
+                    a.id, a.threshold
+                ));
+            }
+            if matches!(&a.action, AlertAction::ApplyProfile { profile } if profile.is_empty()) {
+                return invalid(format!(
+                    "alert '{}': apply_profile needs a profile name",
+                    a.id
+                ));
+            }
+        }
+        let mut ids = std::collections::HashSet::new();
         for entry in &c.schedule {
             if entry.id.is_empty() {
                 return invalid("schedule id must not be empty".into());
@@ -240,6 +334,59 @@ impl DaemonConfig {
             }
         }
         Ok(c)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod alert_tests {
+    use super::*;
+
+    fn err(extra: &str) -> String {
+        DaemonConfig::from_toml(extra).unwrap_err().to_string()
+    }
+
+    const HOT: &str =
+        "[[alert]]\nid='hot'\nsensor='cpu_temp'\nthreshold=85\nseverity='warn'\naction={type='notify'}\n";
+
+    #[test]
+    fn alerts_are_config_tables_and_the_bundled_profiles_alerts_are_the_default() {
+        let c = DaemonConfig::from_toml(HOT).unwrap();
+        assert_eq!(c.alert.len(), 1);
+        assert!(c.alert[0].enabled, "enabled defaults to true");
+        assert_eq!(c.alert[0].action, AlertAction::Notify);
+
+        // No `[[alert]]` in the file: the alerts the bundled profiles used to carry.
+        let d = DaemonConfig::from_toml("").unwrap();
+        let got: Vec<_> = d
+            .alert
+            .iter()
+            .map(|a| (a.sensor.as_str(), a.threshold as u32, a.severity))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("cpu_temp", 85, Severity::Warn),
+                ("cpu_temp", 92, Severity::Crit),
+                ("gpu_temp", 85, Severity::Crit)
+            ]
+        );
+        assert_eq!(DaemonConfig::default().alert, d.alert);
+    }
+
+    #[test]
+    fn bad_alerts_are_refused_by_name() {
+        let with =
+            |s: &str| HOT.replace(s.split_once('|').unwrap().0, s.split_once('|').unwrap().1);
+        assert!(err(&with("id='hot'|id=''")).contains("alert"));
+        assert!(err(&format!("{HOT}{HOT}")).contains("duplicate alert id 'hot'"));
+        assert!(err(&with("threshold=85|threshold=999")).contains("threshold"));
+        assert!(err(&with("sensor='cpu_temp'|sensor=''")).contains("sensor"));
+        assert!(
+            err(&with("{type='notify'}|{type='apply_profile',profile=''}")).contains("profile")
+        );
+        assert!(err(&with("severity='warn'|severity='loud'")).contains("loud"));
+        assert!(err(&HOT.replace("threshold", "limit")).contains("limit"));
     }
 }
 

@@ -202,6 +202,16 @@ pub fn start(
             ));
         }
     }
+    for alert in &cfg.alert {
+        if let thermaliq_common::AlertAction::ApplyProfile { profile } = &alert.action {
+            if !profiles.iter().any(|p| &p.name == profile) {
+                return Err(format!(
+                    "alert '{}' applies unknown profile '{profile}'",
+                    alert.id
+                ));
+            }
+        }
+    }
     let history =
         HistoryDb::open(&dir.join("history.db")).map_err(|e| format!("history.db: {e}"))?;
     let history = Arc::new(Mutex::new(history));
@@ -210,6 +220,9 @@ pub fn start(
         prune_every: Duration::from_secs(3600),
     };
     let daemon = Daemon::start(hal, &active, profiles.clone(), history.clone(), opts);
+    daemon
+        .handle()
+        .configure_alerts(identity.resolve_alerts(&cfg.alert));
     identity.check_when_ready(daemon.handle());
     if let Some(why) = identity.board_reason() {
         daemon.handle().note_degraded(why.to_owned());
@@ -374,6 +387,56 @@ mod tests {
         .unwrap();
         assert!(err.contains("nope"), "{err}");
         assert!(hal.writes().is_empty() && hal.restores().is_empty());
+    }
+
+    fn append_config(d: &tempfile::TempDir, extra: &str) {
+        let path = d.path().join("config.toml");
+        let text = fs::read_to_string(&path).unwrap();
+        fs::write(path, format!("{text}{extra}")).unwrap();
+    }
+
+    #[test]
+    fn an_alert_that_applies_an_unknown_profile_refuses_to_start_and_touches_no_fan() {
+        let d = dir();
+        append_config(&d, "[[alert]]\nid='x'\nsensor='cpu'\nthreshold=80\nseverity='warn'\naction={type='apply_profile',profile='nope'}\n");
+        let hal = mock();
+        let err = start(
+            d.path(),
+            hal.clone(),
+            Token::CreateIfMissing,
+            ForegroundSource::Off,
+        )
+        .err()
+        .unwrap();
+        assert!(err.contains("'x'") && err.contains("nope"), "{err}");
+        assert!(hal.writes().is_empty() && hal.restores().is_empty());
+    }
+
+    /// M16: alerts come from `config.toml`, their sensor role through `roles.toml`.
+    #[test]
+    fn config_alerts_run_with_their_role_resolved_and_an_unmapped_role_is_reported() {
+        let d = dir();
+        fs::write(d.path().join("roles.toml"), "[roles]\ncpu_temp = \"cpu\"\n").unwrap();
+        append_config(&d, "[[alert]]\nid='cpu-hot'\nsensor='cpu_temp'\nthreshold=80\nseverity='warn'\naction={type='notify'}\n\
+            [[alert]]\nid='gpu-hot'\nsensor='gpu_temp'\nthreshold=80\nseverity='warn'\naction={type='log'}\n");
+        let hal = Arc::new(MockHardwareLayer::new(
+            &["f1"],
+            vec![Tick::Temps(vec![("cpu".into(), SensorKind::Cpu, 90.0)])],
+        ));
+        let app = start(d.path(), hal, Token::CreateIfMissing, ForegroundSource::Off).unwrap();
+        let h = app.daemon.handle();
+        wait_until(|| h.active_alerts() == ["cpu-hot"]);
+        let shown = h.alerts();
+        assert_eq!(
+            shown["alerts"].as_array().unwrap().len(),
+            1,
+            "gpu-hot was dropped: {shown}"
+        );
+        assert_eq!(
+            shown["alerts"][0]["sensor"], "cpu",
+            "the role became the real id"
+        );
+        app.stop(Duration::from_secs(5)).unwrap();
     }
 
     #[test]
