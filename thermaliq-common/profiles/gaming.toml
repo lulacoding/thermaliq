@@ -52,15 +52,3 @@ curve = "chassis_gaming"
 step_up_pct = 15
 step_down_pct = 3
 min_pwm = 35
-
-[[alerts]]
-sensor = "cpu_temp"
-threshold = 85
-severity = "warn"
-action = { type = "notify" }
-
-[[alerts]]
-sensor = "gpu_temp"
-threshold = 85
-severity = "crit"
-action = { type = "notify" }

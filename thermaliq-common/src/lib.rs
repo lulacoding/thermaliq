@@ -9,12 +9,10 @@ pub mod identity;
 mod profile;
 
 pub use config::{
-    pick_app_rule, pick_schedule, AppRuleEntry, DaemonConfig, LocalClock, LocalTime, LogLevel,
-    ScheduleEntry, Weekday,
+    pick_app_rule, pick_schedule, AlertAction, AlertEntry, AppRuleEntry, DaemonConfig, LocalClock,
+    LocalTime, LogLevel, ScheduleEntry, Severity, Weekday,
 };
-pub use profile::{
-    Alert, AlertAction, Control, Curve, CustomSensor, GraphPoint, MixFunction, Profile, Severity,
-};
+pub use profile::{Control, Curve, CustomSensor, GraphPoint, MixFunction, Profile};
 
 use serde::{Deserialize, Serialize};
 use std::fmt;

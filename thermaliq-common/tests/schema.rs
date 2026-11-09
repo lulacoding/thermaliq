@@ -88,17 +88,6 @@ min_pwm = 20
 [[controls]]
 fan = "gpu1"
 curve = "sy"
-
-[[alerts]]
-sensor = "cpu_package"
-threshold = 85
-severity = "warn"
-action = { type = "notify" }
-[[alerts]]
-sensor = "cpu_package"
-threshold = 92
-severity = "crit"
-action = { type = "apply_profile", profile = "performance" }
 "#,
     )
     .unwrap();
@@ -183,11 +172,11 @@ fn sensors_alerts_and_rules_are_validated() {
         err("[[sensors]]\nid=\"a\"\ntype=\"mix\"\nfunction=\"max\"\nsources=[]\n")
             .contains("sources")
     );
-    assert!(err(
-        "[[alerts]]\nsensor=\"s\"\nthreshold=999\nseverity=\"warn\"\naction={type=\"log\"}\n"
-    )
-    .contains("threshold"));
-    assert!(err("[[alerts]]\nsensor=\"s\"\nthreshold=80\nseverity=\"warn\"\naction={type=\"apply_profile\",profile=\"\"}\n").contains("profile"));
+    // M16: alerts are global, so they live in config.toml next to the app rules.
+    assert!(
+        err("[[alerts]]\nsensor=\"s\"\nthreshold=80\nseverity=\"warn\"\naction={type=\"log\"}\n")
+            .contains("alerts moved to config.toml [[alert]]")
+    );
     assert!(err("[[app_rules]]\nprocess=\"g.exe\"\nprofile=\"x\"\n")
         .contains("app_rules moved to config.toml [[app_rule]]"));
 }
