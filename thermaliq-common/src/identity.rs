@@ -17,6 +17,8 @@ pub const SENSOR_ROLES: [&str; 2] = ["cpu_temp", "gpu_temp"];
 
 /// A tach reading must rise at least this much for the probe to call a fan "moved".
 pub const RPM_RISE: u32 = 150;
+/// ... and at least this percent of the RPM it had before the hold.
+pub const RPM_RISE_PCT: u64 = 15;
 
 fn is_role(id: &str) -> bool {
     FAN_ROLES.contains(&id) || SENSOR_ROLES.contains(&id)
@@ -375,6 +377,9 @@ pub struct InventoryFan {
     pub id: String,
     pub label: String,
     pub kind: FanKind,
+    /// A probe found that the chip ignores writes to this header. Absent in older files: false.
+    #[serde(default)]
+    pub rejected_writes: bool,
 }
 
 /// What `inventory.json` holds: the board and every fan.
@@ -393,10 +398,18 @@ impl Inventory {
                 id: f.id.clone(),
                 label: f.label.clone(),
                 kind: f.kind,
+                rejected_writes: false,
             })
             .collect();
         fans.sort_by(|a, b| a.id.cmp(&b.id));
         Self { board, fans }
+    }
+
+    /// Accepting today's fans must not forget which headers rejected writes.
+    pub fn keep_rejected_from(&mut self, saved: &Inventory) {
+        for f in &mut self.fans {
+            f.rejected_writes = saved.fans.iter().any(|s| s.id == f.id && s.rejected_writes);
+        }
     }
 }
 
@@ -460,7 +473,7 @@ pub fn diff(saved: &Inventory, now: &Inventory) -> InventoryDiff {
     for f in &now.fans {
         match saved.fans.iter().find(|s| s.id == f.id) {
             None => d.new.push(f.id.clone()),
-            Some(s) if s != f => d.changed.push(f.id.clone()),
+            Some(s) if (&s.label, s.kind) != (&f.label, f.kind) => d.changed.push(f.id.clone()),
             Some(_) => {}
         }
     }
@@ -556,10 +569,14 @@ pub fn pair(probed: &str, before: &[(String, u32)], during: &[(String, u32)]) ->
         let now = during.iter().find(|(i, _)| i == id).map_or(0, |(_, r)| *r);
         now.saturating_sub(was)
     };
+    let was = |id: &str| before.iter().find(|(i, _)| i == id).map_or(0, |(_, r)| *r);
     let best = during
         .iter()
         .map(|(id, _)| (id, rise(id)))
-        .filter(|(_, r)| *r >= RPM_RISE)
+        // At least RPM_RISE and RPM_RISE_PCT of where the fan was: drift is not a pairing.
+        .filter(|(id, r)| {
+            *r >= RPM_RISE && u64::from(*r) * 100 >= u64::from(was(id)) * RPM_RISE_PCT
+        })
         .max_by_key(|(id, r)| (*r, *id == probed));
     match best {
         None => Pairing::None,
@@ -798,6 +815,20 @@ mod tests {
         assert_eq!(diff(&inv(None, &[("a", "Fan")]), &now).changed, ["a"]);
     }
 
+    /// M16 (c): a header that rejected writes is remembered in the inventory so `tq identify`
+    /// does not run it again. It is not a hardware change, an old file reads false, and
+    /// accepting today's fans keeps it.
+    #[test]
+    fn rejected_writes_is_remembered_but_is_never_a_change() {
+        let mut saved = inv(None, &[("a", "Fan")]);
+        saved.fans[0].rejected_writes = true;
+        assert!(diff(&saved, &inv(None, &[("a", "Fan")])).is_empty());
+
+        let mut now = inv(None, &[("a", "Fan"), ("b", "Fan 2")]);
+        now.keep_rejected_from(&saved);
+        assert!(now.fans[0].rejected_writes && !now.fans[1].rejected_writes);
+    }
+
     fn sensor(id: &str, kind: SensorKind) -> SensorReading {
         SensorReading {
             id: id.into(),
@@ -884,6 +915,25 @@ mod tests {
         );
         // Already at full speed, or no tach at all: nothing to see.
         assert_eq!(pair("a", &before, &before), Pairing::None);
+    }
+
+    /// M16 (f): a fan that merely drifts is not a pairing. The rise must be at least 150 RPM
+    /// and at least 15% of where that fan was.
+    #[test]
+    fn a_drifting_tach_is_not_named_as_crossed_wiring() {
+        let before = rpms(&[("hdr", 0), ("gpu", 2000), ("small", 1000)]);
+        // 8% of 2000 is 160 RPM: enough RPM, not enough rise.
+        let drift = rpms(&[("hdr", 0), ("gpu", 2160), ("small", 1000)]);
+        assert_eq!(pair("hdr", &before, &drift), Pairing::None);
+        // 16% of 1000 is 160 RPM: both limits met.
+        let rose = rpms(&[("hdr", 0), ("gpu", 2000), ("small", 1160)]);
+        assert_eq!(pair("hdr", &before, &rose), Pairing::Other("small".into()));
+        // The check's real numbers: 1123 -> 1186.
+        let real = rpms(&[("hdr", 0), ("gpu", 1186)]);
+        assert_eq!(
+            pair("hdr", &rpms(&[("hdr", 0), ("gpu", 1123)]), &real),
+            Pairing::None
+        );
     }
 
     // ---- case_fans (design change, 2026-11-06) ----
