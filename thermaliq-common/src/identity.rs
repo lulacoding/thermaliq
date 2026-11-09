@@ -148,6 +148,32 @@ fn known_roles() -> String {
         .join(", ")
 }
 
+/// The config's alerts with a sensor role replaced by its real id. An alert on a role nothing is
+/// mapped to is dropped and named in the second list (SPEC §4.2); any other sensor id is kept.
+pub fn resolve_alerts(
+    alerts: &[crate::AlertEntry],
+    roles: &Roles,
+) -> (Vec<crate::AlertEntry>, Vec<String>) {
+    let mut kept = Vec::new();
+    let mut skipped = Vec::new();
+    for a in alerts {
+        if !SENSOR_ROLES.contains(&a.sensor.as_str()) {
+            kept.push(a.clone());
+        } else if let Some(id) = roles.get(&a.sensor) {
+            kept.push(crate::AlertEntry {
+                sensor: id.to_owned(),
+                ..a.clone()
+            });
+        } else {
+            skipped.push(format!(
+                "alert '{}': role '{}' is not mapped; the alert is skipped",
+                a.id, a.sensor
+            ));
+        }
+    }
+    (kept, skipped)
+}
+
 /// A profile with its roles replaced by real ids, and what had to be left out.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Resolved {
@@ -175,7 +201,7 @@ pub fn unmapped_lines(per_profile: &[(String, Vec<String>)]) -> Vec<String> {
         .into_iter()
         .map(|(role, profiles)| {
             let what = if SENSOR_ROLES.contains(&role) {
-                "the curves, controls and alerts that read it are skipped"
+                "the curves and controls that read it are skipped"
             } else {
                 "its controls are skipped and the fans stay with the BIOS or driver"
             };
@@ -325,23 +351,6 @@ pub fn resolve(p: &Profile, roles: &Roles) -> Resolved {
     }
     out.controls = controls;
 
-    let mut alerts = Vec::new();
-    for mut a in std::mem::take(&mut out.alerts) {
-        if sensor_dead(&a.sensor) {
-            continue;
-        }
-        match sub(&a.sensor) {
-            Some(Sub::Real(real)) => a.sensor = real,
-            Some(Sub::Unmapped(role)) => {
-                unmapped.insert(role);
-                continue;
-            }
-            None => {}
-        }
-        alerts.push(a);
-    }
-    out.alerts = alerts;
-
     let mut once = HashSet::new();
     skipped.retain(|s| once.insert(s.clone()));
     Resolved {
@@ -380,6 +389,10 @@ pub struct InventoryFan {
     /// A probe found that the chip ignores writes to this header. Absent in older files: false.
     #[serde(default)]
     pub rejected_writes: bool,
+    /// The fan has reported RPM above 0 at least once. A fan that never did has no tach wire
+    /// (`unmonitored`); one that did and reads 0 now is stalled. Absent in older files: false.
+    #[serde(default)]
+    pub tach_seen: bool,
 }
 
 /// What `inventory.json` holds: the board and every fan.
@@ -399,16 +412,19 @@ impl Inventory {
                 label: f.label.clone(),
                 kind: f.kind,
                 rejected_writes: false,
+                tach_seen: false,
             })
             .collect();
         fans.sort_by(|a, b| a.id.cmp(&b.id));
         Self { board, fans }
     }
 
-    /// Accepting today's fans must not forget which headers rejected writes.
-    pub fn keep_rejected_from(&mut self, saved: &Inventory) {
+    /// Accepting today's fans must not forget which headers rejected writes or have turned.
+    pub fn keep_flags_from(&mut self, saved: &Inventory) {
         for f in &mut self.fans {
-            f.rejected_writes = saved.fans.iter().any(|s| s.id == f.id && s.rejected_writes);
+            let before = saved.fans.iter().find(|s| s.id == f.id);
+            f.rejected_writes = before.is_some_and(|s| s.rejected_writes);
+            f.tach_seen = before.is_some_and(|s| s.tach_seen);
         }
     }
 }
@@ -605,8 +621,7 @@ mod tests {
              [[curves]]\nid = \"cpu\"\ntype = \"linear\"\nsource = \"cpu_temp\"\nmin_temp = 40\nmax_temp = 80\nmin_pwm = 20\nmax_pwm = 100\n\
              [[curves]]\nid = \"gpu\"\ntype = \"linear\"\nsource = \"gpu_temp\"\nmin_temp = 40\nmax_temp = 80\nmin_pwm = 20\nmax_pwm = 100\n\
              [[controls]]\nfan = \"cpu_fan\"\ncurve = \"cpu\"\n\
-             [[controls]]\nfan = \"gpu_fan\"\ncurve = \"gpu\"\n\
-             [[alerts]]\nsensor = \"cpu_temp\"\nthreshold = 85\nseverity = \"warn\"\naction = {{ type = \"notify\" }}\n{extra}"
+             [[controls]]\nfan = \"gpu_fan\"\ncurve = \"gpu\"\n{extra}"
         ))
         .unwrap()
     }
@@ -626,7 +641,6 @@ mod tests {
         assert!(r.skipped.is_empty(), "{:?}", r.skipped);
         let fans: Vec<_> = r.profile.controls.iter().map(|c| c.fan.as_str()).collect();
         assert_eq!(fans, ["lhm_nct6687d_0_fan_1", "nvml_GPU-a_fan0"]);
-        assert_eq!(r.profile.alerts[0].sensor, "lhm_cpu");
         let Curve::Linear { source, .. } = &r.profile.curves[1] else {
             panic!()
         };
@@ -645,7 +659,6 @@ mod tests {
             assert!(!r.profile.controls.is_empty(), "{name}");
             let real = |id: &str| id.starts_with("real_");
             assert!(r.profile.controls.iter().all(|c| real(&c.fan)), "{name}");
-            assert!(r.profile.alerts.iter().all(|a| real(&a.sensor)), "{name}");
             for c in &r.profile.curves {
                 if let Curve::Linear { source, .. }
                 | Curve::Graph { source, .. }
@@ -668,14 +681,45 @@ mod tests {
     }
 
     #[test]
-    fn an_unmapped_sensor_role_kills_its_curve_controls_and_alerts() {
+    fn an_unmapped_sensor_role_kills_its_curve_and_controls() {
         let mut m = all_mapped();
         m.roles.remove("cpu_temp");
         let r = resolve(&profile(""), &m);
         let fans: Vec<_> = r.profile.controls.iter().map(|c| c.fan.as_str()).collect();
         assert_eq!(fans, ["nvml_GPU-a_fan0"]);
-        assert!(r.profile.alerts.is_empty());
         assert_eq!(r.unmapped, ["cpu_temp"]);
+    }
+
+    /// SPEC §4.2: an alert on an unmapped sensor role is dropped and reported; a sensor id that
+    /// is not a role passes through.
+    #[test]
+    fn alerts_resolve_their_sensor_role_and_an_unmapped_one_is_dropped_by_name() {
+        let alert = |id: &str, sensor: &str| crate::AlertEntry {
+            id: id.into(),
+            enabled: true,
+            sensor: sensor.into(),
+            threshold: 85.0,
+            severity: crate::Severity::Warn,
+            action: crate::AlertAction::Log,
+        };
+        let mut m = all_mapped();
+        m.roles.remove("gpu_temp");
+        let list = [
+            alert("a", "cpu_temp"),
+            alert("b", "gpu_temp"),
+            alert("c", "ssd_1"),
+        ];
+        let (kept, skipped) = resolve_alerts(&list, &m);
+        let got: Vec<_> = kept
+            .iter()
+            .map(|a| (a.id.as_str(), a.sensor.as_str()))
+            .collect();
+        assert_eq!(got, [("a", "lhm_cpu"), ("c", "ssd_1")]);
+        assert_eq!(skipped.len(), 1);
+        assert!(
+            skipped[0].contains("'b'") && skipped[0].contains("gpu_temp"),
+            "{skipped:?}"
+        );
     }
 
     #[test]
@@ -707,8 +751,7 @@ mod tests {
 
     #[test]
     fn skipped_lines_are_not_repeated() {
-        let p = profile("[[alerts]]\nsensor = \"cpu_temp\"\nthreshold = 92\nseverity = \"crit\"\naction = { type = \"log\" }\n");
-        let r = resolve(&p, &Roles::default());
+        let r = resolve(&profile(""), &Roles::default());
         let mut sorted = r.skipped.clone();
         sorted.sort();
         sorted.dedup();
@@ -825,8 +868,26 @@ mod tests {
         assert!(diff(&saved, &inv(None, &[("a", "Fan")])).is_empty());
 
         let mut now = inv(None, &[("a", "Fan"), ("b", "Fan 2")]);
-        now.keep_rejected_from(&saved);
+        now.keep_flags_from(&saved);
         assert!(now.fans[0].rejected_writes && !now.fans[1].rejected_writes);
+    }
+
+    /// M16 review: whether a fan has ever reported RPM decides `unmonitored`, so it lives in the
+    /// inventory like `rejected_writes`: absent reads false, never a change, kept by accept.
+    #[test]
+    fn tach_seen_is_remembered_but_is_never_a_change() {
+        let mut saved = inv(None, &[("a", "Fan"), ("b", "Fan 2")]);
+        saved.fans[0].tach_seen = true;
+        assert!(
+            !saved.fans[1].tach_seen,
+            "a new fan has not been seen turning"
+        );
+        assert!(diff(&saved, &inv(None, &[("a", "Fan"), ("b", "Fan 2")])).is_empty());
+
+        let mut now = inv(None, &[("a", "Fan"), ("b", "Fan 2"), ("c", "Fan 3")]);
+        now.keep_flags_from(&saved);
+        let seen: Vec<_> = now.fans.iter().map(|f| f.tach_seen).collect();
+        assert_eq!(seen, [true, false, false]);
     }
 
     fn sensor(id: &str, kind: SensorKind) -> SensorReading {

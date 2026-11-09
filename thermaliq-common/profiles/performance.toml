@@ -33,15 +33,3 @@ fan = "gpu_fan"
 curve = "gpu"
 step_down_pct = 3
 min_pwm = 40
-
-[[alerts]]
-sensor = "cpu_temp"
-threshold = 85
-severity = "warn"
-action = { type = "notify" }
-
-[[alerts]]
-sensor = "cpu_temp"
-threshold = 92
-severity = "crit"
-action = { type = "log" }

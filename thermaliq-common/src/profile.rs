@@ -17,8 +17,6 @@ pub struct Profile {
     pub curves: Vec<Curve>,
     #[serde(default)]
     pub controls: Vec<Control>,
-    #[serde(default)]
-    pub alerts: Vec<Alert>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,37 +144,15 @@ fn default_step_down() -> u8 {
     3
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Severity {
-    Warn,
-    Crit,
-}
-
-/// SPEC §2: log, notify, apply-profile.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum AlertAction {
-    Log,
-    Notify,
-    ApplyProfile { profile: String },
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Alert {
-    pub sensor: String,
-    pub threshold: f32,
-    pub severity: Severity,
-    pub action: AlertAction,
-}
-
 impl Profile {
     /// Parse and validate. Every error names the offending item.
     pub fn from_toml(s: &str) -> Result<Self, Error> {
         if let Ok(t) = s.parse::<toml::Table>() {
             if t.contains_key("app_rules") {
                 return invalid("app_rules moved to config.toml [[app_rule]]".into());
+            }
+            if t.contains_key("alerts") {
+                return invalid("alerts moved to config.toml [[alert]]".into());
             }
         }
         let p: Self = toml::from_str(s)?;
@@ -275,21 +251,6 @@ impl Profile {
                 if !(1..=100).contains(&v) {
                     return invalid(format!("{ctx}: {k} {v} is outside 1..100"));
                 }
-            }
-        }
-
-        for a in &self.alerts {
-            if !(a.threshold >= MIN_VALID_TEMP_C && a.threshold <= MAX_VALID_TEMP_C) {
-                return invalid(format!(
-                    "alert on `{}`: threshold {} is outside {MIN_VALID_TEMP_C}..{MAX_VALID_TEMP_C}",
-                    a.sensor, a.threshold
-                ));
-            }
-            if matches!(&a.action, AlertAction::ApplyProfile { profile } if profile.is_empty()) {
-                return invalid(format!(
-                    "alert on `{}`: apply_profile needs a profile name",
-                    a.sensor
-                ));
             }
         }
         Ok(())

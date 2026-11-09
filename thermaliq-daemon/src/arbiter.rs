@@ -1,6 +1,6 @@
 //! Which profile is in effect (SPEC §4.1, M15). One authoritative place: the winning profile
-//! comes from, in order, a foreground app rule, a live Agent profile intent, a schedule, and
-//! the user's chosen fallback. The engine applies whatever this selects; nothing else decides.
+//! comes from, in order, an active alert, a foreground app rule, a live Agent profile intent,
+//! a schedule, and the user's chosen fallback. The engine applies whatever this selects; nothing else decides.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,6 +15,8 @@ pub const LEASE: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProfileSource {
+    /// An active `apply_profile` alert (SPEC §4.1, M16): above every other source.
+    Alert,
     App,
     Agent,
     Schedule,
@@ -24,6 +26,7 @@ pub enum ProfileSource {
 impl ProfileSource {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Alert => "alert",
             Self::App => "app",
             Self::Agent => "agent",
             Self::Schedule => "schedule",
@@ -79,6 +82,10 @@ pub struct Arbiter {
     gens: Generations,
     foreground: Option<String>,
     intent: Option<Lease>,
+    /// `(alert id, profile)` while an `apply_profile` alert is active. It has no lease and no
+    /// hourly budget: the alert's own fire count and hysteresis limit flapping, and a cap must
+    /// never stop a cooling profile.
+    alert: Option<(String, String)>,
     limit: ChangeLimit,
     winner: Option<String>,
     last: Option<Selection>,
@@ -96,6 +103,7 @@ impl Arbiter {
             gens: Generations::default(),
             foreground: None,
             intent: None,
+            alert: None,
             limit: ChangeLimit::default(),
             winner: None,
             last: None,
@@ -137,6 +145,11 @@ impl Arbiter {
             self.schedules.clone_from(&cfg.schedule);
             self.gens.config += 1;
         }
+    }
+
+    /// The profile an active alert asks for, or `None` when none is active. Set every pass.
+    pub fn set_alert(&mut self, wanted: Option<(String, String)>) {
+        self.alert = wanted;
     }
 
     pub fn choose(&mut self, name: &str) {
@@ -205,6 +218,9 @@ impl Arbiter {
             source,
             rule_id: rule_id.map(str::to_owned),
         };
+        if let Some((id, profile)) = self.alert.as_ref().filter(|(_, p)| usable(p)) {
+            return won(profile, ProfileSource::Alert, Some(id));
+        }
         if let Some(r) = self
             .foreground
             .as_deref()
@@ -224,6 +240,15 @@ impl Arbiter {
     /// The engine now runs `s`: only this is what `/status` may report as the profile's source.
     pub fn applied(&mut self, s: &Selection) {
         self.last = Some(s.clone());
+    }
+
+    /// `applied`, and when the engine just changed to an Agent profile, the hourly count too, in
+    /// one call: a pause between the two would otherwise drop the intent uncounted.
+    pub fn record_applied(&mut self, s: &Selection, changed: bool, now: Duration) {
+        self.applied(s);
+        if changed && s.source == ProfileSource::Agent {
+            self.agent_applied(now);
+        }
     }
 
     /// The profile that wins now. A different winner starts a new profile generation.
@@ -311,6 +336,67 @@ mod tests {
     fn offer(a: &mut Arbiter, now: u64, profile: &str) -> Offer {
         let seen = a.generations();
         a.offer_intent(secs(now), profile, seen, &ALL)
+    }
+
+    /// A pause that lands right after the engine took an Agent profile must not lose the
+    /// activation: recording the selection and counting it are one call (one lock hold).
+    #[test]
+    fn an_applied_agent_selection_is_counted_by_the_call_that_records_it() {
+        let (mut a, _) = arb("");
+        for i in 0..6 {
+            assert_eq!(
+                offer(&mut a, i, "performance"),
+                Offer::Activated,
+                "activation {i}"
+            );
+            let s = a.select(secs(i), &ALL);
+            a.record_applied(&s, true, secs(i));
+            a.invalidate_agent(); // the pause arrives straight after
+        }
+        assert_eq!(offer(&mut a, 10, "performance"), Offer::LimitReached);
+    }
+
+    #[test]
+    fn an_active_alert_beats_an_app_rule_and_letting_go_brings_it_back() {
+        let (mut a, _) = arb(RULES);
+        a.set_foreground(Some("cs2.exe"));
+        assert_eq!(sel(&mut a, 0).1, ProfileSource::App);
+        a.set_alert(Some(("hot".into(), "performance".into())));
+        let (p, s, r) = sel(&mut a, 0);
+        assert_eq!(
+            (p.as_str(), s, r.as_deref()),
+            ("performance", ProfileSource::Alert, Some("hot"))
+        );
+        assert_eq!(offer(&mut a, 0, "silent"), Offer::Activated);
+        assert_eq!(
+            sel(&mut a, 0).1,
+            ProfileSource::Alert,
+            "above the Agent too"
+        );
+        a.set_alert(None);
+        assert_eq!(sel(&mut a, 0).1, ProfileSource::App);
+    }
+
+    #[test]
+    fn an_alert_whose_profile_cannot_be_used_falls_through_to_the_next_source() {
+        let (mut a, _) = arb(RULES);
+        a.set_alert(Some(("hot".into(), "missing".into())));
+        let s = a.select(secs(0), &|p: &str| p != "missing");
+        assert_eq!(
+            (s.effective.as_str(), s.source),
+            ("silent", ProfileSource::Schedule)
+        );
+    }
+
+    #[test]
+    fn alerts_have_no_hourly_budget() {
+        let (mut a, _) = arb("");
+        for i in 0..20 {
+            a.set_alert(Some(("hot".into(), "performance".into())));
+            assert_eq!(sel(&mut a, i).1, ProfileSource::Alert, "round {i}");
+            a.set_alert(None);
+            assert_eq!(sel(&mut a, i).1, ProfileSource::Fallback);
+        }
     }
 
     #[test]

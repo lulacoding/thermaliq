@@ -310,6 +310,45 @@ fn identity_and_config_show_print_what_the_daemon_says() {
     );
 }
 
+/// M16: `tq alerts` lists every alert with its state and the latest events, with no token.
+#[test]
+fn alerts_lists_the_state_and_the_latest_events_and_needs_no_token() {
+    let r = rig(vec![ok(
+        "GET",
+        "/alerts",
+        json!({
+            "alerts": [
+                {"id": "cpu-hot", "sensor": "cpu_temp", "threshold": 92.0, "severity": "crit",
+                 "action": {"type": "apply_profile", "profile": "performance"},
+                 "state": "active", "since": 1000, "value": 94.5, "no_reading": false},
+                {"id": "gpu-hot", "sensor": "gpu_temp", "threshold": 85.0, "severity": "warn",
+                 "action": {"type": "notify"}, "state": "idle", "since": null,
+                 "value": 60.0, "no_reading": false}
+            ],
+            "events": [{"at": 1000, "id": "cpu-hot", "event": "fired", "severity": "crit",
+                        "action": "apply_profile", "sensor": "cpu_temp", "value": 94.5,
+                        "notify": false}]
+        }),
+    )]);
+    let o = tq(&r, &["alerts"]);
+    assert_eq!(o.code, 0, "{}", o.err);
+    for w in [
+        "cpu-hot",
+        "active",
+        "apply_profile performance",
+        "gpu-hot",
+        "idle",
+        "notify",
+        "fired",
+        "94.5",
+    ] {
+        assert!(o.out.contains(w), "{w}: {}", o.out);
+    }
+    assert!(r.fake.requests().iter().all(|q| q.auth.is_none()));
+    let j = tq(&r, &["--json", "alerts"]);
+    assert!(j.out.contains("\"events\""), "{}", j.out);
+}
+
 #[test]
 fn history_asks_for_the_sensor_and_keeps_only_the_last_minutes() {
     let now = std::time::SystemTime::now()
@@ -716,6 +755,35 @@ fn inventory_accept_posts() {
     assert_eq!(o.code, 0, "{}", o.err);
     assert_eq!(r.fake.requests()[0].path, "/inventory/accept");
     assert!(r.fake.requests()[0].auth.is_some());
+}
+
+/// M16: `tq alerts ack` is a write, and `tq alerts` shows the health and dust findings.
+#[test]
+fn alerts_ack_posts_with_the_token_and_alerts_lists_the_conditions() {
+    let r = rig(vec![
+        ok(
+            "POST",
+            "/alerts/ack",
+            json!({"baseline_from": 1_700_000_000}),
+        ),
+        ok(
+            "GET",
+            "/alerts",
+            json!({"alerts": [], "events": [], "conditions": [
+                {"id": "dust:cpu", "severity": "warn", "since": 5,
+                 "message": "CPU runs 6 C hotter: check the filters and fans"}]}),
+        ),
+    ]);
+    let o = tq(&r, &["alerts", "ack"]);
+    assert_eq!(o.code, 0, "{}", o.err);
+    assert_eq!(r.fake.requests()[0].path, "/alerts/ack");
+    assert!(r.fake.requests()[0].auth.is_some());
+    let o = tq(&r, &["alerts"]);
+    assert!(
+        o.out.contains("dust:cpu") && o.out.contains("check the filters"),
+        "{}",
+        o.out
+    );
 }
 
 // ---- identify ----

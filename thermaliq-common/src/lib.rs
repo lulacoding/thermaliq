@@ -3,18 +3,18 @@
 //! Parsing is strict: unknown fields and unknown curve types are errors, so
 //! out-of-scope features (SPEC §2) cannot be configured by accident.
 
+pub mod alert;
 mod config;
 pub mod datadir;
+pub mod health;
 pub mod identity;
 mod profile;
 
 pub use config::{
-    pick_app_rule, pick_schedule, AppRuleEntry, DaemonConfig, LocalClock, LocalTime, LogLevel,
-    ScheduleEntry, Weekday,
+    pick_app_rule, pick_schedule, AlertAction, AlertEntry, AppRuleEntry, DaemonConfig, LocalClock,
+    LocalTime, LogLevel, ScheduleEntry, Severity, Weekday,
 };
-pub use profile::{
-    Alert, AlertAction, Control, Curve, CustomSensor, GraphPoint, MixFunction, Profile, Severity,
-};
+pub use profile::{Control, Curve, CustomSensor, GraphPoint, MixFunction, Profile};
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
