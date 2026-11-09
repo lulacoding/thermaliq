@@ -24,7 +24,10 @@ const BASELINE_DAYS: i64 = 7;
 pub enum FanHealth {
     Ok,
     /// RPM at the same duty (bucket start) fell by `drop_pct`.
-    Declining { drop_pct: u32, duty: u8 },
+    Declining {
+        drop_pct: u32,
+        duty: u8,
+    },
     /// The fan never reported RPM: its tach is not connected. Not the same as healthy.
     Unmonitored,
     InsufficientHistory,
@@ -39,7 +42,10 @@ fn median<T: Copy + PartialOrd>(v: &mut [T]) -> T {
 /// window is the baseline, the last week the present; only rows at the same 5-point duty
 /// bucket are compared, and rows with 0 RPM never count (0-RPM mode is not a decline).
 pub fn fan_history(rows: &[(i64, u32, u8)], now: i64) -> FanHealth {
-    let window: Vec<_> = rows.iter().filter(|r| r.0 >= now - 30 * DAY && r.0 <= now).collect();
+    let window: Vec<_> = rows
+        .iter()
+        .filter(|r| r.0 >= now - 30 * DAY && r.0 <= now)
+        .collect();
     if !window.iter().any(|r| r.1 > 0) {
         return FanHealth::Unmonitored;
     }
@@ -64,7 +70,9 @@ pub fn fan_history(rows: &[(i64, u32, u8)], now: i64) -> FanHealth {
     let mut worst: Option<(u32, u8)> = None;
     let mut compared = false;
     for (bucket, a) in &mut then {
-        let Some(b) = recent.get_mut(bucket) else { continue };
+        let Some(b) = recent.get_mut(bucket) else {
+            continue;
+        };
         if a.len() < MIN_SAMPLES || b.len() < MIN_SAMPLES {
             continue;
         }
@@ -98,7 +106,8 @@ impl StallTracker {
         spun: impl Fn(&str, u8) -> bool,
     ) -> Vec<String> {
         let mut stalled = Vec::new();
-        self.zero_since.retain(|id, _| fans.iter().any(|f| &f.0 == id));
+        self.zero_since
+            .retain(|id, _| fans.iter().any(|f| &f.0 == id));
         for (id, rpm, duty) in fans {
             if *rpm == 0 && *duty >= MIN_STALL_DUTY && spun(id, *duty) {
                 let since = *self.zero_since.entry(id.clone()).or_insert(now);
@@ -124,7 +133,11 @@ pub struct Aligned {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DustVerdict {
     Clear,
-    Dusty { load_pct: u32, temp_rise: f32, duty_rise: f32 },
+    Dusty {
+        load_pct: u32,
+        temp_rise: f32,
+        duty_rise: f32,
+    },
     InsufficientHistory,
 }
 
@@ -147,7 +160,9 @@ pub fn dust(baseline: &[Aligned], recent: &[Aligned]) -> DustVerdict {
             continue;
         }
         compared = true;
-        let med = |v: &[Aligned], f: fn(&Aligned) -> f32| median(&mut v.iter().map(f).collect::<Vec<_>>());
+        let med = |v: &[Aligned], f: fn(&Aligned) -> f32| {
+            median(&mut v.iter().map(f).collect::<Vec<_>>())
+        };
         let temp_rise = med(b, |x| x.temp) - med(a, |x| x.temp);
         let duty_rise = med(b, |x| x.duty) - med(a, |x| x.duty);
         let worse = match worst {
@@ -155,7 +170,11 @@ pub fn dust(baseline: &[Aligned], recent: &[Aligned]) -> DustVerdict {
             _ => true,
         };
         if temp_rise >= DUST_TEMP_C && duty_rise >= DUST_DUTY_PTS && worse {
-            worst = Some(DustVerdict::Dusty { load_pct: bucket * 10, temp_rise, duty_rise });
+            worst = Some(DustVerdict::Dusty {
+                load_pct: bucket * 10,
+                temp_rise,
+                duty_rise,
+            });
         }
     }
     match (worst, compared) {
@@ -204,13 +223,32 @@ mod tests {
     #[test]
     fn rpm_down_15_percent_at_the_same_duty_over_the_window_is_declining() {
         // 1000 RPM in the first 7 days of the window, 840 (-16%) in the last 7.
-        let r = rows(30, 60, |age| if age >= 23 { 1000 } else if age < 7 { 840 } else { 920 });
+        let r = rows(30, 60, |age| {
+            if age >= 23 {
+                1000
+            } else if age < 7 {
+                840
+            } else {
+                920
+            }
+        });
         assert_eq!(
             fan_history(&r, NOW),
-            FanHealth::Declining { drop_pct: 16, duty: 60 }
+            FanHealth::Declining {
+                drop_pct: 16,
+                duty: 60
+            }
         );
         // -14% is not enough.
-        let r = rows(30, 60, |age| if age >= 23 { 1000 } else if age < 7 { 860 } else { 920 });
+        let r = rows(30, 60, |age| {
+            if age >= 23 {
+                1000
+            } else if age < 7 {
+                860
+            } else {
+                920
+            }
+        });
         assert_eq!(fan_history(&r, NOW), FanHealth::Ok);
     }
 
@@ -226,7 +264,9 @@ mod tests {
     #[test]
     fn a_bucket_with_few_samples_is_not_trusted() {
         let mut r = rows(30, 60, |age| if age >= 23 { 1000 } else { 500 });
-        r.retain(|(t, _, _)| NOW - t >= 23 * DAY || (t % 3600) == 0 && NOW - t < 7 * DAY && (t / 3600) % 24 < 1);
+        r.retain(|(t, _, _)| {
+            NOW - t >= 23 * DAY || (t % 3600) == 0 && NOW - t < 7 * DAY && (t / 3600) % 24 < 1
+        });
         assert_eq!(fan_history(&r, NOW), FanHealth::InsufficientHistory);
     }
 
@@ -245,9 +285,19 @@ mod tests {
         assert!(t.step(secs(0), &fan(0), spun_at_60).is_empty());
         assert!(t.step(secs(29), &fan(0), spun_at_60).is_empty());
         assert_eq!(t.step(secs(30), &fan(0), spun_at_60), ["f"]);
-        assert_eq!(t.step(secs(40), &fan(0), spun_at_60), ["f"], "still stalled");
-        assert!(t.step(secs(41), &fan(900), spun_at_60).is_empty(), "it spins again");
-        assert!(t.step(secs(42), &fan(0), spun_at_60).is_empty(), "the clock restarted");
+        assert_eq!(
+            t.step(secs(40), &fan(0), spun_at_60),
+            ["f"],
+            "still stalled"
+        );
+        assert!(
+            t.step(secs(41), &fan(900), spun_at_60).is_empty(),
+            "it spins again"
+        );
+        assert!(
+            t.step(secs(42), &fan(0), spun_at_60).is_empty(),
+            "the clock restarted"
+        );
     }
 
     #[test]
@@ -256,8 +306,13 @@ mod tests {
         let low = vec![("f".to_owned(), 0u32, 10u8)];
         let never = |_: &str, _: u8| false;
         for s in [0, 31, 60] {
-            assert!(t.step(secs(s), &low, spun_at_60).is_empty(), "duty 10: below any start");
-            assert!(t.step(secs(s), &vec![("f".to_owned(), 0, 60)], never).is_empty());
+            assert!(
+                t.step(secs(s), &low, spun_at_60).is_empty(),
+                "duty 10: below any start"
+            );
+            assert!(t
+                .step(secs(s), &[("f".to_owned(), 0, 60)], never)
+                .is_empty());
         }
     }
 
@@ -275,7 +330,11 @@ mod tests {
         let dusty = many(MIN_SAMPLES, a(65.0, 52.0, 50.0));
         assert_eq!(
             dust(&base, &dusty),
-            DustVerdict::Dusty { load_pct: 50, temp_rise: 5.0, duty_rise: 10.0 }
+            DustVerdict::Dusty {
+                load_pct: 50,
+                temp_rise: 5.0,
+                duty_rise: 10.0
+            }
         );
         // Hotter but the fans did not speed up: a hot day, not dust.
         let summer = many(MIN_SAMPLES, a(66.0, 52.0, 42.0));

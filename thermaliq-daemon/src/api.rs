@@ -131,6 +131,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/identify/probe", post(identify_probe))
         .route("/roles", put(put_roles))
         .route("/inventory/accept", post(accept_inventory))
+        .route("/alerts/ack", post(ack_alerts))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer,
@@ -285,7 +286,20 @@ fn fans_json(c: &Cache) -> Value {
 }
 
 async fn fans(State(s): State<ApiState>) -> Json<Value> {
-    Json(fans_json(&s.handle.cache()))
+    let mut v = fans_json(&s.handle.cache());
+    // From history: ok, declining, stalled, unmonitored (no tach), insufficient_history, unknown.
+    for f in v.as_array_mut().into_iter().flatten() {
+        f["health"] = json!(s.handle.fan_health(f["id"].as_str().unwrap_or_default()));
+    }
+    Json(v)
+}
+
+/// `tq alerts ack`: the filters were cleaned. The next week of readings is the new dust baseline.
+async fn ack_alerts(State(s): State<ApiState>) -> ApiResult {
+    let now = crate::runtime::unix_now();
+    crate::health::ack(&s.dir, now).map_err(internal)?;
+    s.handle.clear_dust(now);
+    Ok(Json(json!({ "baseline_from": now })))
 }
 
 async fn metrics(State(s): State<ApiState>) -> Json<Value> {
@@ -922,6 +936,24 @@ mod tests {
         assert_eq!(v["alerts"][0]["state"], "active");
         assert_eq!(v["events"][0]["event"], "fired");
         assert_eq!(v["events"][0]["notify"], true);
+    }
+
+    /// M16: `/fans` carries each fan's health, and `POST /alerts/ack` (token) starts a new dust
+    /// baseline, which is saved in `health.json`.
+    #[tokio::test]
+    async fn fans_show_their_health_and_ack_needs_the_token_and_saves_a_new_baseline() {
+        let r = rig(vec![at(40.0)]);
+        ticked(&r).await;
+        let (_, v) = get(&r, "/fans").await;
+        assert_eq!(v[0]["health"], "unknown", "no history check has run yet");
+
+        let (code, _) = call(&r, "POST", "/alerts/ack", None, None).await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+        assert!(!r.dir.path().join("health.json").exists());
+        let (code, v) = call(&r, "POST", "/alerts/ack", Some(TOKEN), None).await;
+        assert_eq!(code, StatusCode::OK, "{v}");
+        assert!(r.dir.path().join("health.json").exists());
+        assert!(v["baseline_from"].as_i64().unwrap() > 0);
     }
 
     #[tokio::test]

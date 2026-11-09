@@ -223,6 +223,15 @@ pub fn start(
     daemon
         .handle()
         .configure_alerts(identity.resolve_alerts(&cfg.alert));
+    // Fan health and dust from history (SPEC §7.6): a minute after start, then hourly. It only
+    // raises alerts. shortcut: the thread is not joined; it ends with the process.
+    crate::health::spawn(
+        daemon.handle(),
+        history.clone(),
+        dir.to_owned(),
+        Duration::from_secs(60),
+        Duration::from_secs(3600),
+    );
     identity.check_when_ready(daemon.handle());
     if let Some(why) = identity.board_reason() {
         daemon.handle().note_degraded(why.to_owned());

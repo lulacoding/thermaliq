@@ -223,6 +223,14 @@ impl HistoryDb {
         rows.collect()
     }
 
+    /// The oldest sensor row's time: where history starts.
+    pub fn first_recorded_at(&self) -> rusqlite::Result<Option<i64>> {
+        self.0
+            .query_row("SELECT MIN(recorded_at) FROM sensor_readings", [], |r| {
+                r.get(0)
+            })
+    }
+
     /// `(recorded_at, rpm, duty_percent)` oldest first.
     pub fn fan_rows(&self, id: &str) -> rusqlite::Result<Vec<(i64, u32, u8)>> {
         self.fan_rows_since(id, i64::MIN)

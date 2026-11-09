@@ -757,6 +757,35 @@ fn inventory_accept_posts() {
     assert!(r.fake.requests()[0].auth.is_some());
 }
 
+/// M16: `tq alerts ack` is a write, and `tq alerts` shows the health and dust findings.
+#[test]
+fn alerts_ack_posts_with_the_token_and_alerts_lists_the_conditions() {
+    let r = rig(vec![
+        ok(
+            "POST",
+            "/alerts/ack",
+            json!({"baseline_from": 1_700_000_000}),
+        ),
+        ok(
+            "GET",
+            "/alerts",
+            json!({"alerts": [], "events": [], "conditions": [
+                {"id": "dust:cpu", "severity": "warn", "since": 5,
+                 "message": "CPU runs 6 C hotter: check the filters and fans"}]}),
+        ),
+    ]);
+    let o = tq(&r, &["alerts", "ack"]);
+    assert_eq!(o.code, 0, "{}", o.err);
+    assert_eq!(r.fake.requests()[0].path, "/alerts/ack");
+    assert!(r.fake.requests()[0].auth.is_some());
+    let o = tq(&r, &["alerts"]);
+    assert!(
+        o.out.contains("dust:cpu") && o.out.contains("check the filters"),
+        "{}",
+        o.out
+    );
+}
+
 // ---- identify ----
 
 fn identity() -> Value {

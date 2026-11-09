@@ -162,6 +162,12 @@ pub fn alerts(v: &Value) -> String {
         &["ID", "SENSOR", "AT", "SEVERITY", "ACTION", "STATE", "NOW"],
         &rows,
     );
+    s += "\nfan health and dust findings:\n";
+    s += &array_table(
+        &v["conditions"],
+        &["ID", "SEVERITY", "SINCE", "MESSAGE"],
+        &["id", "severity", "since", "message"],
+    );
     s += "\nevents:\n";
     s + &array_table(
         &v["events"],

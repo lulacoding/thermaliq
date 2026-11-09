@@ -10,6 +10,7 @@ pub mod app;
 pub mod arbiter;
 pub mod decision_client;
 pub mod foreground;
+pub mod health;
 pub mod history;
 pub mod identity;
 #[cfg(feature = "gate-tests")]

@@ -30,7 +30,8 @@ usage: tq [--json] <command>
   agent key set <provider>        store your key (read from stdin, never from the command line)
   agent key clear                 remove the key
   agent workload <exe> <kind>     tell the agent what an app is
-  alerts                          every alert with its state, and the latest events
+  alerts                          every alert with its state, health findings, and the latest events
+  alerts ack                      filters cleaned: restart the dust baseline
   identity                        board, roles, inventory and proposed mapping
   identify [--probe <fan>]        first-run fan mapping; --probe runs one fan at 100% for 5 s
   inventory accept                accept the current fans as the saved inventory
@@ -316,7 +317,7 @@ fn dispatch(
             render::array_table(
                 v,
                 &[
-                    "ID", "LABEL", "KIND", "RPM", "DUTY%", "CURVE%", "AGENT%", "SENT%",
+                    "ID", "LABEL", "KIND", "RPM", "DUTY%", "CURVE%", "AGENT%", "SENT%", "HEALTH",
                 ],
                 &[
                     "id",
@@ -327,6 +328,7 @@ fn dispatch(
                     "curve_duty",
                     "agent_duty",
                     "commanded_duty",
+                    "health",
                 ],
             )
         }),
@@ -500,6 +502,15 @@ fn dispatch(
                     render::cell(&v["workload"]),
                     render::cell(&v["profile"])
                 ),
+            )
+        }
+        ["alerts", "ack"] => {
+            let v = env.client()?.post("/alerts/ack", None)?;
+            done(
+                out,
+                json,
+                &v,
+                "dust baseline restarted: the next week of readings is the new baseline",
             )
         }
         ["inventory", "accept"] => {

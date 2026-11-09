@@ -79,7 +79,10 @@ impl AlertHub {
                 .find(|s| s.id == id)
                 .map(|s| s.temp_celsius)
         };
-        let events = self.tracker.as_mut().map_or_else(Vec::new, |t| t.step(now, read));
+        let events = self
+            .tracker
+            .as_mut()
+            .map_or_else(Vec::new, |t| t.step(now, read));
         for e in events {
             let r = record(unix, &e);
             match e.kind {
@@ -130,7 +133,9 @@ impl AlertHub {
             .into_iter()
             .map(|fan| Condition {
                 key: format!("fan-stalled:{fan}"),
-                message: format!("fan '{fan}' reads 0 RPM at a duty it has spun at: it may have stalled"),
+                message: format!(
+                    "fan '{fan}' reads 0 RPM at a duty it has spun at: it may have stalled"
+                ),
                 severity: Severity::Crit,
                 sensor: fan,
                 value: 0.0,
@@ -147,7 +152,11 @@ impl AlertHub {
                 None => {
                     self.conds.insert(
                         c.key.clone(),
-                        Active { since: unix, last_notified: unix, cond: c.clone() },
+                        Active {
+                            since: unix,
+                            last_notified: unix,
+                            cond: c.clone(),
+                        },
                     );
                     self.condition_record(unix, c, "fired");
                 }
@@ -205,7 +214,10 @@ impl AlertHub {
         if self.conds.contains_key(&format!("fan-stalled:{fan}")) {
             return "stalled".into();
         }
-        self.fan_health.get(fan).cloned().unwrap_or_else(|| "unknown".into())
+        self.fan_health
+            .get(fan)
+            .cloned()
+            .unwrap_or_else(|| "unknown".into())
     }
 
     /// The sensor ids the alerts read, for history.
@@ -442,7 +454,10 @@ mod tests {
         h.update_conditions("fan-health:", 6 * day, vec![cond("fan-health:f")]);
         assert_eq!(h.log().len(), 1, "once, not daily");
         assert_eq!((h.log()[0].event, h.log()[0].notify), ("fired", true));
-        assert_eq!(h.log()[0].message.as_deref(), Some("fan-health:f may be failing"));
+        assert_eq!(
+            h.log()[0].message.as_deref(),
+            Some("fan-health:f may be failing")
+        );
         h.update_conditions("fan-health:", 7 * day, vec![cond("fan-health:f")]);
         assert_eq!(h.log()[1].event, "repeated");
         assert_eq!(h.describe()["conditions"][0]["id"], "fan-health:f");
@@ -476,7 +491,10 @@ mod tests {
         fan_tick(&mut h, 30, 0, 60);
         let log = h.log();
         assert_eq!(log.len(), 1, "{log:?}");
-        assert_eq!((log[0].id.as_str(), log[0].severity, log[0].notify), ("fan-stalled:f", Severity::Crit, true));
+        assert_eq!(
+            (log[0].id.as_str(), log[0].severity, log[0].notify),
+            ("fan-stalled:f", Severity::Crit, true)
+        );
         assert_eq!(h.fan_health("f"), "stalled");
         fan_tick(&mut h, 31, 900, 60);
         assert_eq!(h.log()[1].event, "cleared");

@@ -231,6 +231,29 @@ impl Handle {
         self.hub().configure(alerts);
     }
 
+    /// Hands the hub what the hourly history check found.
+    pub fn apply_health(&self, e: crate::health::Evaluation, now: i64) {
+        let mut h = self.hub();
+        h.set_spun(e.spun);
+        h.set_fan_health(e.fan_health);
+        let (fans, dusts) = e
+            .conditions
+            .into_iter()
+            .partition(|c| c.key.starts_with("fan-health:"));
+        h.update_conditions("fan-health:", now, fans);
+        h.update_conditions("dust:", now, dusts);
+    }
+
+    /// `tq alerts ack`: a new dust baseline starts now, so the old finding ends.
+    pub fn clear_dust(&self, now: i64) {
+        self.hub().update_conditions("dust:", now, Vec::new());
+    }
+
+    /// `ok`, `declining`, `stalled`, `unmonitored`, `insufficient_history` or `unknown`.
+    pub fn fan_health(&self, fan: &str) -> String {
+        self.hub().fan_health(fan)
+    }
+
     /// What `GET /alerts` answers.
     pub fn alerts(&self) -> serde_json::Value {
         self.hub().describe()
@@ -962,6 +985,42 @@ mod tests {
             h.alerts()["events"].as_array().unwrap().len(),
             1,
             "and does not fire again"
+        );
+        d.shutdown().unwrap();
+    }
+
+    #[test]
+    fn a_health_finding_reaches_the_fans_list_and_the_alerts_and_never_a_fan_write() {
+        let (hal, d) = start(vec![at(40.0)], vec![], &db(), fast());
+        let h = d.handle();
+        wait_until(|| !hal.writes().is_empty());
+        let before = hal.writes().len();
+        let e = crate::health::Evaluation {
+            fan_health: [("f1".to_owned(), "declining".to_owned())].into(),
+            conditions: vec![crate::alerts::Condition {
+                key: "fan-health:f1".into(),
+                message: "fan 'f1' may be failing".into(),
+                severity: thermaliq_common::Severity::Warn,
+                sensor: "f1".into(),
+                value: 16.0,
+            }],
+            ..Default::default()
+        };
+        h.apply_health(e, 1_000);
+        assert_eq!(h.fan_health("f1"), "declining");
+        assert_eq!(h.alerts()["conditions"][0]["id"], "fan-health:f1");
+        assert_eq!(h.alerts()["events"][0]["notify"], true);
+        let ticks = h.cache().ticks;
+        wait_until(|| h.cache().ticks > ticks + 10);
+        assert!(
+            hal.writes()[before..].iter().all(|(_, duty)| *duty == 30),
+            "control is unchanged: the flat profile still writes 30"
+        );
+        h.clear_dust(2_000);
+        assert_eq!(
+            h.alerts()["conditions"].as_array().unwrap().len(),
+            1,
+            "dust only"
         );
         d.shutdown().unwrap();
     }
