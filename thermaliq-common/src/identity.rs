@@ -17,6 +17,8 @@ pub const SENSOR_ROLES: [&str; 2] = ["cpu_temp", "gpu_temp"];
 
 /// A tach reading must rise at least this much for the probe to call a fan "moved".
 pub const RPM_RISE: u32 = 150;
+/// ... and at least this percent of the RPM it had before the hold.
+pub const RPM_RISE_PCT: u64 = 15;
 
 fn is_role(id: &str) -> bool {
     FAN_ROLES.contains(&id) || SENSOR_ROLES.contains(&id)
@@ -556,10 +558,12 @@ pub fn pair(probed: &str, before: &[(String, u32)], during: &[(String, u32)]) ->
         let now = during.iter().find(|(i, _)| i == id).map_or(0, |(_, r)| *r);
         now.saturating_sub(was)
     };
+    let was = |id: &str| before.iter().find(|(i, _)| i == id).map_or(0, |(_, r)| *r);
     let best = during
         .iter()
         .map(|(id, _)| (id, rise(id)))
-        .filter(|(_, r)| *r >= RPM_RISE)
+        // At least RPM_RISE and RPM_RISE_PCT of where the fan was: drift is not a pairing.
+        .filter(|(id, r)| *r >= RPM_RISE && u64::from(*r) * 100 >= u64::from(was(id)) * RPM_RISE_PCT)
         .max_by_key(|(id, r)| (*r, *id == probed));
     match best {
         None => Pairing::None,
@@ -884,6 +888,28 @@ mod tests {
         );
         // Already at full speed, or no tach at all: nothing to see.
         assert_eq!(pair("a", &before, &before), Pairing::None);
+    }
+
+    /// M16 (f): a fan that merely drifts is not a pairing. The rise must be at least 150 RPM
+    /// and at least 15% of where that fan was.
+    #[test]
+    fn a_drifting_tach_is_not_named_as_crossed_wiring() {
+        let before = rpms(&[("hdr", 0), ("gpu", 2000), ("small", 1000)]);
+        // 8% of 2000 is 160 RPM: enough RPM, not enough rise.
+        let drift = rpms(&[("hdr", 0), ("gpu", 2160), ("small", 1000)]);
+        assert_eq!(pair("hdr", &before, &drift), Pairing::None);
+        // 16% of 1000 is 160 RPM: both limits met.
+        let rose = rpms(&[("hdr", 0), ("gpu", 2000), ("small", 1160)]);
+        assert_eq!(
+            pair("hdr", &before, &rose),
+            Pairing::Other("small".into())
+        );
+        // The check's real numbers: 1123 -> 1186.
+        let real = rpms(&[("hdr", 0), ("gpu", 1186)]);
+        assert_eq!(
+            pair("hdr", &rpms(&[("hdr", 0), ("gpu", 1123)]), &real),
+            Pairing::None
+        );
     }
 
     // ---- case_fans (design change, 2026-11-06) ----
