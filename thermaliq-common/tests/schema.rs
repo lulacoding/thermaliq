@@ -173,10 +173,10 @@ fn sensors_alerts_and_rules_are_validated() {
             .contains("sources")
     );
     // M16: alerts are global, so they live in config.toml next to the app rules.
-    assert!(
-        err("[[alerts]]\nsensor=\"s\"\nthreshold=80\nseverity=\"warn\"\naction={type=\"log\"}\n")
-            .contains("alerts moved to config.toml [[alert]]")
-    );
+    assert!(err(
+        "[[alerts]]\nsensor=\"s\"\nthreshold=80\nseverity=\"warn\"\naction={type=\"log\"}\n"
+    )
+    .contains("alerts moved to config.toml [[alert]]"));
     assert!(err("[[app_rules]]\nprocess=\"g.exe\"\nprofile=\"x\"\n")
         .contains("app_rules moved to config.toml [[app_rule]]"));
 }

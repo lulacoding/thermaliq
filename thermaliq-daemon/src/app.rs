@@ -400,9 +400,14 @@ mod tests {
         let d = dir();
         append_config(&d, "[[alert]]\nid='x'\nsensor='cpu'\nthreshold=80\nseverity='warn'\naction={type='apply_profile',profile='nope'}\n");
         let hal = mock();
-        let err = start(d.path(), hal.clone(), Token::CreateIfMissing, ForegroundSource::Off)
-            .err()
-            .unwrap();
+        let err = start(
+            d.path(),
+            hal.clone(),
+            Token::CreateIfMissing,
+            ForegroundSource::Off,
+        )
+        .err()
+        .unwrap();
         assert!(err.contains("'x'") && err.contains("nope"), "{err}");
         assert!(hal.writes().is_empty() && hal.restores().is_empty());
     }
@@ -422,8 +427,15 @@ mod tests {
         let h = app.daemon.handle();
         wait_until(|| h.active_alerts() == ["cpu-hot"]);
         let shown = h.alerts();
-        assert_eq!(shown["alerts"].as_array().unwrap().len(), 1, "gpu-hot was dropped: {shown}");
-        assert_eq!(shown["alerts"][0]["sensor"], "cpu", "the role became the real id");
+        assert_eq!(
+            shown["alerts"].as_array().unwrap().len(),
+            1,
+            "gpu-hot was dropped: {shown}"
+        );
+        assert_eq!(
+            shown["alerts"][0]["sensor"], "cpu",
+            "the role became the real id"
+        );
         app.stop(Duration::from_secs(5)).unwrap();
     }
 

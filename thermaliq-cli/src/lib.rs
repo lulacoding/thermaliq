@@ -30,6 +30,7 @@ usage: tq [--json] <command>
   agent key set <provider>        store your key (read from stdin, never from the command line)
   agent key clear                 remove the key
   agent workload <exe> <kind>     tell the agent what an app is
+  alerts                          every alert with its state, and the latest events
   identity                        board, roles, inventory and proposed mapping
   identify [--probe <fan>]        first-run fan mapping; --probe runs one fan at 100% for 5 s
   inventory accept                accept the current fans as the saved inventory
@@ -332,6 +333,7 @@ fn dispatch(
         ["metrics"] => read(out, json, env.client()?.get("/metrics"), |v| {
             render::array_table(v, &["ID", "KIND", "VALUE"], &["id", "kind", "value"])
         }),
+        ["alerts"] => read(out, json, env.client()?.get("/alerts"), render::alerts),
         ["identity"] => read(out, json, env.client()?.get("/identity"), render::identity),
         ["config", "show"] => read(out, json, env.client()?.get("/config"), render::config),
         ["profile", "list"] => read(out, json, env.client()?.get("/profiles"), render::profiles),

@@ -213,7 +213,10 @@ mod tests {
         run(&mut h, 2, 5, 90.0);
         let log = h.log();
         assert_eq!(log.len(), 1, "{log:?}");
-        assert_eq!((log[0].event, log[0].action, log[0].notify), ("fired", "notify", true));
+        assert_eq!(
+            (log[0].event, log[0].action, log[0].notify),
+            ("fired", "notify", true)
+        );
         assert_eq!(h.active(), ["hot"]);
         assert_eq!(h.describe()["alerts"][0]["state"], "active");
         assert_eq!(h.describe()["alerts"][0]["since"], 1_002);
@@ -245,7 +248,11 @@ mod tests {
         }
         let log = h.log();
         assert_eq!(log.len(), LOG_MAX);
-        assert_eq!(log[LOG_MAX - 1].at, 1_000 + 99 * 10 + 3, "the newest is kept");
+        assert_eq!(
+            log[LOG_MAX - 1].at,
+            1_000 + 99 * 10 + 3,
+            "the newest is kept"
+        );
     }
 
     #[test]
@@ -254,12 +261,20 @@ mod tests {
         off.enabled = false;
         let mut h = AlertHub::default();
         h.configure(vec![
-            entry("cool", AlertAction::ApplyProfile { profile: "performance".into() }),
+            entry(
+                "cool",
+                AlertAction::ApplyProfile {
+                    profile: "performance".into(),
+                },
+            ),
             off,
         ]);
         assert_eq!(h.wanted_profile(), None);
         run(&mut h, 0, 3, 90.0);
-        assert_eq!(h.wanted_profile(), Some(("cool".into(), "performance".into())));
+        assert_eq!(
+            h.wanted_profile(),
+            Some(("cool".into(), "performance".into()))
+        );
         assert_eq!(h.describe()["alerts"][1]["state"], "disabled");
     }
 

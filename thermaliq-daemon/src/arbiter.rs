@@ -341,7 +341,11 @@ mod tests {
             ("performance", ProfileSource::Alert, Some("hot"))
         );
         assert_eq!(offer(&mut a, 0, "silent"), Offer::Activated);
-        assert_eq!(sel(&mut a, 0).1, ProfileSource::Alert, "above the Agent too");
+        assert_eq!(
+            sel(&mut a, 0).1,
+            ProfileSource::Alert,
+            "above the Agent too"
+        );
         a.set_alert(None);
         assert_eq!(sel(&mut a, 0).1, ProfileSource::App);
     }
@@ -351,7 +355,10 @@ mod tests {
         let (mut a, _) = arb(RULES);
         a.set_alert(Some(("hot".into(), "missing".into())));
         let s = a.select(secs(0), &|p: &str| p != "missing");
-        assert_eq!((s.effective.as_str(), s.source), ("silent", ProfileSource::Schedule));
+        assert_eq!(
+            (s.effective.as_str(), s.source),
+            ("silent", ProfileSource::Schedule)
+        );
     }
 
     #[test]

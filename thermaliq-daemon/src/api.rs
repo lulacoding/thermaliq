@@ -901,14 +901,16 @@ mod tests {
         assert_eq!(code, StatusCode::OK);
         assert_eq!(v, json!({"alerts": [], "events": []}));
 
-        r.state.handle.configure_alerts(vec![thermaliq_common::AlertEntry {
-            id: "hot".into(),
-            enabled: true,
-            sensor: "cpu".into(),
-            threshold: 85.0,
-            severity: thermaliq_common::Severity::Warn,
-            action: thermaliq_common::AlertAction::Notify,
-        }]);
+        r.state
+            .handle
+            .configure_alerts(vec![thermaliq_common::AlertEntry {
+                id: "hot".into(),
+                enabled: true,
+                sensor: "cpu".into(),
+                threshold: 85.0,
+                severity: thermaliq_common::Severity::Warn,
+                action: thermaliq_common::AlertAction::Notify,
+            }]);
         for _ in 0..200 {
             if get(&r, "/status").await.1["alerts_active"] == json!(["hot"]) {
                 break;

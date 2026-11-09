@@ -98,6 +98,7 @@ pub fn status(v: &Value) -> String {
         ("degraded_reasons", "degraded"),
         ("waiting_on", "waiting on"),
         ("unavailable_sources", "unavailable"),
+        ("alerts_active", "alert active"),
     ] {
         for item in v[key].as_array().into_iter().flatten() {
             let _ = writeln!(s, "{label}: {}", cell(item));
@@ -128,6 +129,45 @@ pub fn config(v: &Value) -> String {
         .flatten()
         .map(|(k, val)| format!("{k} = {}\n", cell(val)))
         .collect()
+}
+
+pub fn alerts(v: &Value) -> String {
+    let rows = v["alerts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|a| {
+            let action = match a["action"]["type"].as_str() {
+                Some("apply_profile") => format!("apply_profile {}", cell(&a["action"]["profile"])),
+                Some(t) => t.to_owned(),
+                None => "-".into(),
+            };
+            let state = if a["no_reading"] == true {
+                format!("{} (no reading)", cell(&a["state"]))
+            } else {
+                cell(&a["state"])
+            };
+            vec![
+                cell(&a["id"]),
+                cell(&a["sensor"]),
+                cell(&a["threshold"]),
+                cell(&a["severity"]),
+                action,
+                state,
+                cell(&a["value"]),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let mut s = table(
+        &["ID", "SENSOR", "AT", "SEVERITY", "ACTION", "STATE", "NOW"],
+        &rows,
+    );
+    s += "\nevents:\n";
+    s + &array_table(
+        &v["events"],
+        &["AT", "ID", "EVENT", "SEVERITY", "VALUE", "NOTIFY"],
+        &["at", "id", "event", "severity", "value", "notify"],
+    )
 }
 
 pub fn identity(v: &Value) -> String {

@@ -206,9 +206,27 @@ fn default_alerts() -> Vec<AlertEntry> {
         action,
     };
     vec![
-        a("cpu-warm", "cpu_temp", 85.0, Severity::Warn, AlertAction::Notify),
-        a("cpu-hot", "cpu_temp", 92.0, Severity::Crit, AlertAction::Log),
-        a("gpu-hot", "gpu_temp", 85.0, Severity::Crit, AlertAction::Notify),
+        a(
+            "cpu-warm",
+            "cpu_temp",
+            85.0,
+            Severity::Warn,
+            AlertAction::Notify,
+        ),
+        a(
+            "cpu-hot",
+            "cpu_temp",
+            92.0,
+            Severity::Crit,
+            AlertAction::Log,
+        ),
+        a(
+            "gpu-hot",
+            "gpu_temp",
+            85.0,
+            Severity::Crit,
+            AlertAction::Notify,
+        ),
     ]
 }
 
@@ -284,7 +302,10 @@ impl DaemonConfig {
                 ));
             }
             if matches!(&a.action, AlertAction::ApplyProfile { profile } if profile.is_empty()) {
-                return invalid(format!("alert '{}': apply_profile needs a profile name", a.id));
+                return invalid(format!(
+                    "alert '{}': apply_profile needs a profile name",
+                    a.id
+                ));
             }
         }
         let mut ids = std::collections::HashSet::new();
@@ -355,12 +376,15 @@ mod alert_tests {
 
     #[test]
     fn bad_alerts_are_refused_by_name() {
-        let with = |s: &str| HOT.replace(s.split_once('|').unwrap().0, s.split_once('|').unwrap().1);
+        let with =
+            |s: &str| HOT.replace(s.split_once('|').unwrap().0, s.split_once('|').unwrap().1);
         assert!(err(&with("id='hot'|id=''")).contains("alert"));
         assert!(err(&format!("{HOT}{HOT}")).contains("duplicate alert id 'hot'"));
         assert!(err(&with("threshold=85|threshold=999")).contains("threshold"));
         assert!(err(&with("sensor='cpu_temp'|sensor=''")).contains("sensor"));
-        assert!(err(&with("{type='notify'}|{type='apply_profile',profile=''}")).contains("profile"));
+        assert!(
+            err(&with("{type='notify'}|{type='apply_profile',profile=''}")).contains("profile")
+        );
         assert!(err(&with("severity='warn'|severity='loud'")).contains("loud"));
         assert!(err(&HOT.replace("threshold", "limit")).contains("limit"));
     }

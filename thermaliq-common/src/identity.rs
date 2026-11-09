@@ -697,12 +697,22 @@ mod tests {
         };
         let mut m = all_mapped();
         m.roles.remove("gpu_temp");
-        let list = [alert("a", "cpu_temp"), alert("b", "gpu_temp"), alert("c", "ssd_1")];
+        let list = [
+            alert("a", "cpu_temp"),
+            alert("b", "gpu_temp"),
+            alert("c", "ssd_1"),
+        ];
         let (kept, skipped) = resolve_alerts(&list, &m);
-        let got: Vec<_> = kept.iter().map(|a| (a.id.as_str(), a.sensor.as_str())).collect();
+        let got: Vec<_> = kept
+            .iter()
+            .map(|a| (a.id.as_str(), a.sensor.as_str()))
+            .collect();
         assert_eq!(got, [("a", "lhm_cpu"), ("c", "ssd_1")]);
         assert_eq!(skipped.len(), 1);
-        assert!(skipped[0].contains("'b'") && skipped[0].contains("gpu_temp"), "{skipped:?}");
+        assert!(
+            skipped[0].contains("'b'") && skipped[0].contains("gpu_temp"),
+            "{skipped:?}"
+        );
     }
 
     #[test]

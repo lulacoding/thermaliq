@@ -1179,22 +1179,28 @@ mod tests {
         let cfg = cfg(&rule("game.exe", "gaming"));
         let r = rig_on_with_config(
             hal,
-            vec![toml("balanced", "f1"), toml("gaming", "f1"), toml("performance", "f1")],
+            vec![
+                toml("balanced", "f1"),
+                toml("gaming", "f1"),
+                toml("performance", "f1"),
+            ],
             &[],
             cfg,
         );
         show(&r, "game.exe");
         wait_until(|| active(&r) == "gaming");
-        r.daemon.handle().configure_alerts(vec![thermaliq_common::AlertEntry {
-            id: "hot".into(),
-            enabled: true,
-            sensor: "cpu".into(),
-            threshold: 85.0,
-            severity: thermaliq_common::Severity::Crit,
-            action: thermaliq_common::AlertAction::ApplyProfile {
-                profile: "performance".into(),
-            },
-        }]);
+        r.daemon
+            .handle()
+            .configure_alerts(vec![thermaliq_common::AlertEntry {
+                id: "hot".into(),
+                enabled: true,
+                sensor: "cpu".into(),
+                threshold: 85.0,
+                severity: thermaliq_common::Severity::Crit,
+                action: thermaliq_common::AlertAction::ApplyProfile {
+                    profile: "performance".into(),
+                },
+            }]);
         wait_until(|| active(&r) == "performance");
         assert_eq!(source(&r), Some(ProfileSource::Alert));
         let sel = r.daemon.handle().cache().selection.unwrap();

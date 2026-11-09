@@ -580,8 +580,7 @@ impl Daemon {
                             // Global alerts (config.toml) run on every fresh tick, whatever the
                             // profile; their sensors are recorded even if no profile names them.
                             let alert_sensors = {
-                                let mut hub =
-                                    alerts.lock().unwrap_or_else(PoisonError::into_inner);
+                                let mut hub = alerts.lock().unwrap_or_else(PoisonError::into_inner);
                                 hub.step(t0 - began, unix_now(), &snapshot);
                                 hub.sensors()
                             };
@@ -954,8 +953,16 @@ mod tests {
         rt.block_on(h.apply_profile(other)).unwrap();
         let ticks = h.cache().ticks;
         wait_until(|| h.cache().ticks > ticks + 20);
-        assert_eq!(h.alerts()["alerts"][0]["state"], "active", "a switch is not a clear");
-        assert_eq!(h.alerts()["events"].as_array().unwrap().len(), 1, "and does not fire again");
+        assert_eq!(
+            h.alerts()["alerts"][0]["state"],
+            "active",
+            "a switch is not a clear"
+        );
+        assert_eq!(
+            h.alerts()["events"].as_array().unwrap().len(),
+            1,
+            "and does not fire again"
+        );
         d.shutdown().unwrap();
     }
 
@@ -971,7 +978,14 @@ mod tests {
         let mut a = alert("ssd-hot", thermaliq_common::AlertAction::Log);
         a.sensor = "ssd".into();
         d.handle().configure_alerts(vec![a]);
-        wait_until(|| !database.lock().unwrap().sensor_rows("ssd").unwrap().is_empty());
+        wait_until(|| {
+            !database
+                .lock()
+                .unwrap()
+                .sensor_rows("ssd")
+                .unwrap()
+                .is_empty()
+        });
         d.shutdown().unwrap();
     }
 

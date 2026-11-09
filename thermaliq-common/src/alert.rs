@@ -44,8 +44,13 @@ pub struct AlertState {
 }
 
 enum Phase {
-    Idle { hot: u32 },
-    Active { since: Duration, last_notified: Duration },
+    Idle {
+        hot: u32,
+    },
+    Active {
+        since: Duration,
+        last_notified: Duration,
+    },
 }
 
 struct Slot {
@@ -209,7 +214,10 @@ mod tests {
         let mut t = AlertTracker::new(&[warn()]);
         assert!(tick(&mut t, 0, Some(90.0)).is_empty());
         assert!(tick(&mut t, 1, Some(90.0)).is_empty());
-        assert!(tick(&mut t, 2, Some(84.0)).is_empty(), "a dip resets the count");
+        assert!(
+            tick(&mut t, 2, Some(84.0)).is_empty(),
+            "a dip resets the count"
+        );
         assert!(tick(&mut t, 3, Some(90.0)).is_empty());
         assert!(tick(&mut t, 4, Some(90.0)).is_empty());
         assert_eq!(tick(&mut t, 5, Some(90.0)), [fired("hot")]);
@@ -231,7 +239,10 @@ mod tests {
         for at in 0..3 {
             tick(&mut t, at, Some(90.0));
         }
-        assert!(tick(&mut t, 3, Some(83.0)).is_empty(), "83 is still inside the band");
+        assert!(
+            tick(&mut t, 3, Some(83.0)).is_empty(),
+            "83 is still inside the band"
+        );
         assert!(tick(&mut t, 4, Some(85.0)).is_empty());
         assert_eq!(
             tick(&mut t, 5, Some(82.9)),
@@ -258,9 +269,12 @@ mod tests {
             tick(&mut t, 2 + 300, Some(95.0)),
             [("melt".to_owned(), EventKind::Repeated)]
         );
-        assert!(tick(&mut t, 2 + 599, Some(95.0)).iter().all(|e| e.0 != "hot"));
-        assert!(tick(&mut t, 2 + 600, Some(95.0))
-            .contains(&("hot".to_owned(), EventKind::Repeated)));
+        assert!(tick(&mut t, 2 + 599, Some(95.0))
+            .iter()
+            .all(|e| e.0 != "hot"));
+        assert!(
+            tick(&mut t, 2 + 600, Some(95.0)).contains(&("hot".to_owned(), EventKind::Repeated))
+        );
     }
 
     #[test]
@@ -271,11 +285,18 @@ mod tests {
         for bad in [None, Some(f32::NAN), Some(999.0), Some(-100.0)] {
             assert!(tick(&mut t, 2, bad).is_empty());
         }
-        assert_eq!(tick(&mut t, 3, Some(90.0)), [fired("hot")], "the count was kept");
+        assert_eq!(
+            tick(&mut t, 3, Some(90.0)),
+            [fired("hot")],
+            "the count was kept"
+        );
         for bad in [None, Some(f32::NAN), Some(999.0)] {
             assert!(tick(&mut t, 4, bad).is_empty());
         }
-        assert!(t.states()[0].active, "a sensor that goes away does not clear a fire");
+        assert!(
+            t.states()[0].active,
+            "a sensor that goes away does not clear a fire"
+        );
         assert!(t.states()[0].missing);
     }
 
