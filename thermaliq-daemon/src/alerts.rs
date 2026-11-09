@@ -5,13 +5,34 @@
 //! arbiter (`wanted_profile`), never a call to the engine.
 
 use serde_json::{json, Value};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::Duration;
 use thermaliq_common::alert::{AlertTracker, Event, EventKind};
+use thermaliq_common::health::StallTracker;
 use thermaliq_common::{AlertAction, AlertEntry, HardwareSnapshot, Severity};
 
 /// Events kept for `GET /alerts`; the oldest go first.
 pub const LOG_MAX: usize = 100;
+/// A fan-health or dust condition that stays true is notified again after a week.
+pub const CONDITION_REPEAT_SECS: i64 = 7 * 86_400;
+
+/// A fan-health or dust finding (SPEC §7.6): one notify, a weekly repeat, a cleared record.
+/// It never changes control.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Condition {
+    /// `fan-stalled:<fan>`, `fan-health:<fan>` or `dust:<sensor>`.
+    pub key: String,
+    pub message: String,
+    pub severity: Severity,
+    pub sensor: String,
+    pub value: f32,
+}
+
+struct Active {
+    since: i64,
+    last_notified: i64,
+    cond: Condition,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Record {
@@ -24,6 +45,8 @@ pub struct Record {
     pub value: f32,
     /// A `notify` alert that fired or repeated: the tray shows it.
     pub notify: bool,
+    /// Health and dust findings explain themselves; temperature alerts do not need to.
+    pub message: Option<String>,
 }
 
 #[derive(Default)]
@@ -32,6 +55,11 @@ pub struct AlertHub {
     tracker: Option<AlertTracker>,
     log: VecDeque<Record>,
     fired_at: HashMap<String, i64>,
+    conds: BTreeMap<String, Active>,
+    stall: StallTracker,
+    /// Per fan, the 10-point duty buckets it has reported RPM at (history, then live).
+    spun: HashMap<String, HashSet<u8>>,
+    fan_health: HashMap<String, String>,
 }
 
 impl AlertHub {
@@ -44,9 +72,6 @@ impl AlertHub {
 
     /// One fresh tick. `now` is the engine's clock, `unix` the wall clock for the record.
     pub fn step(&mut self, now: Duration, unix: i64, snapshot: &HardwareSnapshot) {
-        let Some(tracker) = self.tracker.as_mut() else {
-            return;
-        };
         let read = |id: &str| {
             snapshot
                 .sensors
@@ -54,7 +79,8 @@ impl AlertHub {
                 .find(|s| s.id == id)
                 .map(|s| s.temp_celsius)
         };
-        for e in tracker.step(now, read) {
+        let events = self.tracker.as_mut().map_or_else(Vec::new, |t| t.step(now, read));
+        for e in events {
             let r = record(unix, &e);
             match e.kind {
                 EventKind::Fired => {
@@ -69,11 +95,117 @@ impl AlertHub {
                 "thermaliq: alert '{}' {}: {} reads {:.1} C",
                 r.id, r.event, r.sensor, r.value
             );
-            if self.log.len() == LOG_MAX {
-                self.log.pop_front();
-            }
-            self.log.push_back(r);
+            self.push(r);
         }
+        self.step_stalls(now, unix, snapshot);
+    }
+
+    fn push(&mut self, r: Record) {
+        if self.log.len() == LOG_MAX {
+            self.log.pop_front();
+        }
+        self.log.push_back(r);
+    }
+
+    /// A fan reading 0 RPM for 30 s at a duty it has spun at is stalled (critical). A fan that
+    /// never spun there is unmonitored, not stalled.
+    fn step_stalls(&mut self, now: Duration, unix: i64, snapshot: &HardwareSnapshot) {
+        let fans: Vec<(String, u32, u8)> = snapshot
+            .fans
+            .iter()
+            .map(|f| (f.id.clone(), f.rpm, f.duty_percent))
+            .collect();
+        for (id, rpm, duty) in &fans {
+            if *rpm > 0 {
+                self.spun.entry(id.clone()).or_default().insert(duty / 10);
+            }
+        }
+        let spun = &self.spun;
+        let stalled = self.stall.step(now, &fans, |id, duty| {
+            let b = duty / 10;
+            spun.get(id)
+                .is_some_and(|s| (b.saturating_sub(1)..=b + 1).any(|x| s.contains(&x)))
+        });
+        let active = stalled
+            .into_iter()
+            .map(|fan| Condition {
+                key: format!("fan-stalled:{fan}"),
+                message: format!("fan '{fan}' reads 0 RPM at a duty it has spun at: it may have stalled"),
+                severity: Severity::Crit,
+                sensor: fan,
+                value: 0.0,
+            })
+            .collect();
+        self.update_conditions("fan-stalled:", unix, active);
+    }
+
+    /// The conditions with this key prefix are now `active`. A new one fires (one notify), a
+    /// standing one repeats after a week, one that ended clears.
+    pub fn update_conditions(&mut self, prefix: &str, unix: i64, active: Vec<Condition>) {
+        for c in &active {
+            match self.conds.get_mut(&c.key) {
+                None => {
+                    self.conds.insert(
+                        c.key.clone(),
+                        Active { since: unix, last_notified: unix, cond: c.clone() },
+                    );
+                    self.condition_record(unix, c, "fired");
+                }
+                Some(a) => {
+                    a.cond = c.clone();
+                    if unix - a.last_notified >= CONDITION_REPEAT_SECS {
+                        a.last_notified = unix;
+                        self.condition_record(unix, c, "repeated");
+                    }
+                }
+            }
+        }
+        let gone: Vec<String> = self
+            .conds
+            .keys()
+            .filter(|k| k.starts_with(prefix) && !active.iter().any(|c| &c.key == *k))
+            .cloned()
+            .collect();
+        for k in gone {
+            if let Some(a) = self.conds.remove(&k) {
+                self.condition_record(unix, &a.cond, "cleared");
+            }
+        }
+    }
+
+    fn condition_record(&mut self, unix: i64, c: &Condition, event: &'static str) {
+        eprintln!("thermaliq: {} {event}: {}", c.key, c.message);
+        self.push(Record {
+            at: unix,
+            id: c.key.clone(),
+            event,
+            severity: c.severity,
+            action: "notify",
+            sensor: c.sensor.clone(),
+            value: c.value,
+            notify: event != "cleared",
+            message: Some(c.message.clone()),
+        });
+    }
+
+    /// History's view of the fans: the duty buckets each has spun at, learned at start and hourly.
+    pub fn set_spun(&mut self, spun: HashMap<String, HashSet<u8>>) {
+        for (fan, buckets) in spun {
+            self.spun.entry(fan).or_default().extend(buckets);
+        }
+    }
+
+    /// `ok`, `declining`, `unmonitored` or `insufficient_history` per fan, from history.
+    pub fn set_fan_health(&mut self, health: HashMap<String, String>) {
+        self.fan_health = health;
+    }
+
+    /// What `/fans` shows: a live stall wins over the history verdict.
+    pub fn fan_health(&self, fan: &str) -> String {
+        if self.conds.contains_key(&format!("fan-stalled:{fan}")) {
+            return "stalled".into();
+        }
+        self.fan_health.get(fan).cloned().unwrap_or_else(|| "unknown".into())
     }
 
     /// The sensor ids the alerts read, for history.
@@ -140,10 +272,21 @@ impl AlertHub {
                 json!({
                     "at": r.at, "id": r.id, "event": r.event, "severity": r.severity,
                     "action": r.action, "sensor": r.sensor, "value": r.value, "notify": r.notify,
+                    "message": r.message,
                 })
             })
             .collect();
-        json!({ "alerts": alerts, "events": events })
+        let conditions: Vec<Value> = self
+            .conds
+            .values()
+            .map(|a| {
+                json!({
+                    "id": a.cond.key, "severity": a.cond.severity, "since": a.since,
+                    "message": a.cond.message,
+                })
+            })
+            .collect();
+        json!({ "alerts": alerts, "conditions": conditions, "events": events })
     }
 }
 
@@ -166,6 +309,7 @@ fn record(unix: i64, e: &Event) -> Record {
         sensor: e.sensor.clone(),
         value: e.value,
         notify: matches!(e.action, AlertAction::Notify) && e.kind != EventKind::Cleared,
+        message: None,
     }
 }
 
@@ -276,6 +420,87 @@ mod tests {
             Some(("cool".into(), "performance".into()))
         );
         assert_eq!(h.describe()["alerts"][1]["state"], "disabled");
+    }
+
+    fn cond(key: &str) -> Condition {
+        Condition {
+            key: key.into(),
+            message: format!("{key} may be failing"),
+            severity: Severity::Warn,
+            sensor: "f".into(),
+            value: 16.0,
+        }
+    }
+
+    /// M16: fan health and dust are conditions: one notify, a weekly repeat, a cleared record.
+    #[test]
+    fn a_condition_is_notified_once_repeated_weekly_and_cleared_when_it_ends() {
+        let mut h = AlertHub::default();
+        let day = 86_400;
+        h.update_conditions("fan-health:", 0, vec![cond("fan-health:f")]);
+        h.update_conditions("fan-health:", day, vec![cond("fan-health:f")]);
+        h.update_conditions("fan-health:", 6 * day, vec![cond("fan-health:f")]);
+        assert_eq!(h.log().len(), 1, "once, not daily");
+        assert_eq!((h.log()[0].event, h.log()[0].notify), ("fired", true));
+        assert_eq!(h.log()[0].message.as_deref(), Some("fan-health:f may be failing"));
+        h.update_conditions("fan-health:", 7 * day, vec![cond("fan-health:f")]);
+        assert_eq!(h.log()[1].event, "repeated");
+        assert_eq!(h.describe()["conditions"][0]["id"], "fan-health:f");
+        // Another prefix's conditions are left alone; the same prefix with none clears it.
+        h.update_conditions("dust:", 8 * day, vec![]);
+        assert_eq!(h.log().len(), 2);
+        h.update_conditions("fan-health:", 8 * day, vec![]);
+        assert_eq!((h.log()[2].event, h.log()[2].notify), ("cleared", false));
+        assert_eq!(h.describe()["conditions"], json!([]));
+    }
+
+    fn fan_tick(h: &mut AlertHub, at: u64, rpm: u32, duty: u8) {
+        let mut s = snap(40.0);
+        s.fans = vec![thermaliq_common::FanReading {
+            id: "f".into(),
+            label: "f".into(),
+            rpm,
+            duty_percent: duty,
+            kind: thermaliq_common::FanKind::Fan,
+        }];
+        h.step(Duration::from_secs(at), 1_000 + at as i64, &s);
+    }
+
+    #[test]
+    fn a_stall_is_critical_after_30_seconds_at_a_duty_the_fan_has_spun_at_and_clears() {
+        let mut h = AlertHub::default();
+        h.set_spun([("f".to_owned(), [6u8].into())].into());
+        fan_tick(&mut h, 0, 0, 60);
+        fan_tick(&mut h, 29, 0, 60);
+        assert!(h.log().is_empty());
+        fan_tick(&mut h, 30, 0, 60);
+        let log = h.log();
+        assert_eq!(log.len(), 1, "{log:?}");
+        assert_eq!((log[0].id.as_str(), log[0].severity, log[0].notify), ("fan-stalled:f", Severity::Crit, true));
+        assert_eq!(h.fan_health("f"), "stalled");
+        fan_tick(&mut h, 31, 900, 60);
+        assert_eq!(h.log()[1].event, "cleared");
+        assert_eq!(h.fan_health("f"), "unknown", "no history verdict was set");
+    }
+
+    #[test]
+    fn a_fan_with_no_history_is_not_stalled_until_it_has_been_seen_spinning() {
+        let mut h = AlertHub::default();
+        fan_tick(&mut h, 0, 0, 60);
+        fan_tick(&mut h, 40, 0, 60);
+        assert!(h.log().is_empty(), "never spun: unmonitored, not stalled");
+        fan_tick(&mut h, 41, 900, 60); // now it has
+        fan_tick(&mut h, 42, 0, 60);
+        fan_tick(&mut h, 80, 0, 60);
+        assert_eq!(h.log().len(), 1);
+    }
+
+    #[test]
+    fn per_fan_health_from_history_is_kept_for_the_fans_list() {
+        let mut h = AlertHub::default();
+        h.set_fan_health([("f".to_owned(), "declining".to_owned())].into());
+        assert_eq!(h.fan_health("f"), "declining");
+        assert_eq!(h.fan_health("other"), "unknown");
     }
 
     #[test]

@@ -899,7 +899,7 @@ mod tests {
         ticked(&r).await;
         let (code, v) = get(&r, "/alerts").await;
         assert_eq!(code, StatusCode::OK);
-        assert_eq!(v, json!({"alerts": [], "events": []}));
+        assert_eq!(v, json!({"alerts": [], "conditions": [], "events": []}));
 
         r.state
             .handle
