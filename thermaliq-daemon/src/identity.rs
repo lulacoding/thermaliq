@@ -220,6 +220,7 @@ impl Identity {
     /// What `GET /identity` answers.
     pub fn describe(&self, snap: &HardwareSnapshot) -> Value {
         let roles = self.roles();
+        let rejected = self.rejected();
         json!({
             "board": self.board,
             "roles": roles.iter().collect::<BTreeMap<_, _>>(),
@@ -234,6 +235,7 @@ impl Identity {
             "fans": snap.fans.iter().map(|f| json!({
                 "id": f.id, "label": f.label, "kind": f.kind, "rpm": f.rpm,
                 "controllable": self.controllable.contains(&f.id),
+                "rejected_writes": rejected.contains(&f.id),
             })).collect::<Vec<_>>(),
             "sensors": snap.sensors.iter()
                 .map(|s| json!({"id": s.id, "label": s.label, "kind": s.kind}))
@@ -288,7 +290,40 @@ impl Identity {
         if snap.fans.is_empty() {
             return Err("the snapshot has no fans; not saving an empty inventory".into());
         }
-        save_inventory(&self.dir, &Inventory::of(snap, self.board.clone()))
+        let mut now = Inventory::of(snap, self.board.clone());
+        if let Ok(Some(saved)) = read_inventory(&self.dir) {
+            now.keep_rejected_from(&saved);
+        }
+        save_inventory(&self.dir, &now)
+    }
+
+    /// Which headers a probe found deaf to writes, so `tq identify` does not run them again.
+    fn rejected(&self) -> Vec<String> {
+        match read_inventory(&self.dir) {
+            Ok(Some(inv)) => inv
+                .fans
+                .into_iter()
+                .filter(|f| f.rejected_writes)
+                .map(|f| f.id)
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Records what a probe found. Without a saved inventory there is nowhere to keep it.
+    fn remember_probe(&self, fan: &str, landed: bool) {
+        let Ok(Some(mut inv)) = read_inventory(&self.dir) else {
+            return;
+        };
+        let Some(f) = inv.fans.iter_mut().find(|f| f.id == fan) else {
+            return;
+        };
+        if f.rejected_writes != !landed {
+            f.rejected_writes = !landed;
+            if let Err(e) = save_inventory(&self.dir, &inv) {
+                eprintln!("thermaliq: could not remember the probe of '{fan}': {e}");
+            }
+        }
     }
 
     /// Holds `fan` at 100% for `probe_for` through the engine (SPEC §5.2). It only raises a fan,
@@ -310,17 +345,21 @@ impl Identity {
         if before.status.latched {
             return Err(ProbeError::Latched);
         }
-        let (handle, fan, hold) = (handle.clone(), fan.to_owned(), self.probe_for);
-        tokio::spawn(async move {
+        let (task_handle, task_fan, hold) = (handle.clone(), fan.to_owned(), self.probe_for);
+        let result = tokio::spawn(async move {
             let _one_at_a_time = one_at_a_time;
-            hold_and_release(&handle, before, &fan, hold).await
+            hold_and_release(&task_handle, before, &task_fan, hold).await
         })
         .await
         .unwrap_or_else(|e| {
             Err(ProbeError::NotRestored(format!(
                 "the probe task failed ({e}); the hold ends by itself within seconds"
             )))
-        })
+        });
+        if let Ok(v) = &result {
+            self.remember_probe(fan, v["landed"] == true);
+        }
+        result
     }
 }
 
@@ -857,6 +896,56 @@ mod tests {
 
         h.heal_writes("f2");
         assert_eq!(id.probe(&d.handle(), "f2").await.unwrap()["landed"], true);
+    }
+
+    fn saved_flag(dir: &Path, fan: &str) -> bool {
+        read_inventory(dir)
+            .unwrap()
+            .unwrap()
+            .fans
+            .iter()
+            .any(|f| f.id == fan && f.rejected_writes)
+    }
+
+    /// M16 (c): a header that rejected writes is remembered, shown, kept by accepting, and not
+    /// a change; a later probe that lands clears it.
+    #[tokio::test]
+    async fn a_probe_that_does_not_land_is_remembered_in_the_inventory() {
+        let dir = dir();
+        let (h, d, _) = running(&["f1", "f2"]);
+        let mut id = Identity::empty(dir.path().to_owned()).with_probe_time(Duration::from_millis(150));
+        id.controllable = vec!["f1".into(), "f2".into()];
+        let snap = d.cache().snapshot;
+        id.check_inventory(&snap);
+
+        h.fail_writes("f2");
+        id.probe(&d.handle(), "f2").await.unwrap();
+        assert!(saved_flag(dir.path(), "f2") && !saved_flag(dir.path(), "f1"));
+        let fans = id.describe(&snap)["fans"].clone();
+        assert_eq!(fans[1]["rejected_writes"], true, "{fans}");
+        assert_eq!(fans[0]["rejected_writes"], false, "{fans}");
+
+        id.accept_inventory(&snap).unwrap();
+        assert!(saved_flag(dir.path(), "f2"), "accepting forgot it");
+        id.check_inventory(&snap);
+        assert_eq!(id.describe(&snap)["inventory"]["new"], json!([]));
+        assert_eq!(id.describe(&snap)["inventory"]["changed"], json!([]));
+
+        h.heal_writes("f2");
+        id.probe(&d.handle(), "f2").await.unwrap();
+        assert!(!saved_flag(dir.path(), "f2"), "a write that landed clears it");
+    }
+
+    #[test]
+    fn an_inventory_file_from_before_rejected_writes_still_loads() {
+        let dir = dir();
+        fs::write(
+            dir.path().join("inventory.json"),
+            r#"{"board":null,"fans":[{"id":"f1","label":"f1","kind":"fan"}]}"#,
+        )
+        .unwrap();
+        assert!(!saved_flag(dir.path(), "f1"));
+        assert_eq!(read_inventory(dir.path()).unwrap().unwrap().fans.len(), 1);
     }
 
     #[tokio::test]

@@ -377,6 +377,9 @@ pub struct InventoryFan {
     pub id: String,
     pub label: String,
     pub kind: FanKind,
+    /// A probe found that the chip ignores writes to this header. Absent in older files: false.
+    #[serde(default)]
+    pub rejected_writes: bool,
 }
 
 /// What `inventory.json` holds: the board and every fan.
@@ -395,10 +398,21 @@ impl Inventory {
                 id: f.id.clone(),
                 label: f.label.clone(),
                 kind: f.kind,
+                rejected_writes: false,
             })
             .collect();
         fans.sort_by(|a, b| a.id.cmp(&b.id));
         Self { board, fans }
+    }
+
+    /// Accepting today's fans must not forget which headers rejected writes.
+    pub fn keep_rejected_from(&mut self, saved: &Inventory) {
+        for f in &mut self.fans {
+            f.rejected_writes = saved
+                .fans
+                .iter()
+                .any(|s| s.id == f.id && s.rejected_writes);
+        }
     }
 }
 
@@ -462,7 +476,7 @@ pub fn diff(saved: &Inventory, now: &Inventory) -> InventoryDiff {
     for f in &now.fans {
         match saved.fans.iter().find(|s| s.id == f.id) {
             None => d.new.push(f.id.clone()),
-            Some(s) if s != f => d.changed.push(f.id.clone()),
+            Some(s) if (&s.label, s.kind) != (&f.label, f.kind) => d.changed.push(f.id.clone()),
             Some(_) => {}
         }
     }
@@ -800,6 +814,20 @@ mod tests {
         let mut now = inv(None, &[("a", "Fan")]);
         now.fans[0].kind = FanKind::Pump;
         assert_eq!(diff(&inv(None, &[("a", "Fan")]), &now).changed, ["a"]);
+    }
+
+    /// M16 (c): a header that rejected writes is remembered in the inventory so `tq identify`
+    /// does not run it again. It is not a hardware change, an old file reads false, and
+    /// accepting today's fans keeps it.
+    #[test]
+    fn rejected_writes_is_remembered_but_is_never_a_change() {
+        let mut saved = inv(None, &[("a", "Fan")]);
+        saved.fans[0].rejected_writes = true;
+        assert!(diff(&saved, &inv(None, &[("a", "Fan")])).is_empty());
+
+        let mut now = inv(None, &[("a", "Fan"), ("b", "Fan 2")]);
+        now.keep_rejected_from(&saved);
+        assert!(now.fans[0].rejected_writes && !now.fans[1].rejected_writes);
     }
 
     fn sensor(id: &str, kind: SensorKind) -> SensorReading {
