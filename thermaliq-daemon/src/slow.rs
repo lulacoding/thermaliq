@@ -583,6 +583,9 @@ fn supervise(s: Supervisor, stopping: &AtomicBool) {
             .and_then(clean_exe);
         let agent_up = cache.status.agent == AgentState::Running && !shared.view().crashed;
         // A target is usable when it exists and the engine would not release a fan for it.
+        // Until the snapshot is steady a missing fan may just not be listed yet (the bridge
+        // starts late), so the target is skipped quietly; `apply_named` waits for it too.
+        let steady = settled.is_settled(now, stable_for);
         let skipped = RefCell::new(Vec::<String>::new());
         let usable = |name: &str| -> bool {
             if name == cache.active_profile {
@@ -600,7 +603,9 @@ fn supervise(s: Supervisor, stopping: &AtomicBool) {
             };
             match why_not_switch(next, active, &cache.snapshot, &ever_seen) {
                 Some(why) => {
-                    skipped.borrow_mut().push(why);
+                    if steady {
+                        skipped.borrow_mut().push(why);
+                    }
                     false
                 }
                 None => true,
@@ -650,7 +655,7 @@ fn supervise(s: Supervisor, stopping: &AtomicBool) {
             handle.arbiter().applied(&selection);
         } else {
             let gate = Gate {
-                stable: settled.is_settled(now, stable_for),
+                stable: steady,
                 ever_seen: &ever_seen,
             };
             match apply_named(&selection.effective, &cache, &profiles, &rt, &handle, &gate) {
@@ -978,6 +983,33 @@ mod tests {
         std::thread::sleep(STABLE / 3);
         assert_eq!(active(&r), "balanced");
         wait_until(|| active(&r) == "gaming");
+    }
+
+    /// M16 (e): after a restart the LHM fans are listed a moment late. Until the snapshot has
+    /// been steady, a missing fan is not a reason to log a refusal.
+    #[test]
+    fn a_fan_not_listed_yet_after_a_restart_is_waited_for_not_logged_as_a_refusal() {
+        let (hal, hide_f2, _) = flaky();
+        hide_f2.store(true, Ordering::SeqCst); // the bridge has not listed f2 yet
+        let r = rig_on(
+            hal,
+            vec![toml2("balanced", &["f1"]), toml2("gaming", &["f1", "f2"])],
+            &[("game.exe", "gaming")],
+        );
+        show(&r, "game.exe");
+        std::thread::sleep(STABLE / 3);
+        let refusals = |r: &Rig| {
+            r.shared
+                .view()
+                .decisions
+                .iter()
+                .filter(|d| d.note.as_deref().is_some_and(|n| n.contains("f2")))
+                .count()
+        };
+        assert_eq!(refusals(&r), 0, "{:?}", r.shared.view().decisions);
+        hide_f2.store(false, Ordering::SeqCst); // it shows up
+        wait_until(|| active(&r) == "gaming");
+        assert_eq!(refusals(&r), 0, "{:?}", r.shared.view().decisions);
     }
 
     fn rig_on(
