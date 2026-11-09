@@ -251,8 +251,9 @@ pub fn run_probe(api: &dyn Api, fan: &str, out: &mut dyn Write) -> Result<(), Cl
         .find(|f| f["id"] == fan)
         .and_then(|f| f["label"].as_str())
         .unwrap_or(fan);
-    let _ = writeln!(out, "Running '{label}' ({fan}) at 100% for 5 s...");
+    let _ = writeln!(out, "Asking the daemon to run '{label}' ({fan})...");
     let r = api.probe(fan)?;
+    let _ = writeln!(out, "  it ran at 100% for 5 s");
     let landed = if r["landed"] == true {
         format!("the write landed (the chip reads {})", chip(&r))
     } else {
@@ -552,5 +553,19 @@ mod tests {
             .unwrap_err()
             .msg
             .contains("safety latch"));
+    }
+
+    /// M16 (d): nothing may say a fan runs at 100% before the daemon has accepted the probe.
+    #[test]
+    fn a_refused_probe_never_says_a_fan_ran_at_100() {
+        let mut api = pc();
+        api.probe_error = Some("401 unauthorized".into());
+        let mut out = Vec::new();
+        run_probe(&api, "h1", &mut out).unwrap_err();
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains("100%"), "{out}");
+        assert!(out.contains("Asking the daemon to run"), "{out}");
+        api.probe_error = None;
+        assert!(probe_out(&api, "h1").unwrap().contains("100% for 5 s"));
     }
 }
