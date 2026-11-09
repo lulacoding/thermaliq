@@ -646,7 +646,9 @@ fn supervise(s: Supervisor, stopping: &AtomicBool) {
                 last_note = Some(why);
             }
         }
-        if selection.effective != cache.active_profile {
+        if selection.effective == cache.active_profile {
+            handle.arbiter().applied(&selection);
+        } else {
             let gate = Gate {
                 stable: settled.is_settled(now, stable_for),
                 ever_seen: &ever_seen,
@@ -654,6 +656,7 @@ fn supervise(s: Supervisor, stopping: &AtomicBool) {
             match apply_named(&selection.effective, &cache, &profiles, &rt, &handle, &gate) {
                 Ok(changed) => {
                     last_note = None;
+                    handle.arbiter().applied(&selection);
                     if changed && selection.source == ProfileSource::Agent {
                         handle.arbiter().agent_applied(now);
                         let profile = selection.effective.clone();

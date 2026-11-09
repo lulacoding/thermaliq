@@ -275,6 +275,7 @@ impl Handle {
     pub async fn pause_agent(&self) -> Result<(), CommandError> {
         self.agent_alive()?;
         self.flags.paused.store(true, Ordering::SeqCst);
+        self.arbiter().invalidate_agent(); // the paused intent is gone before the next tick
         self.ask(Cmd::WithdrawAgent).await.map(drop)
     }
 
@@ -320,6 +321,9 @@ impl Handle {
         };
         if selection.effective == profile.name && self.cache().active_profile != profile.name {
             self.apply_profile(profile).await?;
+        }
+        if selection.effective == self.cache().active_profile {
+            self.arbiter().applied(&selection);
         }
         Ok(selection)
     }

@@ -102,7 +102,7 @@ impl Arbiter {
         }
     }
 
-    /// The most recent selection, for `/status`.
+    /// The selection the engine last applied, for `/status`.
     pub fn last(&self) -> Option<&Selection> {
         self.last.as_ref()
     }
@@ -221,6 +221,11 @@ impl Arbiter {
         won(&self.chosen, ProfileSource::Fallback, None)
     }
 
+    /// The engine now runs `s`: only this is what `/status` may report as the profile's source.
+    pub fn applied(&mut self, s: &Selection) {
+        self.last = Some(s.clone());
+    }
+
     /// The profile that wins now. A different winner starts a new profile generation.
     pub fn select(&mut self, now: Duration, usable: Usable) -> Selection {
         let s = self.pick(now, usable);
@@ -228,7 +233,6 @@ impl Arbiter {
             self.winner = Some(s.effective.clone());
             self.gens.profile += 1;
         }
-        self.last = Some(s.clone());
         s
     }
 }
@@ -356,6 +360,22 @@ mod tests {
             ("gaming", ProfileSource::App, Some("cs2")),
             "the intent is live, and the app rule still wins"
         );
+    }
+
+    #[test]
+    fn a_pending_pick_is_not_reported_until_the_engine_applied_it() {
+        let (mut a, _) = arb(RULES);
+        a.set_foreground(Some("cs2.exe"));
+        let app = a.select(secs(0), &ALL);
+        assert_eq!(a.last(), None, "nothing is reported before it is applied");
+        a.applied(&app);
+        a.set_foreground(Some("notepad.exe"));
+        assert_eq!(offer(&mut a, 1, "performance"), Offer::Activated);
+        let pending = a.select(secs(1), &ALL);
+        assert_eq!(pending.source, ProfileSource::Agent);
+        assert_eq!(a.last(), Some(&app), "the agent's pick is only pending");
+        a.applied(&pending);
+        assert_eq!(a.last(), Some(&pending));
     }
 
     #[test]
