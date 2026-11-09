@@ -158,12 +158,46 @@ pub fn run(api: &dyn Api, input: &mut dyn BufRead, out: &mut dyn Write) -> Resul
     // A header can exist as a channel with no header behind it: the chip then ignores writes.
     // Each new candidate runs at 100% once (raise-only, agent paused by the daemon); one whose
     // write does not land is not worth controlling.
+    let leave_out = |roles: &mut BTreeMap<String, Role>, id: &str| {
+        if let Some(Role::Many(m)) = roles.get_mut(CASE_FANS) {
+            m.retain(|i| i != id);
+        }
+    };
+    // A header that rejected writes in an earlier check is not run again (`--probe` still can).
+    let (rejected, candidates): (Vec<_>, Vec<_>) = candidates.into_iter().partition(|id| {
+        v["fans"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|f| f["id"] == id.as_str() && f["rejected_writes"] == true)
+    });
+    for id in &rejected {
+        t.say(&format!(
+            "  {}: rejected writes in an earlier check: left out (`tq identify --probe {id}` runs it again)",
+            label_of(&v, id)
+        ));
+        leave_out(&mut roles, id);
+    }
+    let mut candidates = candidates;
     if !candidates.is_empty() {
         t.say(&format!(
-            "\nChecking {} case fan{}: each runs at 100% for 5 s, one at a time.",
+            "\n{} case fan{} to check: each runs at 100% for 5 s, one at a time.",
             candidates.len(),
             if candidates.len() == 1 { "" } else { "s" }
         ));
+        match t.ask("Run them now? [Y/n]") {
+            None => {
+                t.say("Nothing was saved.");
+                return Ok(());
+            }
+            Some(a) if a.starts_with('n') => {
+                t.say("Not checked, so left out. Run `tq identify` again to check them.");
+                for id in candidates.drain(..) {
+                    leave_out(&mut roles, &id);
+                }
+            }
+            Some(_) => {}
+        }
     }
     for id in candidates {
         let label = label_of(&v, &id);
@@ -361,7 +395,7 @@ mod tests {
     #[test]
     fn it_shows_the_proposals_with_the_case_fans_list_and_enter_saves_them() {
         let api = pc();
-        let out = go(&api, "\n");
+        let out = go(&api, "\n\n");
         let saved = api.saved.borrow().clone().unwrap();
         assert_eq!(
             saved,
@@ -392,7 +426,7 @@ mod tests {
     #[test]
     fn each_new_case_fans_candidate_is_probed_once_and_never_a_pump_or_another_role() {
         let api = pc();
-        let out = go(&api, "\n");
+        let out = go(&api, "\n\n");
         assert_eq!(*api.probed.borrow(), ["h1", "h2"]);
         assert!(
             out.contains("100% for 5 s"),
@@ -407,7 +441,7 @@ mod tests {
     fn a_candidate_that_rejects_writes_is_left_out_and_listed_with_the_chip_duty() {
         let mut api = pc();
         rejects(&mut api, "h2", 50);
-        let out = go(&api, "\n");
+        let out = go(&api, "\n\n");
         assert!(
             out.contains("System Fan #2 rejects writes (chip stays at 50%): left out"),
             "{out}"
@@ -423,7 +457,7 @@ mod tests {
         let mut api = pc();
         rejects(&mut api, "h1", 50);
         rejects(&mut api, "h2", 50);
-        go(&api, "\n");
+        go(&api, "\n\n");
         let saved = api.saved.borrow().clone().unwrap();
         assert!(saved.get("case_fans").is_none(), "{saved}");
         assert_eq!(saved["cpu_fan"], "h0");
@@ -436,7 +470,7 @@ mod tests {
             "h1".into(),
             Err("the safety latch holds every fan at 100%".into()),
         );
-        let out = go(&api, "\n");
+        let out = go(&api, "\n\n");
         assert!(
             out.contains("System Fan #1 could not be checked (the safety latch holds every fan at 100%): left out"),
             "{out}"
@@ -451,12 +485,12 @@ mod tests {
     fn y_and_a_bare_enter_save_and_n_q_or_the_end_of_input_save_nothing() {
         for yes in ["\n", "y\n", "Y\n"] {
             let api = pc();
-            go(&api, yes);
+            go(&api, &format!("\n{yes}")); // the first line answers "Run them now?"
             assert!(api.saved.borrow().is_some(), "{yes:?}");
         }
         for no in ["n\n", "q\n", ""] {
             let api = pc();
-            go(&api, no);
+            go(&api, &format!("\n{no}"));
             assert!(api.saved.borrow().is_none(), "{no:?}");
             assert_eq!(*api.accepted.borrow(), 0, "{no:?}");
         }
@@ -471,7 +505,7 @@ mod tests {
             proposal("case_fans", "h2", "a fan header"),
             proposal("case_fans", "h3", "a fan header"),
         ]);
-        go(&api, "\n");
+        go(&api, "\n\n");
         let saved = api.saved.borrow().clone().unwrap();
         assert_eq!(saved["cpu_fan"], "h1");
         assert_eq!(saved["case_fans"], json!(["h2", "h3"]));
@@ -553,6 +587,67 @@ mod tests {
             .unwrap_err()
             .msg
             .contains("safety latch"));
+    }
+
+    /// M16 (c): no fan moves before the user has agreed once, and a header that rejected writes
+    /// before is not run again.
+    #[test]
+    fn it_asks_once_before_any_fan_runs_and_n_leaves_the_candidates_out() {
+        let api = pc();
+        let out = go(&api, "n\n\n");
+        assert!(api.probed.borrow().is_empty(), "{out}");
+        assert!(out.contains("Run them now? [Y/n]"), "{out}");
+        assert_eq!(
+            out.matches("[Y/n]").count(),
+            2,
+            "one for the probe, one to save"
+        );
+        let saved = api.saved.borrow().clone().unwrap();
+        assert!(
+            saved.get("case_fans").is_none(),
+            "unchecked fans are not saved: {saved}"
+        );
+        assert_eq!(saved["cpu_fan"], "h0");
+    }
+
+    #[test]
+    fn q_or_the_end_of_input_at_the_probe_question_stops_before_anything_runs() {
+        for stop in ["q\n", ""] {
+            let api = pc();
+            let out = go(&api, stop);
+            assert!(
+                api.probed.borrow().is_empty() && api.saved.borrow().is_none(),
+                "{out}"
+            );
+            assert!(out.contains("Nothing was saved"), "{out}");
+        }
+    }
+
+    #[test]
+    fn a_header_that_rejected_writes_before_is_not_probed_again() {
+        let mut api = pc();
+        api.identity["fans"][3]["rejected_writes"] = json!(true); // h2
+        let out = go(&api, "\n\n");
+        assert_eq!(*api.probed.borrow(), ["h1"], "{out}");
+        assert!(
+            out.contains("System Fan #2") && out.contains("--probe h2"),
+            "{out}"
+        );
+        assert_eq!(
+            api.saved.borrow().clone().unwrap()["case_fans"],
+            json!(["h1"])
+        );
+
+        // With nothing left to run there is nothing to ask.
+        let mut api = pc();
+        api.identity["fans"][2]["rejected_writes"] = json!(true);
+        api.identity["fans"][3]["rejected_writes"] = json!(true);
+        let out = go(&api, "\n");
+        assert!(
+            api.probed.borrow().is_empty() && !out.contains("Run them now"),
+            "{out}"
+        );
+        assert!(api.saved.borrow().is_some(), "{out}");
     }
 
     /// M16 (d): nothing may say a fan runs at 100% before the daemon has accepted the probe.

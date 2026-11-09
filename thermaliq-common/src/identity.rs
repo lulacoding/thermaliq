@@ -408,10 +408,7 @@ impl Inventory {
     /// Accepting today's fans must not forget which headers rejected writes.
     pub fn keep_rejected_from(&mut self, saved: &Inventory) {
         for f in &mut self.fans {
-            f.rejected_writes = saved
-                .fans
-                .iter()
-                .any(|s| s.id == f.id && s.rejected_writes);
+            f.rejected_writes = saved.fans.iter().any(|s| s.id == f.id && s.rejected_writes);
         }
     }
 }
@@ -577,7 +574,9 @@ pub fn pair(probed: &str, before: &[(String, u32)], during: &[(String, u32)]) ->
         .iter()
         .map(|(id, _)| (id, rise(id)))
         // At least RPM_RISE and RPM_RISE_PCT of where the fan was: drift is not a pairing.
-        .filter(|(id, r)| *r >= RPM_RISE && u64::from(*r) * 100 >= u64::from(was(id)) * RPM_RISE_PCT)
+        .filter(|(id, r)| {
+            *r >= RPM_RISE && u64::from(*r) * 100 >= u64::from(was(id)) * RPM_RISE_PCT
+        })
         .max_by_key(|(id, r)| (*r, *id == probed));
     match best {
         None => Pairing::None,
@@ -928,10 +927,7 @@ mod tests {
         assert_eq!(pair("hdr", &before, &drift), Pairing::None);
         // 16% of 1000 is 160 RPM: both limits met.
         let rose = rpms(&[("hdr", 0), ("gpu", 2000), ("small", 1160)]);
-        assert_eq!(
-            pair("hdr", &before, &rose),
-            Pairing::Other("small".into())
-        );
+        assert_eq!(pair("hdr", &before, &rose), Pairing::Other("small".into()));
         // The check's real numbers: 1123 -> 1186.
         let real = rpms(&[("hdr", 0), ("gpu", 1186)]);
         assert_eq!(

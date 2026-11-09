@@ -913,7 +913,8 @@ mod tests {
     async fn a_probe_that_does_not_land_is_remembered_in_the_inventory() {
         let dir = dir();
         let (h, d, _) = running(&["f1", "f2"]);
-        let mut id = Identity::empty(dir.path().to_owned()).with_probe_time(Duration::from_millis(150));
+        let mut id =
+            Identity::empty(dir.path().to_owned()).with_probe_time(Duration::from_millis(150));
         id.controllable = vec!["f1".into(), "f2".into()];
         let snap = d.cache().snapshot;
         id.check_inventory(&snap);
@@ -933,7 +934,10 @@ mod tests {
 
         h.heal_writes("f2");
         id.probe(&d.handle(), "f2").await.unwrap();
-        assert!(!saved_flag(dir.path(), "f2"), "a write that landed clears it");
+        assert!(
+            !saved_flag(dir.path(), "f2"),
+            "a write that landed clears it"
+        );
     }
 
     #[test]
