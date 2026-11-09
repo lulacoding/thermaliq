@@ -611,8 +611,10 @@ fn supervise(s: Supervisor, stopping: &AtomicBool) {
                 None => true,
             }
         };
+        let alert_wanted = handle.alert_profile();
         let selection = {
             let mut a = handle.arbiter();
+            a.set_alert(alert_wanted);
             if a.generations().config != config_gen {
                 config_gen = a.generations().config;
                 accepted.clear();
@@ -1169,6 +1171,37 @@ mod tests {
             "second exe lost ownership because its desired profile was already active"
         );
     }
+    /// M16: an active `apply_profile` alert wins over the user's choice and an app rule.
+    #[test]
+    fn an_active_alert_puts_its_profile_in_place_through_the_engine() {
+        let hot = Tick::Temps(vec![("cpu".into(), SensorKind::Cpu, 90.0)]);
+        let hal = Arc::new(MockHardwareLayer::new(&["f1"], vec![hot]));
+        let cfg = cfg(&rule("game.exe", "gaming"));
+        let r = rig_on_with_config(
+            hal,
+            vec![toml("balanced", "f1"), toml("gaming", "f1"), toml("performance", "f1")],
+            &[],
+            cfg,
+        );
+        show(&r, "game.exe");
+        wait_until(|| active(&r) == "gaming");
+        r.daemon.handle().configure_alerts(vec![thermaliq_common::AlertEntry {
+            id: "hot".into(),
+            enabled: true,
+            sensor: "cpu".into(),
+            threshold: 85.0,
+            severity: thermaliq_common::Severity::Crit,
+            action: thermaliq_common::AlertAction::ApplyProfile {
+                profile: "performance".into(),
+            },
+        }]);
+        wait_until(|| active(&r) == "performance");
+        assert_eq!(source(&r), Some(ProfileSource::Alert));
+        let sel = r.daemon.handle().cache().selection.unwrap();
+        assert_eq!(sel.rule_id.as_deref(), Some("hot"));
+        assert_eq!(sel.chosen, "balanced", "the user's choice is untouched");
+    }
+
     #[test]
     fn a_cached_exe_switches_the_profile_by_the_rule_through_the_engine() {
         let r = rig(
