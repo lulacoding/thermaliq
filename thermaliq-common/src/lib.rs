@@ -3,6 +3,7 @@
 //! Parsing is strict: unknown fields and unknown curve types are errors, so
 //! out-of-scope features (SPEC §2) cannot be configured by accident.
 
+pub mod alert;
 mod config;
 pub mod datadir;
 pub mod identity;
