@@ -367,7 +367,10 @@ async fn hold_and_release(
         .map(|f| f.label.clone());
     // What the engine last wrote to the fan and the chip accepted. A header that rejects writes
     // (a channel with no header behind it, say) never gets there, whatever the engine asked.
-    let landed = during.fan_info.get(fan).and_then(|i| i.commanded) == Some(100);
+    let landed = during
+        .fan_info
+        .get(fan)
+        .is_some_and(|i| i.commanded == Some(100) && !i.write_failing);
     let duty_after = during
         .snapshot
         .fans
@@ -837,6 +840,23 @@ mod tests {
             bad["duty_after"].is_u64(),
             "the chip's own reading is reported: {bad}"
         );
+    }
+
+    /// M16 (a): the engine's last accepted duty is 100 from an earlier hold. A write that fails
+    /// now must not read as landed.
+    #[tokio::test]
+    async fn a_stale_commanded_100_does_not_hide_a_write_that_now_fails() {
+        let (h, d, _) = running(&["f1", "f2"]);
+        let id = identity_for(&["f1", "f2"]);
+        assert_eq!(id.probe(&d.handle(), "f2").await.unwrap()["landed"], true);
+        assert_eq!(d.handle().cache().fan_info["f2"].commanded, Some(100));
+
+        h.fail_writes("f2");
+        let bad = id.probe(&d.handle(), "f2").await.unwrap();
+        assert_eq!(bad["landed"], false, "{bad}");
+
+        h.heal_writes("f2");
+        assert_eq!(id.probe(&d.handle(), "f2").await.unwrap()["landed"], true);
     }
 
     #[tokio::test]

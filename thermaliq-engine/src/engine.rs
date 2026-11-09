@@ -376,6 +376,12 @@ impl Engine {
         self.written.get(fan).copied()
     }
 
+    /// True when the fan's latest write failed. `written` keeps the last accepted duty, so on its
+    /// own it can't tell a fan that took 100 just now from one that took it last week.
+    pub fn write_failing(&self, fan: &str) -> bool {
+        self.write_fails.contains_key(fan)
+    }
+
     /// Drops one source's requests on every fan: pause and agent crash withdraw `Source::Agent`.
     pub fn withdraw_all(&mut self, source: Source) {
         for f in &mut self.fans {

@@ -419,6 +419,8 @@ pub struct FanInfo {
     pub curve: Option<u8>,
     pub agent: Option<u8>,
     pub commanded: Option<u8>,
+    /// The latest write to this fan failed, so `commanded` is an older duty.
+    pub write_failing: bool,
 }
 
 type HistoryTick = (i64, Vec<SensorReading>, Vec<FanReading>, Vec<MetricReading>);
@@ -610,6 +612,7 @@ impl Daemon {
                                     curve: engine.curve_output(&f.id),
                                     agent: engine.agent_request(&f.id),
                                     commanded: engine.written(&f.id),
+                                    write_failing: engine.write_failing(&f.id),
                                 };
                                 (f.id.clone(), info)
                             })
