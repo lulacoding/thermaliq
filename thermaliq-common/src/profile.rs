@@ -19,8 +19,6 @@ pub struct Profile {
     pub controls: Vec<Control>,
     #[serde(default)]
     pub alerts: Vec<Alert>,
-    #[serde(default)]
-    pub app_rules: Vec<AppRule>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -173,17 +171,14 @@ pub struct Alert {
     pub action: AlertAction,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AppRule {
-    /// Case-insensitive substring of the process name.
-    pub process: String,
-    pub profile: String,
-}
-
 impl Profile {
     /// Parse and validate. Every error names the offending item.
     pub fn from_toml(s: &str) -> Result<Self, Error> {
+        if let Ok(t) = s.parse::<toml::Table>() {
+            if t.contains_key("app_rules") {
+                return invalid("app_rules moved to config.toml [[app_rule]]".into());
+            }
+        }
         let p: Self = toml::from_str(s)?;
         p.validate()?;
         Ok(p)
@@ -294,17 +289,6 @@ impl Profile {
                 return invalid(format!(
                     "alert on `{}`: apply_profile needs a profile name",
                     a.sensor
-                ));
-            }
-        }
-        for r in &self.app_rules {
-            if r.process.is_empty() {
-                return invalid("app rule: process must not be empty".into());
-            }
-            if r.profile.is_empty() {
-                return invalid(format!(
-                    "app rule `{}`: profile must not be empty",
-                    r.process
                 ));
             }
         }

@@ -245,6 +245,9 @@ fn status_json(c: &Cache) -> Value {
         "unavailable_sources": c.status.unavailable_sources,
         "snapshot_age": c.snapshot_age,
         "active_profile": c.active_profile,
+        "chosen_profile": c.selection.as_ref().map(|s| s.chosen.as_str()),
+        "profile_source": c.selection.as_ref().map(|s| s.source.as_str()),
+        "profile_rule_id": c.selection.as_ref().and_then(|s| s.rule_id.as_deref()),
         "ticks": c.ticks,
         "agent": c.status.agent.as_str(),
     })
@@ -324,8 +327,29 @@ async fn set_active_profile(State(s): State<ApiState>, Json(b): Json<ProfileName
         .iter()
         .find(|p| p.name == b.name)
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no profile '{}'", b.name)))?;
-    s.handle.set_profile(profile.clone()).await?;
-    Ok(Json(json!({"active_profile": b.name})))
+    // The choice is the user's fallback: it is applied only if nothing higher wins, and saved as
+    // `default_profile` either way.
+    let _one_at_a_time = s.config_lock.lock().await;
+    let selection = s.handle.choose_profile(profile.clone()).await?;
+    let (dir, name) = (s.dir.clone(), b.name);
+    tokio::task::spawn_blocking(move || {
+        let mut cfg = load_config(&dir)?;
+        cfg.default_profile = name;
+        save_config(&dir, &cfg)
+    })
+    .await
+    .map_err(internal)?
+    .map_err(|e| {
+        internal(io::Error::other(format!(
+            "chosen for this run, but config.toml could not be saved: {e}"
+        )))
+    })?;
+    Ok(Json(json!({
+        "chosen": selection.chosen,
+        "effective": selection.effective,
+        "source": selection.source.as_str(),
+        "rule_id": selection.rule_id,
+    })))
 }
 
 #[derive(Deserialize)]
@@ -335,7 +359,7 @@ struct ProbeBody {
 
 /// Holds one fan at 100% for 5 s and says which tach rose (SPEC §5.2). Answers after the probe.
 async fn identify_probe(State(s): State<ApiState>, Json(b): Json<ProbeBody>) -> ApiResult {
-    match s.identity.probe(&s.handle, &s.profiles, &b.fan).await {
+    match s.identity.probe(&s.handle, &b.fan).await {
         Ok(v) => Ok(Json(v)),
         Err(ProbeError::UnknownFan(f)) => Err(ApiError(
             StatusCode::NOT_FOUND,
@@ -507,6 +531,32 @@ async fn put_config(State(s): State<ApiState>, Json(cfg): Json<DaemonConfig>) ->
             cfg.default_profile
         );
         return Err(ApiError(StatusCode::BAD_REQUEST, m));
+    }
+    if let Some(entry) = cfg
+        .schedule
+        .iter()
+        .find(|entry| !s.profiles.iter().any(|p| p.name == entry.profile))
+    {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "schedule profile '{}' is not a known profile",
+                entry.profile
+            ),
+        ));
+    }
+    if let Some(rule) = cfg
+        .app_rule
+        .iter()
+        .find(|rule| !s.profiles.iter().any(|p| p.name == rule.profile))
+    {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "app_rule '{}' selects unknown profile '{}'",
+                rule.id, rule.profile
+            ),
+        ));
     }
     let _one_at_a_time = s.config_lock.lock().await;
     let dir = s.dir.clone();
@@ -1262,6 +1312,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn choosing_a_profile_reports_both_and_persists_it_as_the_fallback() {
+        let r = rig(vec![at(40.0)]);
+        let (code, v) = call(
+            &r,
+            "POST",
+            "/profiles/active",
+            Some(TOKEN),
+            Some(json!({"name": "sixty"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(
+            v,
+            json!({"chosen": "sixty", "effective": "sixty", "source": "fallback", "rule_id": null})
+        );
+        let saved = load_config(r.dir.path()).unwrap();
+        assert_eq!(saved.default_profile, "sixty", "survives a restart");
+        let s = get(&r, "/status").await.1;
+        assert_eq!(s["chosen_profile"], "sixty");
+        assert_eq!(s["profile_source"], "fallback");
+        assert_eq!(s["profile_rule_id"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn a_manual_choice_never_preempts_a_live_app_rule_and_says_so() {
+        let r = rig(vec![at(40.0)]);
+        let cfg = DaemonConfig::from_toml(
+            "default_profile='flat'\n[[app_rule]]\nid='r1'\nexe='x.exe'\nprofile='sixty'\n",
+        )
+        .unwrap();
+        r.state.handle.configure_selection(&cfg);
+        r.state.handle.arbiter().set_foreground(Some("x.exe"));
+        let (code, v) = call(
+            &r,
+            "POST",
+            "/profiles/active",
+            Some(TOKEN),
+            Some(json!({"name": "flat"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(
+            v,
+            json!({"chosen": "flat", "effective": "sixty", "source": "app", "rule_id": "r1"})
+        );
+        assert_eq!(load_config(r.dir.path()).unwrap().default_profile, "flat");
+    }
+
+    #[tokio::test]
     async fn switching_to_an_unknown_profile_is_404_and_changes_nothing() {
         let r = rig(vec![at(40.0)]);
         let (code, _) = call(
@@ -1445,6 +1544,9 @@ mod tests {
             json!({"api_port": 0, "default_profile": "flat"}),
             json!({"default_profile": ""}),
             json!({"default_profile": "no-such-profile"}),
+            json!({"default_profile": "flat", "schedule": [{"id": "s", "time": "09:00-17:00", "profile": "no-such-profile"}]}),
+            json!({"default_profile": "flat", "app_rule": [{"id": "r", "exe": "a.exe", "profile": "no-such-profile"}]}),
+            json!({"default_profile": "flat", "app_rule": [{"id": "r", "exe": "a.exe", "profile": "flat"}, {"id": "r", "exe": "b.exe", "profile": "flat"}]}),
         ] {
             let (code, _) = call(&r, "PUT", "/config", Some(TOKEN), Some(bad)).await;
             assert_eq!(code, StatusCode::BAD_REQUEST);

@@ -73,12 +73,15 @@ impl FanControl {
     }
 
     /// Everything except the profile's own request, for carrying across a profile switch.
+    /// A fast Agent request belongs to the old profile, so it is dropped, not carried.
     pub(crate) fn take_requests(&mut self) -> Vec<Request> {
-        let (keep, take) = std::mem::take(&mut self.requests)
+        let (keep, take): (Vec<_>, Vec<_>) = std::mem::take(&mut self.requests)
             .into_iter()
             .partition(|r| r.source == Source::Profile);
         self.requests = keep;
-        take
+        take.into_iter()
+            .filter(|r| r.source != Source::Agent)
+            .collect()
     }
 
     pub(crate) fn put_requests(&mut self, requests: Vec<Request>) {

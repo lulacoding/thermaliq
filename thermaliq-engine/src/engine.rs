@@ -124,6 +124,8 @@ pub struct Engine {
     fans: Vec<Fan>,
     controllable: HashSet<String>,
     touched: BTreeSet<String>,
+    /// Fans dropped by a profile switch while the emergency latch owns them.
+    deferred_restore: BTreeSet<String>,
     latch: Latch,
     snapshot_fails: u8,
     /// Last duty each fan accepted, to seed ramping across a profile switch.
@@ -134,6 +136,15 @@ pub struct Engine {
     pumps: HashSet<String>,
     /// Consecutive failed `set_fan_duty` calls per fan, with the last error.
     write_fails: HashMap<String, (u32, String)>,
+    /// Expiring holds at 100% (SPEC §4 calibration tier), one per fan, owned by their id.
+    probes: Vec<Probe>,
+    next_probe: u64,
+}
+
+struct Probe {
+    id: u64,
+    fan: String,
+    until: Duration,
 }
 
 impl Engine {
@@ -145,12 +156,61 @@ impl Engine {
             controllable: hal.capabilities().controllable_fans.into_iter().collect(),
             hal,
             touched: BTreeSet::new(),
+            deferred_restore: BTreeSet::new(),
             latch: Latch::default(),
             snapshot_fails: 0,
             written: HashMap::new(),
             last: None,
             pumps: HashSet::new(),
             write_fails: HashMap::new(),
+            probes: Vec::new(),
+            next_probe: 0,
+        }
+    }
+
+    /// Holds a controllable fan at 100% until `until`, with no ramp, whatever the profile says.
+    /// It is a request of its own, not a profile: a profile switch leaves it alone, and it works
+    /// for a fan the active profile does not control. Refused on a fan with a live override: the
+    /// user's override is never replaced. The id is the only way to end it early.
+    pub fn start_probe(&mut self, fan: &str, until: Duration) -> Result<u64, String> {
+        if !self.controllable.contains(fan) {
+            return Err(format!("fan '{fan}' is not controllable"));
+        }
+        if self
+            .fans
+            .iter()
+            .any(|f| f.id == fan && f.ctl.request(Source::Override).is_some())
+        {
+            return Err(format!("fan has a live override: '{fan}'"));
+        }
+        if self.probes.iter().any(|p| p.fan == fan) {
+            return Err(format!("fan '{fan}' is already being probed"));
+        }
+        self.next_probe += 1;
+        self.probes.push(Probe {
+            id: self.next_probe,
+            fan: fan.to_owned(),
+            until,
+        });
+        Ok(self.next_probe)
+    }
+
+    /// Ends the probe with this id; any other request on the fan is untouched. `false`: it was
+    /// not there (expired, or someone else's id).
+    pub fn end_probe(&mut self, fan: &str, id: u64) -> bool {
+        let Some(i) = self.probes.iter().position(|p| p.id == id && p.fan == fan) else {
+            return false;
+        };
+        let p = self.probes.remove(i);
+        self.release_probed(&p.fan);
+        true
+    }
+
+    /// A probed fan the profile does not control goes back to the BIOS (S5); one it controls
+    /// simply resumes.
+    fn release_probed(&mut self, fan: &str) {
+        if !self.fans.iter().any(|f| f.id == fan) && self.touched.remove(fan) {
+            let _ = self.hal.restore_auto(fan);
         }
     }
 
@@ -191,6 +251,17 @@ impl Engine {
         if !missing.is_empty() {
             return Err(missing_message(&profile.name, &missing));
         }
+        // A live override owns its fan: a profile may not drop it. (A probe does not need the
+        // fan in any profile, so it never blocks a switch.)
+        if let Some(f) = self.fans.iter().find(|f| {
+            f.ctl.request(Source::Override).is_some()
+                && !profile.controls.iter().any(|c| c.fan == f.id)
+        }) {
+            return Err(format!(
+                "fan '{}' has a live override, so profile '{}' cannot drop it",
+                f.id, profile.name
+            ));
+        }
         match profile
             .controls
             .iter()
@@ -216,6 +287,8 @@ impl Engine {
             .iter()
             .map(|c| {
                 let mut fan = Fan::new(c);
+                // The winning profile controls this fan again, so no hand-back at release.
+                self.deferred_restore.remove(&c.fan);
                 if let Some(i) = old.iter().position(|o| o.id == c.fan) {
                     let mut o = old.swap_remove(i);
                     fan.ctl.put_requests(o.ctl.take_requests());
@@ -231,7 +304,9 @@ impl Engine {
         for gone in old {
             self.written.remove(&gone.id);
             self.write_fails.remove(&gone.id);
-            if self.touched.remove(&gone.id) {
+            if self.latch.on && self.touched.contains(&gone.id) {
+                self.deferred_restore.insert(gone.id);
+            } else if self.touched.remove(&gone.id) {
                 let _ = self.hal.restore_auto(&gone.id);
             }
         }
@@ -364,12 +439,26 @@ impl Engine {
             self.all_full();
             return;
         }
+        for fan in std::mem::take(&mut self.deferred_restore) {
+            self.touched.remove(&fan);
+            let _ = self.hal.restore_auto(&fan);
+        }
         let real: Temps = snap
             .sensors
             .iter()
             .map(|s| (s.id.clone(), s.temp_celsius))
             .collect();
         let temps = self.sensors.evaluate(&real, now);
+        for gone in self
+            .probes
+            .iter()
+            .filter(|p| now >= p.until)
+            .map(|p| p.fan.clone())
+            .collect::<Vec<_>>()
+        {
+            self.probes.retain(|p| p.fan != gone);
+            self.release_probed(&gone);
+        }
         for i in 0..self.fans.len() {
             let f = &mut self.fans[i];
             let duty = self.curves.duty(&f.curve, &temps, now);
@@ -389,7 +478,8 @@ impl Engine {
                     Some(d) => {
                         // Profile never needs an expiry, so submit cannot fail.
                         let _ = f.ctl.submit(Source::Profile, d, None);
-                        // SPEC §7.2: the engine itself keeps an agent within 15 points of the curve.
+                        // SPEC §7.2: the engine itself keeps an agent within 15 points of the
+                        // winning profile's curve (the control's min_pwm applies after).
                         f.ctl.floor_agent(d.saturating_sub(AGENT_MAX_LOWER_PCT));
                     }
                     None => {
@@ -402,8 +492,19 @@ impl Engine {
             };
             if let Some(d) = out {
                 let id = f.id.clone();
-                self.write(&id, d);
+                if !self.probes.iter().any(|p| p.fan == id) {
+                    self.write(&id, d);
+                }
             }
+        }
+        for i in 0..self.probes.len() {
+            let fan = self.probes[i].fan.clone();
+            if let Some(f) = self.fans.iter_mut().find(|f| f.id == fan) {
+                // The hardware is at 100: the profile ramps down from there when the probe ends.
+                f.ctl.seed(100, true);
+                f.seeded = true;
+            }
+            self.write(&fan, 100);
         }
     }
 
@@ -996,6 +1097,141 @@ mod profile_switch_tests {
         Duration::from_secs(n)
     }
 
+    fn at(cpu: f32, gpu: f32) -> Tick {
+        Tick::Temps(vec![
+            ("cpu".into(), SensorKind::Cpu, cpu),
+            ("gpu".into(), SensorKind::Gpu, gpu),
+        ])
+    }
+
+    #[test]
+    fn reviewer_readded_latched_fan_must_not_be_restored_on_release() {
+        let hal = Arc::new(MockHardwareLayer::new(
+            &["f1", "f2"],
+            vec![at(97.0, 40.0), at(40.0, 40.0), at(40.0, 40.0)],
+        ));
+        let mut e = Engine::new(hal.clone(), &profile(30, &["f1", "f2"]));
+        e.tick(secs(0));
+        e.set_profile(&profile(30, &["f1"]));
+        e.set_profile(&profile(30, &["f1", "f2"]));
+        e.tick(secs(1));
+        e.tick(secs(31));
+        assert!(!e.latched());
+        assert!(
+            hal.restores().is_empty(),
+            "f2 was re-added to the active profile but handed back: {:?}",
+            hal.restores()
+        );
+    }
+
+    #[test]
+    fn a_probe_holds_the_fan_at_100_at_once_then_the_profile_resumes_when_it_expires() {
+        let (hal, mut e) = rig(40.0);
+        e.tick(secs(0));
+        let id = e.start_probe("f2", secs(8)).unwrap();
+        e.tick(secs(1));
+        assert_eq!(
+            e.written("f2"),
+            Some(100),
+            "no ramp: the hold must land within the probe"
+        );
+        e.tick(secs(7));
+        assert_eq!(e.written("f2"), Some(100));
+        e.tick(secs(8)); // expired
+        assert_eq!(
+            e.written("f2"),
+            Some(30),
+            "step_down is 100: back to the curve"
+        );
+        assert!(!e.end_probe("f2", id), "already gone");
+        drop(hal);
+    }
+
+    #[test]
+    fn a_probe_on_a_fan_the_profile_does_not_control_is_handed_back_when_it_ends() {
+        let (hal, mut e) = rig(40.0);
+        e.set_profile(&profile(30, &["f1"]));
+        e.tick(secs(0));
+        let id = e.start_probe("f2", secs(8)).unwrap();
+        e.tick(secs(1));
+        assert_eq!(e.written("f2"), Some(100));
+        assert!(e.end_probe("f2", id));
+        assert_eq!(hal.restores(), vec!["f2".to_string()]);
+        e.tick(secs(2));
+        assert_eq!(
+            hal.writes()
+                .iter()
+                .filter(|(f, d)| f == "f2" && *d == 100)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_probe_never_replaces_a_live_override_and_ending_withdraws_only_its_own_id() {
+        let (_, mut e) = rig(40.0);
+        e.tick(secs(0));
+        e.submit("f1", Source::Override, 80, Some(secs(99)))
+            .unwrap();
+        let err = e.start_probe("f1", secs(8)).unwrap_err();
+        assert!(err.contains("fan has a live override"), "{err}");
+        assert!(err.contains("'f1'"), "names the fan: {err}");
+        let id = e.start_probe("f2", secs(8)).unwrap();
+        assert!(e.start_probe("f2", secs(8)).is_err(), "one probe per fan");
+        assert!(!e.end_probe("f2", id + 1), "someone else's id");
+        e.tick(secs(1));
+        assert_eq!(e.written("f2"), Some(100), "still held");
+        assert!(e.end_probe("f2", id));
+        assert!(e.start_probe("f2", secs(9)).is_ok());
+        assert!(e.start_probe("nope", secs(9)).is_err());
+    }
+
+    #[test]
+    fn a_profile_switch_leaves_a_probe_alone() {
+        let (_, mut e) = rig(40.0);
+        e.tick(secs(0));
+        e.start_probe("f2", secs(8)).unwrap();
+        e.set_profile(&profile(50, &["f1", "f2"]));
+        e.tick(secs(1));
+        assert_eq!(e.written("f2"), Some(100));
+    }
+
+    #[test]
+    fn a_profile_that_drops_a_fan_with_a_live_override_is_refused_but_a_kept_override_survives() {
+        let (_, mut e) = rig(40.0);
+        e.tick(secs(0));
+        e.submit("f2", Source::Override, 80, Some(secs(99)))
+            .unwrap();
+        let err = e.check_profile(&profile(30, &["f1"])).unwrap_err();
+        assert!(err.contains("f2") && err.contains("override"), "{err}");
+        assert!(
+            e.check_profile(&profile(30, &["f2"])).is_ok(),
+            "f1 has no override"
+        );
+        e.set_profile(&profile(50, &["f1", "f2"]));
+        for t in 1..=12 {
+            e.tick(secs(t)); // the ramp is 10 points a tick
+        }
+        assert_eq!(
+            e.written("f2"),
+            Some(80),
+            "the override is kept across the switch"
+        );
+    }
+
+    #[test]
+    fn reviewer_old_agent_request_is_invalidated_by_profile_switch() {
+        let (hal, mut e) = rig(40.0);
+        e.tick(secs(0));
+        e.submit("f1", Source::Agent, 90, Some(secs(99))).unwrap();
+        e.set_profile(&profile(30, &["f1", "f2"]));
+        assert_eq!(
+            e.agent_request("f1"),
+            None,
+            "agent request belongs to the old profile generation"
+        );
+        drop(hal);
+    }
     #[test]
     fn switching_profile_while_latched_stays_at_100_and_hands_nothing_back() {
         let (hal, mut e) = rig(97.0);
@@ -1005,6 +1241,31 @@ mod profile_switch_tests {
         assert!(e.latched());
         assert!(hal.writes().iter().all(|(_, d)| *d == 100));
         assert!(hal.restores().is_empty());
+    }
+
+    #[test]
+    fn switching_profile_while_latched_does_not_restore_a_dropped_fan() {
+        let hal = Arc::new(MockHardwareLayer::new(
+            &["f1", "f2"],
+            vec![at(97.0, 40.0), at(40.0, 40.0), at(40.0, 40.0)],
+        ));
+        let mut e = Engine::new(hal.clone(), &profile(30, &["f1", "f2"]));
+        e.tick(secs(0));
+        assert!(e.latched());
+
+        e.set_profile(&profile(30, &["f1"]));
+
+        assert!(
+            hal.restores().is_empty(),
+            "a dropped fan must stay under engine control while the emergency latch is active"
+        );
+        e.tick(secs(1));
+        assert!(e.latched());
+        assert!(hal.restores().is_empty());
+        assert!(hal.writes().iter().all(|(_, duty)| *duty == 100));
+        e.tick(secs(31));
+        assert!(!e.latched());
+        assert_eq!(hal.restores(), ["f2"]);
     }
 
     #[test]
@@ -1270,6 +1531,19 @@ mod agent_tests {
     }
 
     #[test]
+    fn reviewer_expired_lower_request_cannot_raise_the_agent_floor() {
+        let (hal, mut e) = rig();
+        e.tick(secs(0));
+        e.submit("f1", Source::AppRule, 100, Some(secs(1))).unwrap();
+        agent(&mut e, 0, 60);
+        e.tick(secs(1));
+        assert_eq!(
+            last(&hal),
+            45,
+            "expired 100% request must not produce an 85% floor"
+        );
+    }
+    #[test]
     fn the_engine_exposes_each_fans_curve_output() {
         let (_, mut e) = rig();
         assert_eq!(e.curve_output("f1"), None, "before the first tick");
@@ -1310,6 +1584,22 @@ mod agent_tests {
         agent(&mut e, 34, 99);
         e.tick(secs(2));
         assert_eq!(last(&hal), 35);
+    }
+
+    #[test]
+    fn the_agent_floor_ignores_lower_source_requests_and_follows_the_winning_curve() {
+        let (hal, mut e) = rig();
+        e.tick(secs(0));
+        e.submit("f1", Source::Schedule, 70, None).unwrap();
+        e.submit("f1", Source::AppRule, 80, None).unwrap();
+        agent(&mut e, 0, 60);
+        e.tick(secs(1));
+        assert_eq!(last(&hal), 45);
+        assert_eq!(
+            e.agent_request("f1"),
+            Some(35),
+            "curve 50 minus 15, not the 80% request"
+        );
     }
 
     #[test]

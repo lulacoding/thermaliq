@@ -6,6 +6,7 @@ pub mod agent;
 pub mod anti_cheat;
 pub mod api;
 pub mod app;
+pub mod arbiter;
 pub mod decision_client;
 pub mod foreground;
 pub mod history;

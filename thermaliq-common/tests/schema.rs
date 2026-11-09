@@ -99,10 +99,6 @@ sensor = "cpu_package"
 threshold = 92
 severity = "crit"
 action = { type = "apply_profile", profile = "performance" }
-
-[[app_rules]]
-process = "game.exe"
-profile = "gaming"
 "#,
     )
     .unwrap();
@@ -192,7 +188,8 @@ fn sensors_alerts_and_rules_are_validated() {
     )
     .contains("threshold"));
     assert!(err("[[alerts]]\nsensor=\"s\"\nthreshold=80\nseverity=\"warn\"\naction={type=\"apply_profile\",profile=\"\"}\n").contains("profile"));
-    assert!(err("[[app_rules]]\nprocess=\"\"\nprofile=\"x\"\n").contains("process"));
+    assert!(err("[[app_rules]]\nprocess=\"g.exe\"\nprofile=\"x\"\n")
+        .contains("app_rules moved to config.toml [[app_rule]]"));
 }
 
 #[test]

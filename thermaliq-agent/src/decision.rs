@@ -513,10 +513,6 @@ pub struct SlowLayer {
     due: bool,
     idle: IdleTracker,
     was_idle: bool,
-    limit: ChangeLimit,
-    /// The profile the rule last put in place. It isn't proposed again, so a manual choice
-    /// stands until the workload calls for a different profile.
-    settled: Option<&'static str>,
     local_retry_at: Option<Duration>,
     last_decision: Option<Decision>,
 }
@@ -534,8 +530,6 @@ impl SlowLayer {
             due: false,
             idle: IdleTracker::default(),
             was_idle: false,
-            limit: ChangeLimit::default(),
-            settled: None,
             local_retry_at: None,
             last_decision: None,
         }
@@ -573,23 +567,6 @@ impl SlowLayer {
             .filter(|(_, k)| k.workload == Workload::Gaming)
             .map(|(e, _)| e.clone())
             .collect()
-    }
-
-    /// Counts against the hourly limit.
-    pub fn applied(&mut self, now: Duration, c: &Change) {
-        self.limit.record(now);
-        self.settled = Some(c.profile);
-    }
-
-    /// The profile was already active: nothing changed, so nothing counts.
-    /// The change was held back only because the hardware wasn't steady: offer it again next
-    /// second, not at the next cycle. A known exe costs no provider call.
-    pub fn retry(&mut self) {
-        self.due = true;
-    }
-
-    pub fn already_active(&mut self, c: &Change) {
-        self.settled = Some(c.profile);
     }
 
     /// Records one second. Any change of foreground app starts this exe's averages over.
@@ -727,8 +704,9 @@ impl SlowLayer {
             asked: false,
         });
         let profile = profile_for(workload);
-        let wanted = self.settled != Some(profile) && self.limit.allowed(now);
-        let change = wanted.then_some(Change {
+        // Every decided cycle says what the workload calls for. Whether it takes effect, and the
+        // six-an-hour limit, belong to the daemon's arbiter.
+        let change = Some(Change {
             exe,
             workload,
             profile,
@@ -1363,7 +1341,7 @@ mod tests {
     }
 
     #[test]
-    fn a_change_is_only_proposed_once_for_the_same_app_so_a_manual_choice_stands() {
+    fn each_decided_cycle_proposes_the_workloads_profile_whatever_is_active() {
         let mut r = Rig::new(Fake::says("gaming", 0.9), Fake::down());
         r.s.set_known(
             "a.exe",
@@ -1373,12 +1351,12 @@ mod tests {
                 confidence: None,
             },
         );
-        let c = r.step(0, &seen("a.exe")).change.unwrap();
-        r.s.applied(secs(0), &c);
-        for t in 1..300 {
-            assert!(r.step(t, &seen("a.exe")).change.is_none());
+        assert_eq!(r.step(0, &seen("a.exe")).change.unwrap().profile, "gaming");
+        for t in 1..60 {
+            assert!(r.step(t, &seen("a.exe")).change.is_none(), "t={t}");
         }
-        // another app with the same workload needs no change either
+        assert_eq!(r.step(60, &seen("a.exe")).change.unwrap().profile, "gaming");
+        // another app with the same workload is proposed too: the arbiter keeps the ownership
         r.s.set_known(
             "same.exe",
             Known {
@@ -1387,7 +1365,10 @@ mod tests {
                 confidence: None,
             },
         );
-        assert!(r.step(300, &seen("same.exe")).change.is_none());
+        assert_eq!(
+            r.step(300, &seen("same.exe")).change.unwrap().profile,
+            "gaming"
+        );
         r.s.set_known(
             "b.exe",
             Known {
@@ -1401,48 +1382,7 @@ mod tests {
     }
 
     #[test]
-    fn a_profile_that_was_already_active_uses_up_no_change() {
-        let mut r = Rig::new(Fake::down(), Fake::down());
-        r.s.set_known(
-            "a.exe",
-            Known {
-                workload: Gaming,
-                source: Source::User,
-                confidence: None,
-            },
-        );
-        let c = r.step(0, &seen("a.exe")).change.unwrap();
-        r.s.already_active(&c);
-        assert!(r.step(60, &seen("a.exe")).change.is_none());
-        for t in 0..6 {
-            assert!(r.s.limit.allowed(secs(61 + t)));
-            r.s.limit.record(secs(61 + t));
-        }
-        assert!(!r.s.limit.allowed(secs(70)), "exactly six were left");
-    }
-
-    #[test]
-    fn a_change_held_back_only_for_unsteady_hardware_is_offered_again_next_second() {
-        let mut r = Rig::new(Fake::down(), Fake::down());
-        r.s.set_known(
-            "a.exe",
-            Known {
-                workload: Gaming,
-                source: Source::User,
-                confidence: None,
-            },
-        );
-        assert!(r.step(0, &seen("a.exe")).change.is_some());
-        assert!(
-            r.step(1, &seen("a.exe")).change.is_none(),
-            "not retried by itself"
-        );
-        r.s.retry();
-        assert!(r.step(2, &seen("a.exe")).change.is_some());
-    }
-
-    #[test]
-    fn a_change_that_could_not_be_applied_is_retried_at_the_next_cycle_not_every_second() {
+    fn a_decision_is_offered_at_the_next_cycle_not_every_second() {
         let mut r = Rig::new(Fake::down(), Fake::down());
         r.s.set_known(
             "a.exe",
@@ -1457,32 +1397,6 @@ mod tests {
             assert!(r.step(t, &seen("a.exe")).change.is_none(), "t={t}");
         }
         assert!(r.step(60, &seen("a.exe")).change.is_some());
-    }
-
-    #[test]
-    fn the_seventh_change_in_an_hour_is_not_proposed() {
-        let mut r = Rig::new(Fake::down(), Fake::down());
-        let exes = ["a.exe", "b.exe"];
-        for (exe, workload) in exes.into_iter().zip([Gaming, Browsing]) {
-            r.s.set_known(
-                exe,
-                Known {
-                    workload,
-                    source: Source::User,
-                    confidence: None,
-                },
-            );
-        }
-        let (mut t, mut made) = (0, 0);
-        for n in 0..10 {
-            let s = r.step(t, &seen(exes[n % 2]));
-            if let Some(c) = s.change {
-                r.s.applied(secs(t), &c);
-                made += 1;
-            }
-            t += 60;
-        }
-        assert_eq!(made, 6);
     }
 
     #[test]
@@ -1556,7 +1470,6 @@ mod tests {
         let first = first.unwrap();
         assert_eq!(first.source, Source::BuiltIn);
         assert_eq!(first.confidence, None);
-        r.s.applied(secs(10), &first);
         assert!(r.s.take_learned().is_empty(), "not cached");
         r.hosted = Fake::says("other", 0.9);
         let mut c = None;

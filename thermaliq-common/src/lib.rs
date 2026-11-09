@@ -8,10 +8,12 @@ pub mod datadir;
 pub mod identity;
 mod profile;
 
-pub use config::{DaemonConfig, LogLevel};
+pub use config::{
+    pick_app_rule, pick_schedule, AppRuleEntry, DaemonConfig, LocalClock, LocalTime, LogLevel,
+    ScheduleEntry, Weekday,
+};
 pub use profile::{
-    Alert, AlertAction, AppRule, Control, Curve, CustomSensor, GraphPoint, MixFunction, Profile,
-    Severity,
+    Alert, AlertAction, Control, Curve, CustomSensor, GraphPoint, MixFunction, Profile, Severity,
 };
 
 use serde::{Deserialize, Serialize};
